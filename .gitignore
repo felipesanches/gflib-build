@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+# runtime build artifacts (never committed): outputs, venvs, caches, state, logs
+work/
+out/
+logs/
+venvs/
+pip-cache/
+state.json
+*.log
+*.tmp
