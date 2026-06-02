@@ -100,6 +100,11 @@ class Result:
     compare: str = ""
     config_used: str = ""
     timings: Dict[str, float] = field(default_factory=dict)   # op -> seconds (mirror/extract/build/…)
+    # fontc→fontmake migration tracking
+    fontc_error: str = ""    # why fontc failed (when it fell back to fontmake, or in 'both')
+    fontc_ok: bool = False   # 'both' mode: did fontc build succeed
+    fontmake_ok: bool = False
+    vs: str = ""             # 'both' mode: fontc-vs-fontmake comparison (identical | differ:<tables>)
 
     def dur(self) -> float:
         if self.started == 0:
@@ -646,6 +651,47 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def diff_font_tables(python: str, a: Path, b: Path) -> List[str]:
+    """Return the OpenType table tags that differ between two fonts (raw compiled bytes),
+    using fontTools in the build interpreter. ['?'] if the comparison itself failed."""
+    script = (
+        "import sys\n"
+        "from fontTools.ttLib import TTFont\n"
+        "fa=TTFont(sys.argv[1]); fb=TTFont(sys.argv[2])\n"
+        "ka=set(fa.keys()); kb=set(fb.keys())\n"
+        "d=[t for t in (ka|kb) if t!='GlyphOrder' and "
+        "(fa.getTableData(t) if t in ka else None)!=(fb.getTableData(t) if t in kb else None)]\n"
+        "print(','.join(sorted(d)))\n")
+    try:
+        p = subprocess.run([python, "-c", script, str(a), str(b)],
+                           capture_output=True, text=True, timeout=180)
+        if p.returncode != 0:
+            return ["?"]
+        return [t for t in p.stdout.strip().split(",") if t]
+    except Exception:
+        return ["?"]
+
+
+def compare_backends(python: str, fontc_built: Dict[str, Path], fontmake_built: Dict[str, Path],
+                     shipped: List[str]) -> str:
+    """Compare fontc vs fontmake outputs (fontc_crater-style). Returns 'identical',
+    'differ:<tables>', or '' if there were no comparable pairs."""
+    names = shipped or sorted(set(fontc_built) & set(fontmake_built))
+    tags, any_pair = set(), False
+    for fn in names:
+        a, b = fontc_built.get(fn), fontmake_built.get(fn)
+        if a is None or b is None:
+            continue
+        any_pair = True
+        if sha256(a) != sha256(b):
+            tags.update(diff_font_tables(python, a, b) or ["?"])
+    if not any_pair:
+        return ""
+    if not tags:
+        return "identical"
+    return "differ:" + ",".join(sorted(tags)[:6])
+
+
 def compare_to_shipped(google_fonts: Path, fam: Family, built: Dict[str, Path]) -> str:
     if not fam.shipped_fonts:
         return ""
@@ -820,11 +866,24 @@ class Orchestrator:
             rs = list(self.results.values())
             counts = {"built": 0, "failed": 0, "building": 0, "queued": 0, "skipped": 0}
             backends = {"fontc": 0, "fontmake": 0}
+            migration = {"fontc": 0, "fontmake_fallback": 0, "fontmake_only": 0,
+                         "both_identical": 0, "both_differ": 0}
             building = []
             for r in rs:
                 counts[r.status] = counts.get(r.status, 0) + 1
                 if r.status == "built" and r.backend:
                     backends[r.backend] = backends.get(r.backend, 0) + 1
+                    if r.backend == "fontc":
+                        migration["fontc"] += 1
+                    elif r.backend == "fontmake":
+                        migration["fontmake_fallback" if r.fontc_error else "fontmake_only"] += 1
+                    elif r.backend == "both":
+                        if r.fontc_ok and r.fontmake_ok:
+                            migration["both_identical" if r.vs == "identical" else "both_differ"] += 1
+                        elif r.fontc_ok:                 # fontc built, fontmake didn't
+                            migration["fontc"] += 1
+                        else:                            # fontc failed (blocker)
+                            migration["fontmake_fallback"] += 1
                 if r.status == "building":
                     building.append({"slug": r.slug, "worker": r.worker, "dur": r.dur(),
                                      "backend": r.backend, "note": r.note})
@@ -855,7 +914,7 @@ class Orchestrator:
             "phase_label": plabel, "phase_error": perr,
             "cohorts": [{"key": k, "count": v["count"],
                          "requirements": v["requirements"]} for k, v in cohorts],
-            "op_stats": op_stats, "phase_durations": phase_dur,
+            "op_stats": op_stats, "phase_durations": phase_dur, "migration": migration,
             "done": phase == "done",
         }
 
@@ -958,46 +1017,72 @@ class Orchestrator:
             else:
                 python = self.args.build_python
 
-            order = self._backend_order()
-            ok, berr, used = False, "", ""
-            for i, b in enumerate(order):
-                if i > 0:
-                    err = timed("extract", lambda: extract_tree(mirror, fam.commit, work, EXTRACT_TIMEOUT))
-                    if err:
-                        berr = err
-                        break
+            def attempt(b: str, dest: Path, fresh: bool):
+                """Build with one backend into `dest`; returns (ok, err, built_dict, bytes)."""
+                if fresh:
+                    e = timed("extract", lambda: extract_tree(mirror, fam.commit, work, EXTRACT_TIMEOUT))
+                    if e:
+                        return False, e, {}, 0
                 preclean_outputs(work)
                 cfg, label, cerr = timed("config", lambda: resolve_config(self.google_fonts, fam, work))
                 if cerr:
-                    berr = cerr
-                    flog(f"config: FAIL {cerr}")
-                    break
+                    return False, cerr, {}, 0
                 self._set(slug, backend=b, config_used=label)
                 flog(f"build[{b}]: config={label} — running gftools.builder…")
                 t0 = time.time()
-                ok, berr = run_builder(python, cfg, work, log_path, self.args.timeout, b, self.args.fontc_bin)
-                dt = time.time() - t0
-                self._record_op(slug, "build", dt)
-                flog(f"build[{b}]: " + ("OK" if ok else f"FAIL {berr}") + f"  ({dt:.0f}s)")
-                if ok:
-                    used = b
-                    break
-            if not ok:
-                return self._fail(slug, berr or "build failed")
+                bok, berr = run_builder(python, cfg, work, log_path, self.args.timeout, b, self.args.fontc_bin)
+                self._record_op(slug, "build", time.time() - t0)
+                flog(f"build[{b}]: " + ("OK" if bok else f"FAIL {berr}") + f"  ({time.time() - t0:.0f}s)")
+                if not bok:
+                    return False, berr, {}, 0
+                nb, bd = collect_outputs(work, dest, fam.shipped_fonts)
+                return True, "", bd, nb
 
-            nbytes, built = timed("collect", lambda: collect_outputs(work, out_dir, fam.shipped_fonts))
-            if fam.shipped_fonts and not built:
-                flog("collect: FAIL produced no expected font files")
-                return self._fail(slug, f"{used}: produced no expected font files")
-            missing = [f for f in fam.shipped_fonts if f not in built]
-            cmp_label = ""
-            if self.args.compare:
-                cmp_label = timed("compare", lambda: compare_to_shipped(self.google_fonts, fam, built))
-            flog(f"DONE: backend={used} bytes={nbytes} missing={len(missing)} compare={cmp_label or '-'}")
-            self._set(slug, status="built", ended=time.time(), out_bytes=nbytes,
-                      out_missing=len(missing), compare=cmp_label, backend=used, note="")
-            self._emit("built", slug, backend=used, bytes=nbytes, compare=cmp_label,
-                       missing=len(missing), dur=round(self.results[slug].dur(), 1))
+            if self.args.backend == "both":
+                # fontc_crater-style: build with BOTH compilers and compare their outputs
+                fok, ferr, fbuilt, fbytes = attempt("fontc", out_dir / "fontc", fresh=False)
+                mok, merr, mbuilt, mbytes = attempt("fontmake", out_dir / "fontmake", fresh=True)
+                if not (fok or mok):
+                    self._set(slug, fontc_error=ferr)
+                    return self._fail(slug, f"both backends failed (fontc: {ferr[:80]})")
+                vs = ""
+                if fok and mok:
+                    vs = timed("vs", lambda: compare_backends(python, fbuilt, mbuilt, fam.shipped_fonts))
+                flog(f"DONE both: fontc={'ok' if fok else 'FAIL'} fontmake={'ok' if mok else 'FAIL'} vs={vs or '-'}")
+                self._set(slug, status="built", ended=time.time(), backend="both", note="",
+                          out_bytes=(fbytes if fok else mbytes), fontc_ok=fok, fontmake_ok=mok,
+                          vs=vs, fontc_error=("" if fok else ferr))
+                self._emit("built", slug, backend="both", fontc_ok=fok, fontmake_ok=mok, vs=vs,
+                           dur=round(self.results[slug].dur(), 1))
+            else:
+                order = self._backend_order()
+                ok, berr, used, fontc_err = False, "", "", ""
+                for i, b in enumerate(order):
+                    ok, berr, built, nbytes = attempt(b, out_dir, fresh=(i > 0))
+                    if ok:
+                        used = b
+                        break
+                    if b == "fontc":
+                        fontc_err = berr            # fontc couldn't build this — a migration blocker
+                if not ok:
+                    self._set(slug, fontc_error=fontc_err)
+                    return self._fail(slug, berr or "build failed")
+                if fam.shipped_fonts and not built:
+                    flog("collect: FAIL produced no expected font files")
+                    self._set(slug, fontc_error=fontc_err)
+                    return self._fail(slug, f"{used}: produced no expected font files")
+                missing = [f for f in fam.shipped_fonts if f not in built]
+                cmp_label = ""
+                if self.args.compare:
+                    cmp_label = timed("compare", lambda: compare_to_shipped(self.google_fonts, fam, built))
+                flog(f"DONE: backend={used} bytes={nbytes} missing={len(missing)} compare={cmp_label or '-'}"
+                     + (f"  (fontc fell back: {fontc_err[:60]})" if used == "fontmake" and fontc_err else ""))
+                self._set(slug, status="built", ended=time.time(), out_bytes=nbytes,
+                          out_missing=len(missing), compare=cmp_label, backend=used, note="",
+                          fontc_error=fontc_err)
+                self._emit("built", slug, backend=used, bytes=nbytes, compare=cmp_label,
+                           missing=len(missing), fontc_failed=bool(fontc_err),
+                           dur=round(self.results[slug].dur(), 1))
             if not self.args.keep_fonts:
                 shutil.rmtree(out_dir, ignore_errors=True)
             self.save_state()
@@ -1036,6 +1121,39 @@ class Orchestrator:
                 "operations": snap["op_stats"], "families": fams}
         try:
             (self.build_dir / "timings.json").write_text(json.dumps(data, indent=1))
+        except OSError:
+            pass
+        return data
+
+    def migration_report(self):
+        """fontc→fontmake migration tracking: who builds with fontc, who still needs fontmake
+        (and why fontc failed = the blockers), and 'both'-mode agreement."""
+        with self.lock:
+            rs = list(self.results.values())
+        built = [r for r in rs if r.status == "built"]
+        fontc = [r.slug for r in built if r.backend == "fontc"]
+        fallback = [{"slug": r.slug, "fontc_error": r.fontc_error}
+                    for r in built if r.backend == "fontmake" and r.fontc_error]
+        fm_only = [r.slug for r in built if r.backend == "fontmake" and not r.fontc_error]
+        both = [r for r in built if r.backend == "both"]
+        identical = [r.slug for r in both if r.vs == "identical"]
+        differ = [{"slug": r.slug, "vs": r.vs} for r in both if r.vs and r.vs != "identical"]
+        failed = [{"slug": r.slug, "error": r.error, "fontc_error": r.fontc_error}
+                  for r in rs if r.status == "failed"]
+        data = {
+            "summary": {"fontc": len(fontc), "fontmake_fallback": len(fallback),
+                        "fontmake_only": len(fm_only), "both_identical": len(identical),
+                        "both_differ": len(differ), "failed": len(failed)},
+            "fontc_built": fontc,
+            "fontmake_fallback": fallback,        # fontc failed → fontmake used (MIGRATION BLOCKERS)
+            "fontmake_only": fm_only,             # fontmake without trying fontc
+            "both": {"fontc_ok": sum(1 for r in both if r.fontc_ok),
+                     "fontmake_ok": sum(1 for r in both if r.fontmake_ok),
+                     "identical": identical, "differ": differ},
+            "failed": failed,
+        }
+        try:
+            (self.build_dir / "migration.json").write_text(json.dumps(data, indent=1))
         except OSError:
             pass
         return data
@@ -1090,6 +1208,7 @@ class Orchestrator:
             if self._status_thread is not None:
                 self._status_thread.join(timeout=3)
             self.write_timings()
+            self.migration_report()
             self._write_status()                          # …then write the final status alone
 
     def _close_events(self):
@@ -1344,6 +1463,13 @@ class CursesFrontend(Frontend):
                 if not fails:
                     put(row, 1, "(no failures)", GREEN)
             elif view == "stats":
+                m = snap.get("migration", {})
+                put(row, 0, " fontc migration ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
+                put(row, 1, f"fontc {m.get('fontc', 0)}   fontmake-fallback(blockers) "
+                            f"{m.get('fontmake_fallback', 0)}   fontmake-only {m.get('fontmake_only', 0)}"
+                            + (f"   both id {m.get('both_identical', 0)}/diff {m.get('both_differ', 0)}"
+                               if (m.get('both_identical') or m.get('both_differ')) else ""),
+                    GREEN); row += 2
                 put(row, 0, " Timing — phases ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
                 for ph, sec in sorted(snap.get("phase_durations", {}).items(),
                                       key=lambda kv: -kv[1]):
@@ -1403,6 +1529,22 @@ def print_timing_summary(data: dict):
     for op, s in sorted(data.get("operations", {}).items(), key=lambda kv: -kv[1]["total"]):
         print(f"  op    {op:<10} total {s['total']:>9.1f}s  n {s['count']:>5}  "
               f"mean {s['mean']:>6.2f}s  max {s['max']:>6.1f}s", file=e)
+
+
+def print_migration_summary(data: dict):
+    e = sys.stderr
+    s = data["summary"]
+    print("\nfontc migration (full detail in migration.json):", file=e)
+    print(f"  built with fontc                     : {s['fontc']}", file=e)
+    print(f"  fontmake fallback (fontc FAILED) ⇐ blockers : {s['fontmake_fallback']}", file=e)
+    print(f"  fontmake only (fontc not attempted)  : {s['fontmake_only']}", file=e)
+    if s['both_identical'] or s['both_differ']:
+        print(f"  both: identical {s['both_identical']}  differ {s['both_differ']}", file=e)
+    for b in data.get("fontmake_fallback", [])[:10]:
+        print(f"    blocker {b['slug']}: {b['fontc_error'][:80]}", file=e)
+    extra = len(data.get("fontmake_fallback", [])) - 10
+    if extra > 0:
+        print(f"    … (+{extra} more blockers in migration.json)", file=e)
 
 
 # =============================================================================== report
@@ -1762,7 +1904,10 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="skip the setup wizard (non-interactive bootstrap with current settings)")
     ap.add_argument("--wizard", action="store_true",
                     help="always show the interactive setup wizard (even when nothing needs bootstrapping)")
-    ap.add_argument("--backend", choices=["auto", "fontc", "fontmake"], default="auto")
+    ap.add_argument("--backend", choices=["auto", "fontc", "fontmake", "both"], default="auto",
+                    help="auto = fontc first, fall back to fontmake (the migration default); "
+                         "fontc/fontmake = that compiler only; both = build with each and compare "
+                         "outputs (fontc_crater-style)")
     ap.add_argument("--fontc-bin", default=None, help="path to the fontc (Rust) binary")
     ap.add_argument("--build-python", default=sys.executable,
                     help="interpreter for builds when --manage-venvs is off")
@@ -1898,7 +2043,7 @@ def main():
             {"key": "archive", "label": "repo archive", "type": "path", "value": str(archive)},
             {"key": "build_dir", "label": "build output dir", "type": "path", "value": str(build_dir)},
             {"key": "backend", "label": "build backend", "type": "choice",
-             "value": args.backend, "choices": ["auto", "fontc", "fontmake"]},
+             "value": args.backend, "choices": ["auto", "fontc", "fontmake", "both"]},
             {"key": "fontc_bin", "label": "fontc binary (auto-detected)", "type": "path",
              "value": args.fontc_bin or "", "show_if": lambda v: v["backend"] != "fontmake"},
             {"key": "build_fontc", "label": "build fontc from source (if none)", "type": "bool",
@@ -2076,6 +2221,7 @@ def main():
     c = orch.snapshot()["counts"]
     print(f"\nDONE: built {c['built']}, failed {c['failed']}. "
           f"state: {orch.state_path}  events: {orch.build_dir / 'events.jsonl'}", file=sys.stderr)
+    print_migration_summary(orch.migration_report())
     print_timing_summary(orch.write_timings())
 
 
