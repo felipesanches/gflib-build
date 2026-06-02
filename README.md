@@ -31,29 +31,37 @@ defaults — you edit any field, watch the live "Plan" update, then choose **Sta
 
 ```
  gflib-build — setup wizard
- [↑↓/Tab] move   [space] toggle/cycle choices   type to edit text   [Esc] cancel
+ [↑↓/Tab] move   [space] toggle   [←→] move cursor / step / cycle   type to edit   [Esc] cancel
 
  ▸ worklist source              ‹ metadata ›
    google/fonts clone           gflib-data/google-fonts
-   repo archive                 gflib-data/archive
+   repo archive                 /home/you/repo_archive        (auto-detected)
    build output dir             gflib-data/build
    build backend                ‹ auto ›
+   fontc binary (auto-detected) /home/you/fontc/target/release/fontc
    parallel jobs                8
-   percent of library           100
+   percent of library (←/→ ±5)  100
+   use per-build timeout        [ ] no
    populate archive (mirror missing)  [x] yes
    cohort venvs                 [ ] no
  Plan -----------------------------------------------------------------------
-   google/fonts : CLONE https://github.com/google/fonts.git → gflib-data/google-fonts
-   archive      : POPULATE — mirror any missing upstream repos → gflib-data/archive
+   google/fonts : use existing clone (…)
+   archive      : POPULATE — mirror any missing upstream repos → /home/you/repo_archive
    build        : backend=auto  jobs=8  scope=full library
+   fontc        : /home/you/fontc/target/release/fontc
+   timeout      : none (stop manually)
   Start    Cancel
 ```
 
-`↑`/`↓` or `Tab` move between fields; `space` toggles a checkbox or cycles a `‹choice›`;
-type to edit a text/number field; navigate to **Start** and press Enter to proceed (or
-`Esc` to cancel). Then it runs the phases — **clone → populate archive → generate cohorts →
-build** — with a live, navigable ncurses dashboard. `--yes` skips the wizard, `--wizard`
-forces it, `--percent 5` validates on a sample first.
+Every field is pre-filled with the resolved default and editable: `↑`/`↓` or `Tab` move
+between fields; `space` toggles a checkbox; `←`/`→` move the **text cursor** (Home/End jump,
+Backspace/Delete edit at the caret), **cycle** a `‹choice›`, or **±5-step** the percent;
+type for finer/other values. Conditional fields appear as relevant — ticking **use
+per-build timeout** reveals a seconds field (unticked = builds never time out, stop them in
+the UI); the **fontc** binary is auto-detected, and if missing the form offers *build fontc
+from source* or lets you type a path; the **repo archive** is auto-detected too. Navigate to
+**Start** and press Enter (or `Esc`/Cancel). Then it runs the phases — **clone → populate
+archive → generate cohorts → build** — live. `--yes` skips the wizard, `--wizard` forces it.
 
 > Cloning google/fonts is a few GB; mirroring all upstream repos can be tens of GB and take
 > a long time. Sources are read-only and **archives are never deleted**.
@@ -105,6 +113,13 @@ intent so nothing is lost as the tool evolves.
     shown live on an ncurses UI the user can observe and **navigate** as the data updates.
 16. **Setup-wizard mode.** It must **ask the user before** doing those heavy things
     (cloning, mirroring) — a setup wizard, not silent.
+17. **The wizard is an editable ncurses form** with fields pre-populated with the default
+    settings that the user can edit and then move on. Specifically: text fields render a
+    movable cursor; a *build timeout* checkbox reveals a seconds field only when ticked
+    (otherwise builds never time out — the user can still stop them in the UI); *percent of
+    library* reacts to ←/→ in ±5 steps yet stays typeable for finer control; the *fontc*
+    binary is auto-detected (offering to build it from source, or to type a path, if not
+    found); and a pre-existing **repo archive is auto-detected** too.
 
 ---
 
