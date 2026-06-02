@@ -155,6 +155,32 @@ def discover(google_fonts: Path) -> Tuple[List[Family], int, int]:
     return fams, library_total, library_total - len(fams)
 
 
+def discover_from_archive(archive: Path, rev: str, jobs: int) -> Tuple[List[Family], int, int]:
+    """Archive-driven discovery: the worklist is every bare mirror in the archive, each at
+    `rev` (default HEAD = the mirror's default-branch tip). The repo URL is read from the
+    mirror's origin remote. No google/fonts needed; config is auto-discovered at build
+    time and shipped-binary comparison is unavailable (there is no METADATA reference)."""
+    from concurrent.futures import ThreadPoolExecutor
+    mirrors = sorted(archive.glob("*/*.git"))
+
+    def resolve(mirror: Path) -> Optional[Family]:
+        owner, repo = mirror.parent.name, mirror.name[:-4]
+        rc, sha, _ = git(["--git-dir", str(mirror), "rev-parse", "--verify", f"{rev}^{{commit}}"])
+        if rc != 0 or not sha.strip():
+            return None
+        rc2, url, _ = git(["--git-dir", str(mirror), "config", "--get", "remote.origin.url"])
+        repo_url = url.strip() if rc2 == 0 and url.strip() else f"https://github.com/{owner}/{repo}"
+        return Family(f"{owner}/{repo}", repo, repo_url, sha.strip(), None, False, [])
+
+    fams: List[Family] = []
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
+        for fam in ex.map(resolve, mirrors):
+            if fam is not None:
+                fams.append(fam)
+    total = len(mirrors)
+    return fams, total, total - len(fams)
+
+
 def sample_evenly(items: List[Family], percent: float) -> List[Family]:
     """Deterministic, evenly-spaced sample across the (alphabetical) list, so a small
     percentage still spans the whole library rather than one corner of it."""
@@ -246,9 +272,10 @@ def preclean_outputs(work: Path) -> None:
 
 # ============================================================================== config
 
-def resolve_config(google_fonts: Path, fam: Family, work: Path):
-    override = google_fonts / fam.slug / "config.yaml"
-    if override.is_file():
+def resolve_config(google_fonts: Optional[Path], fam: Family, work: Path):
+    # google/fonts override has priority (only in metadata mode, where google_fonts is set)
+    override = (google_fonts / fam.slug / "config.yaml") if google_fonts is not None else None
+    if override is not None and override.is_file():
         dest = work / "__gflib_override_config.yaml"
         try:
             shutil.copyfile(override, dest)
@@ -489,7 +516,7 @@ class Orchestrator:
     def __init__(self, args, families: List[Family], total: int, skipped: int):
         self.args = args
         self.build_dir = Path(args.build_dir)
-        self.google_fonts = Path(args.google_fonts)
+        self.google_fonts = Path(args.google_fonts) if args.google_fonts else None
         self.archive = Path(args.archive)
         self.families = {f.slug: f for f in families}
         self.total_with_source = total
@@ -945,7 +972,7 @@ def pick_frontend(name: str) -> str:
 # =============================================================================== report
 
 def cohorts_report(families: List[Family], archive: Path, jobs: int, out_path: Optional[Path],
-                   library_total: int = 0, skipped: int = 0):
+                   context: str = ""):
     """Scan each family's requirements.txt (read-only, via git show on the mirror) and
     print the dependency-cohort grouping. No extraction, no builds, archives untouched."""
     from concurrent.futures import ThreadPoolExecutor
@@ -970,9 +997,7 @@ def cohorts_report(families: List[Family], archive: Path, jobs: int, out_path: O
         sigs.setdefault(cohort, sig)
 
     real = [k for k in groups if k not in ("base", "(mirror-absent)")]
-    ctx = (f" (of {library_total} total in the library; {skipped} not buildable — no "
-           f"gftools config/commit)") if library_total else ""
-    print(f"Cohort report: {len(families)} buildable families{ctx} -> {len(real)} distinct "
+    print(f"Cohort report: {len(families)} repos scanned{context} -> {len(real)} distinct "
           f"dependency cohort(s), plus 'base' (no requirements file) and any mirror-absent.\n")
     for cohort, slugs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         label = {"base": "base — no requirements file",
@@ -997,8 +1022,16 @@ def cohorts_report(families: List[Family], archive: Path, jobs: int, out_path: O
 def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="From-scratch, archive-safe, Rust-first full-library build of Google Fonts.")
-    ap.add_argument("--google-fonts", required=True, help="path to a google/fonts clone")
+    ap.add_argument("--source", choices=["metadata", "archive"], default="metadata",
+                    help="where the worklist/stats come from: 'metadata' = parse google/fonts "
+                         "METADATA.pb (pinned commits + configs + shipped refs); 'archive' = every "
+                         "bare mirror in the archive at --archive-rev (google/fonts optional)")
+    ap.add_argument("--google-fonts", default=None,
+                    help="path to a google/fonts clone (required for --source metadata and "
+                         "--compare; optional for --source archive)")
     ap.add_argument("--archive", required=True, help="repo archive of bare mirrors ({owner}/{repo}.git)")
+    ap.add_argument("--archive-rev", default="HEAD",
+                    help="revision to build for --source archive (default HEAD = default-branch tip)")
     ap.add_argument("--build-dir", required=True, help="output dir (NOT inside any repo)")
     ap.add_argument("--backend", choices=["auto", "fontc", "fontmake"], default="auto")
     ap.add_argument("--fontc-bin", default=None, help="path to the fontc (Rust) binary")
@@ -1034,11 +1067,20 @@ def main():
     args = build_argparser().parse_args()
     if sys.platform == "win32":
         sys.exit("gflib-build targets macOS/Linux (POSIX venv layout, git archive, tar).")
-    gf = Path(args.google_fonts)
-    if not (gf / "ofl").is_dir():
-        sys.exit(f"--google-fonts {gf} has no ofl/ — is this a google/fonts clone?")
     if not Path(args.archive).is_dir():
         sys.exit(f"--archive {args.archive} not found")
+    if args.source == "metadata":
+        if not args.google_fonts:
+            sys.exit("--source metadata requires --google-fonts")
+        gf = Path(args.google_fonts)
+        if not (gf / "ofl").is_dir():
+            sys.exit(f"--google-fonts {gf} has no ofl/ — is this a google/fonts clone?")
+    else:
+        gf = Path(args.google_fonts) if args.google_fonts else None
+        if gf is not None and not (gf / "ofl").is_dir():
+            sys.exit(f"--google-fonts {gf} has no ofl/")
+    if args.compare and gf is None:
+        sys.exit("--compare needs --google-fonts (the shipped binaries to compare against)")
     if args.backend == "fontc" and not args.fontc_bin:
         sys.exit("--backend fontc requires --fontc-bin")
     if args.manage_venvs and not args.base_requirements:
@@ -1049,15 +1091,22 @@ def main():
     for sub in ("work", "out", "logs"):
         (Path(args.build_dir) / sub).mkdir(exist_ok=True)
 
-    families, total, skipped = discover(gf)
+    if args.source == "archive":
+        families, total, skipped = discover_from_archive(Path(args.archive), args.archive_rev, args.jobs)
+    else:
+        families, total, skipped = discover(gf)
     sampled = sample_evenly(families, args.percent)
+    if args.source == "metadata":
+        ctx = f" (of {total} total in the library; {skipped} not buildable: no config/commit)"
+    else:
+        ctx = (f" (of {total} mirrors in the archive; {skipped} with no resolvable rev "
+               f"at {args.archive_rev})")
     if args.list:
         for f in sampled:
-            cfg = "override" if f.has_override else (f.config_yaml or "?")
+            cfg = "override" if f.has_override else (f.config_yaml or "(auto)")
             print(f"{f.slug:<40} {cfg:<26} {f.repo_url}")
-        print(f"\n{len(sampled)} selected ({args.percent:g}% of {len(families)} buildable; "
-              f"{total} total in library, {skipped} not buildable: no config/commit)",
-              file=sys.stderr)
+        print(f"\n{len(sampled)} selected ({args.percent:g}% of {len(families)} via "
+              f"--source {args.source}){ctx}", file=sys.stderr)
         return
 
     if args.cohorts_report:
@@ -1066,13 +1115,12 @@ def main():
             keep = set(args.only.split(","))
             sel = [f for f in sampled if f.slug in keep]
         cohorts_report(sel, Path(args.archive), args.jobs, Path(args.build_dir) / "cohorts.json",
-                       library_total=total, skipped=skipped)
+                       context=ctx)
         return
 
     orch = Orchestrator(args, sampled, total, skipped)
-    print(f"Selected {len(sampled)}/{len(families)} buildable ({args.percent:g}%) of {total} "
-          f"total in the library ({skipped} not buildable). "
-          f"Queued {orch.q.qsize()}; backend={args.backend}"
+    print(f"Selected {len(sampled)}/{len(families)} ({args.percent:g}%) via --source "
+          f"{args.source}{ctx}. Queued {orch.q.qsize()}; backend={args.backend}"
           f"{' (fontc-first)' if orch._backend_order()[0] == 'fontc' else ''}; "
           f"ui={pick_frontend(args.ui)}.", file=sys.stderr)
 

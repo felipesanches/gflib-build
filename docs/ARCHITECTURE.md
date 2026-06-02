@@ -11,7 +11,7 @@ the `fontc` binary.
 | Section | Responsibility |
 |---|---|
 | `Family`, `Result` | dataclasses: the work item and its evolving state |
-| discovery | `parse_metadata`, `discover`, `sample_evenly` — read `METADATA.pb`, build the worklist, sample for `--percent` |
+| discovery | `parse_metadata`, `discover` (METADATA-driven), `discover_from_archive` (mirror-driven, `--source archive`), `sample_evenly` — build the worklist, sample for `--percent` |
 | mirror/git | `mirror_path`, `git`, `ensure_mirror`, `extract_tree`, `preclean_outputs` — archive-safe source access |
 | config | `resolve_config`, `read_requirements`, `normalize_requirements`, `cohort_key_for`, `read_requirements_from_mirror` |
 | `VenvManager` | dependency cohorts: one shared venv per distinct requirements set |

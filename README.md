@@ -90,6 +90,24 @@ harness:
 
 ---
 
+## Where the worklist comes from (`--source`)
+
+Two data sources for the worklist/stats, both first-class:
+
+- **`--source metadata`** (default) — the worklist and each family's pinned `commit`,
+  config, and shipped binaries are read from a **google/fonts clone**'s `METADATA.pb`.
+  This builds *exactly what Google Fonts ships* and can compare against the shipped
+  binaries (`--compare`). Requires `--google-fonts`.
+- **`--source archive`** — the worklist is **every bare mirror in the archive**, each at
+  `--archive-rev` (default `HEAD` = the default-branch tip). The repo URL comes from the
+  mirror's origin; the config is auto-discovered in the repo; `--google-fonts` is
+  **optional** (no shipped binaries exist to diff against, so `--compare` is unavailable).
+  This inspects/builds the *upstream sources as they are*, independent of what GF pins.
+
+In **both** modes the **sources** always come from the archive (read-only `git archive`),
+and `requirements.txt` for cohorts is read from the archive. `--source` only changes where
+the *worklist* is enumerated.
+
 ## Build backends — Rust first, Python cohorts as fallback
 
 The compiler backend is selectable with `--backend {auto,fontc,fontmake}`
@@ -287,6 +305,7 @@ failures; `--rebuild` starts over.
 - [x] Dependency cohorts sharing venvs.
 - [x] Modular, optional frontends (curses / plain / json / none) + state.json/events.jsonl for external/web UIs.
 - [x] Partial runs via `--percent` (evenly-spaced sample).
+- [x] Two worklist sources: `--source metadata` (google/fonts) and `--source archive` (the mirrors directly).
 - [ ] Emit a migration report: % of library building under fontc, and the blockers per family.
 - [ ] Feed results back to the gfonts_agents dashboard (`reproducible_build` + provenance levels).
 - [ ] Track toward an **all-Rust** build with no Python orchestration in the loop.
