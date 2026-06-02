@@ -9,6 +9,12 @@ environments.
 > pristine extraction, resumable state, dependency cohorts, and Rust-first/Python-
 > fallback backend selection are implemented. See [Roadmap](#roadmap).
 
+**Documentation:** this README is the overview + spec + usage.
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) covers the internals (pipeline, backends,
+cohorts, concurrency, the `state.json`/`events.jsonl` schemas, archive-safety invariants);
+[`docs/EXTENDING.md`](docs/EXTENDING.md) shows how to add a frontend (incl. a web UI) or a
+backend; [`docs/cohort-map.md`](docs/cohort-map.md) is the generated full-library cohort map.
+
 ---
 
 ## Specifications (as given by Felipe)
