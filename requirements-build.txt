@@ -1,0 +1,10 @@
+# Base build toolchain (the "base" dependency cohort) for gflib-build.
+# Pinned to the gfonts_agents build_registry baseline so results are comparable to the
+# existing reproducible-build run (most diffs then categorize as "compiler-version").
+# Adjust to taste; a newer/dev gftools may need installing from git instead of PyPI.
+fontmake==3.11.1
+fonttools==4.61.1
+glyphsLib==6.12.7
+ufo2ft==3.7.0
+ttfautohint-py==0.6.0
+gftools==0.9.100.dev4
