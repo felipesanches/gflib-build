@@ -1317,7 +1317,11 @@ class Orchestrator:
                         self.archive, self.args.archive_rev, self.args.jobs)
                 else:
                     fams, total, skipped = discover(self.google_fonts)
-                fams = sample_evenly(fams, self.args.percent)
+                if self.args.only:                   # --only restricts the WHOLE pipeline
+                    keep = set(self.args.only.split(","))
+                    fams = [f for f in fams if f.slug in keep]   # (so a targeted rebuild only
+                else:                                            #  mirrors/scans/builds those)
+                    fams = sample_evenly(fams, self.args.percent)
                 with self.lock:
                     self.families = {f.slug: f for f in fams}
                     self.total_with_source = total
@@ -1339,8 +1343,9 @@ class Orchestrator:
                     urls, self.archive, self.args.jobs,
                     on_progress=lambda d, n, u, st: self._archive_progress(d, u, st),
                     stop=self.stop)
-                self._task_done("archive",
-                                f"{len(added)} added, {present} present, {len(failed)} failed")
+                self._task_done(  # "unreachable" (not "failed") to avoid confusion with BUILD failures
+                    "archive",
+                    f"{len(added)} mirrored, {present} present, {len(failed)} unreachable")
 
             # Task: scan/generate the dependency cohorts (read-only)
             if self.families and not self.stop.is_set():
@@ -1375,7 +1380,17 @@ class Orchestrator:
                                      if r.status in ("built", "failed", "skipped"))
                     self._task_progress("build", done_n)
                     time.sleep(0.2)
-                self._task_done("build")
+                # the build task's OUTCOME, not just "processed 15/15": show built/failed, and
+                # mark it failed (❌, not ✅) when every build failed — so it never looks like a
+                # success when nothing built.
+                with self.lock:
+                    nb = sum(1 for r in self.results.values() if r.status == "built")
+                    nf = sum(1 for r in self.results.values() if r.status == "failed")
+                    bt = self._task("build")
+                    if bt is not None:
+                        bt.status = "failed" if (nb == 0 and nf > 0) else "done"
+                        bt.t1 = time.time()
+                        bt.detail = f"{nb} built, {nf} failed"
             elif self._task("build") is not None and self._task("build").status == "pending":
                 done_note = ("nothing to build" if not self.families
                              else "nothing new to build (already built / filtered out)")
@@ -1568,7 +1583,10 @@ class CursesFrontend(Frontend):
             out += ["  " + r for r in reqs] or ["  (none — the 'base' cohort has no requirements file)"]
         elif view == "failures":                     # {slug, error, log}
             log = item.get("log", "")
-            out += [f"Failed: {item.get('slug', '')}", "", "error:", "  " + str(item.get("error", "")),
+            slug = item.get("slug", "")
+            out += [f"Failed: {slug}",
+                    f"rebuild: python3 gflib_build.py --only {slug} --rebuild --yes",
+                    "", "error:", "  " + str(item.get("error", "")),
                     "", f"log: {self.orch.build_dir / log if log else '(none)'}", "", "log tail:"]
             if log:
                 out += ["  " + ln for ln in _read_log_tail(self.orch.build_dir / log, 120)]

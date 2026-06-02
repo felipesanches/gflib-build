@@ -401,6 +401,18 @@ Useful flags: `--percent 5` (sample), `--only ofl/dmsans,ofl/roboto` (subset),
 `--discard-fonts` (keep only the comparison result, not the built binaries),
 `--keep-work` (debug: keep the extraction).
 
+```sh
+# Rebuild ONE family (e.g. after fixing a config) — --only restricts the WHOLE pipeline
+# (mirror/cohorts/build) to just that family, --rebuild ignores its prior state, --yes skips
+# the wizard. (The Failures tab's detail overlay shows this exact command for each failure.)
+python3 gflib_build.py --only ofl/dmsans --rebuild --yes
+```
+
+The **build-fonts task reports its outcome**, not just "processed": its detail shows
+`N built, M failed`, and it turns ❌ (not ✅) if every build failed — so the task-list never
+looks like a success when nothing built. (The archive task counts unreachable repos
+separately as `unreachable`, distinct from build failures.)
+
 ## Detached builds, monitoring & persistence
 
 - **Run autonomously, watch later — by default.** A fresh interactive (curses) build
