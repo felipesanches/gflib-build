@@ -99,6 +99,7 @@ class Result:
     out_missing: int = 0
     compare: str = ""
     config_used: str = ""
+    timings: Dict[str, float] = field(default_factory=dict)   # op -> seconds (mirror/extract/build/…)
 
     def dur(self) -> float:
         if self.started == 0:
@@ -300,14 +301,22 @@ def detect_archive(data_dir: Path) -> Optional[str]:
     return None
 
 
+RUST_INSTALL_HINT = ("install Rust first: `curl --proto '=https' --tlsv1.2 -sSf "
+                     "https://sh.rustup.rs | sh` then restart your shell (see https://rustup.rs)")
+
+
+def detect_cargo() -> Optional[str]:
+    return shutil.which("cargo")
+
+
 def build_fontc_from_source(dest: Path, on_progress: Optional[Callable[[str], None]] = None) -> str:
     """Clone googlefonts/fontc and `cargo build --release -p fontc`. Returns the binary path."""
     dest = Path(dest)
     binp = dest / "target" / "release" / "fontc"
     if binp.is_file():
         return str(binp)
-    if shutil.which("cargo") is None:
-        raise RuntimeError("cannot build fontc: cargo (Rust toolchain) not found on PATH")
+    if detect_cargo() is None:
+        raise RuntimeError("cannot build fontc: cargo (Rust toolchain) not found.\n  " + RUST_INSTALL_HINT)
     if not (dest / ".git").is_dir():
         if on_progress:
             on_progress(f"cloning fontc → {dest}")
@@ -572,8 +581,9 @@ def run_builder(python: str, config_path: Path, work: Path, log_path: Path,
     if backend == "fontc":
         cmd += ["--experimental-fontc", fontc_bin]
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "wb") as logf:
-        logf.write(f"# backend={backend}\n# {' '.join(cmd)}\n# cwd={work}\n\n".encode())
+    with open(log_path, "ab") as logf:   # append: the whole pipeline shares one family log
+        logf.write(f"\n===== gftools.builder (backend={backend}) =====\n"
+                   f"# {' '.join(cmd)}\n# cwd={work}\n\n".encode())
         logf.flush()
         try:
             p = subprocess.run(cmd, cwd=str(work), env=env,
@@ -694,22 +704,46 @@ class Orchestrator:
         self.phase_error = ""
         self.cohorts: Dict[str, dict] = {}
         self.driver: Optional[threading.Thread] = None
+        # timing instrumentation (every operation is measured, for bottleneck analysis)
+        self.op_stats: Dict[str, List[float]] = {}   # op -> [total_seconds, count, max]
+        self.phase_durations: Dict[str, float] = {}
+        self._phase_t0: Optional[float] = None
+        self._status_thread: Optional[threading.Thread] = None
 
         self._load_state()
         self._enqueue()
 
-    # ---- phase helpers
+    # ---- phase helpers (also accumulate per-phase wall-clock durations)
+    def _close_phase(self, now: float):
+        if self.phase not in ("init", "done") and self._phase_t0 is not None:
+            self.phase_durations[self.phase] = (self.phase_durations.get(self.phase, 0.0)
+                                                + (now - self._phase_t0))
+
     def _begin_phase(self, name: str, total: int):
+        now = time.time()
         with self.lock:
+            self._close_phase(now)
             self.phase, self.phase_total, self.phase_done, self.phase_label = name, total, 0, ""
+            self._phase_t0 = now
 
     def _phase_progress(self, done: int, label: str = ""):
         with self.lock:
             self.phase_done, self.phase_label = done, label
 
     def _set_phase(self, name: str):
+        now = time.time()
         with self.lock:
+            self._close_phase(now)
             self.phase = name
+            self._phase_t0 = now
+
+    def _record_op(self, slug: str, op: str, dt: float):
+        with self.lock:
+            s = self.op_stats.setdefault(op, [0.0, 0, 0.0])
+            s[0] += dt; s[1] += 1; s[2] = max(s[2], dt)
+            r = self.results.get(slug)
+            if r is not None:
+                r.timings[op] = r.timings.get(op, 0.0) + dt
 
     # ---- persistence / events
     @property
@@ -804,6 +838,10 @@ class Orchestrator:
             phase, ptot, pdone, plabel, perr = (self.phase, self.phase_total,
                                                 self.phase_done, self.phase_label, self.phase_error)
             cohorts = list(self.cohorts.items())
+            op_stats = {op: {"total": round(s[0], 2), "count": s[1],
+                             "mean": round(s[0] / s[1], 3) if s[1] else 0.0, "max": round(s[2], 2)}
+                        for op, s in self.op_stats.items()}
+            phase_dur = {k: round(v, 1) for k, v in self.phase_durations.items()}
         return {
             "elapsed": time.time() - self.start_time,
             "disk_used_delta": disk_delta, "disk_free": disk_free,
@@ -815,6 +853,7 @@ class Orchestrator:
             "phase_label": plabel, "phase_error": perr,
             "cohorts": [{"key": k, "count": v["count"],
                          "requirements": v["requirements"]} for k, v in cohorts],
+            "op_stats": op_stats, "phase_durations": phase_dur,
             "done": phase == "done",
         }
 
@@ -867,62 +906,92 @@ class Orchestrator:
         safe = slug.replace("/", "__")
         work = self.build_dir / "work" / safe
         out_dir = self.build_dir / "out" / safe
+        log_rel = f"logs/{safe}.log"
+        log_path = self.build_dir / log_rel
+        t_start = time.time()
+        try:                                            # comprehensive per-family log (kept always)
+            log_path.write_text(f"# {slug}\n# repo={fam.repo_url}\n# commit={fam.commit}\n")
+        except OSError:
+            pass
+
+        def flog(msg):
+            try:
+                with open(log_path, "a") as lf:
+                    lf.write(f"[+{time.time() - t_start:6.1f}s] {msg}\n")
+            except OSError:
+                pass
+
+        def timed(op, fn):                              # measure every operation
+            t0 = time.time()
+            r = fn()
+            self._record_op(slug, op, time.time() - t0)
+            return r
+
         self._set(slug, status="building", started=time.time(), worker=wid,
-                  ended=0.0, error="", note="", backend="")
+                  ended=0.0, error="", note="", backend="", log=log_rel)
         self._emit("started", slug, worker=wid)
         try:
-            mirror, err = ensure_mirror(self.archive, fam.repo_url, fam.commit,
-                                        self.args.mirror_missing)
+            mirror, err = timed("mirror", lambda: ensure_mirror(
+                self.archive, fam.repo_url, fam.commit, self.args.mirror_missing))
+            flog("mirror: " + (f"ok ({mirror.name})" if not err else f"FAIL {err}"))
             if err:
                 return self._fail(slug, err)
-            err = extract_tree(mirror, fam.commit, work, EXTRACT_TIMEOUT)
+            err = timed("extract", lambda: extract_tree(mirror, fam.commit, work, EXTRACT_TIMEOUT))
+            flog("extract: " + ("ok" if not err else f"FAIL {err}"))
             if err:
                 return self._fail(slug, err)
 
-            # pick interpreter (cohort venv or single build-python) from the extracted tree
             if self.venvs is not None:
                 req = read_requirements(work)
 
                 def installing(key):
                     self._set(slug, note=f"installing deps ({key})")
                     self._emit("venv", slug, cohort=key)
-                python, cohort, verr = self.venvs.get_python(req, installing)
+                    flog(f"venv: installing cohort {key}…")
+                python, cohort, verr = timed("venv", lambda: self.venvs.get_python(req, installing))
                 self._set(slug, cohort=cohort, note="")
+                flog(f"venv: cohort {cohort} " + ("ok" if not verr else f"FAIL {verr}"))
                 if verr:
                     return self._fail(slug, f"venv: {verr}")
             else:
                 python = self.args.build_python
 
-            # backend attempts; each fallback gets a FRESH extraction (truly from scratch)
             order = self._backend_order()
             ok, berr, used = False, "", ""
             for i, b in enumerate(order):
                 if i > 0:
-                    err = extract_tree(mirror, fam.commit, work, EXTRACT_TIMEOUT)
+                    err = timed("extract", lambda: extract_tree(mirror, fam.commit, work, EXTRACT_TIMEOUT))
                     if err:
                         berr = err
                         break
                 preclean_outputs(work)
-                cfg, label, cerr = resolve_config(self.google_fonts, fam, work)
+                cfg, label, cerr = timed("config", lambda: resolve_config(self.google_fonts, fam, work))
                 if cerr:
                     berr = cerr
+                    flog(f"config: FAIL {cerr}")
                     break
-                log_rel = f"logs/{safe}.{b}.log"
-                self._set(slug, backend=b, config_used=label, log=log_rel)
-                ok, berr = run_builder(python, cfg, work, self.build_dir / log_rel,
-                                       self.args.timeout, b, self.args.fontc_bin)
+                self._set(slug, backend=b, config_used=label)
+                flog(f"build[{b}]: config={label} — running gftools.builder…")
+                t0 = time.time()
+                ok, berr = run_builder(python, cfg, work, log_path, self.args.timeout, b, self.args.fontc_bin)
+                dt = time.time() - t0
+                self._record_op(slug, "build", dt)
+                flog(f"build[{b}]: " + ("OK" if ok else f"FAIL {berr}") + f"  ({dt:.0f}s)")
                 if ok:
                     used = b
                     break
             if not ok:
                 return self._fail(slug, berr or "build failed")
 
-            nbytes, built = collect_outputs(work, out_dir, fam.shipped_fonts)
+            nbytes, built = timed("collect", lambda: collect_outputs(work, out_dir, fam.shipped_fonts))
             if fam.shipped_fonts and not built:
+                flog("collect: FAIL produced no expected font files")
                 return self._fail(slug, f"{used}: produced no expected font files")
             missing = [f for f in fam.shipped_fonts if f not in built]
-            cmp_label = (compare_to_shipped(self.google_fonts, fam, built)
-                         if self.args.compare else "")
+            cmp_label = ""
+            if self.args.compare:
+                cmp_label = timed("compare", lambda: compare_to_shipped(self.google_fonts, fam, built))
+            flog(f"DONE: backend={used} bytes={nbytes} missing={len(missing)} compare={cmp_label or '-'}")
             self._set(slug, status="built", ended=time.time(), out_bytes=nbytes,
                       out_missing=len(missing), compare=cmp_label, backend=used, note="")
             self._emit("built", slug, backend=used, bytes=nbytes, compare=cmp_label,
@@ -941,8 +1010,39 @@ class Orchestrator:
             return ["fontc"]
         return ["fontc", "fontmake"] if self.args.fontc_bin else ["fontmake"]
 
+    # ---- status snapshot file (for the monitor UI / detached builds) + timings report
+    def _write_status(self):
+        try:
+            tmp = self.build_dir / "status.json.tmp"
+            tmp.write_text(json.dumps(self.snapshot()))
+            tmp.replace(self.build_dir / "status.json")
+        except OSError:
+            pass
+
+    def _status_writer(self):
+        while True:
+            self._write_status()
+            if self.phase == "done":
+                break
+            time.sleep(1.0)
+
+    def write_timings(self):
+        snap = self.snapshot()
+        with self.lock:
+            fams = {s: {k: round(v, 2) for k, v in r.timings.items()}
+                    for s, r in self.results.items() if r.timings}
+        data = {"elapsed": round(snap["elapsed"], 1), "phases": snap["phase_durations"],
+                "operations": snap["op_stats"], "families": fams}
+        try:
+            (self.build_dir / "timings.json").write_text(json.dumps(data, indent=1))
+        except OSError:
+            pass
+        return data
+
     # ---- lifecycle: a background driver runs the phases (archive → cohorts → build)
     def run(self):
+        self._status_thread = threading.Thread(target=self._status_writer, daemon=True)
+        self._status_thread.start()
         self.driver = threading.Thread(target=self._drive, daemon=True)
         self.driver.start()
 
@@ -985,6 +1085,8 @@ class Orchestrator:
         finally:
             self.save_state()
             self._set_phase("done")  # workers are guaranteed stopped here
+            self.write_timings()
+            self._write_status()
 
     def join(self):
         if self.driver is not None:
@@ -1018,8 +1120,9 @@ class Frontend:
     """Base frontend: observe an Orchestrator and render progress. Subclass and register
     in FRONTENDS, or write your own (e.g. web) that tails <build-dir>/events.jsonl +
     state.json out-of-process."""
-    def __init__(self, orch: "Orchestrator"):
+    def __init__(self, orch):
         self.orch = orch
+        self.monitor = False   # True when attached read-only to a (possibly detached) build
     def run(self):
         raise NotImplementedError
 
@@ -1139,8 +1242,11 @@ class CursesFrontend(Frontend):
                 view, scroll = "cohorts", 0
             elif ch in (ord("3"), ord("f"), ord("F")):
                 view, scroll = "failures", 0
+            elif ch in (ord("4"), ord("s"), ord("S")):
+                view, scroll = "stats", 0
             elif ch == 9:  # Tab cycles views
-                view = {"overview": "cohorts", "cohorts": "failures", "failures": "overview"}[view]
+                view = {"overview": "cohorts", "cohorts": "failures",
+                        "failures": "stats", "stats": "overview"}[view]
                 scroll = 0
             elif ch == curses.KEY_DOWN:
                 scroll += 1
@@ -1187,10 +1293,10 @@ class CursesFrontend(Frontend):
             # tabs
             x = 1
             for lbl, name in (("1 overview", "overview"), ("2 cohorts", "cohorts"),
-                              ("3 failures", "failures")):
+                              ("3 failures", "failures"), ("4 stats", "stats")):
                 put(4, x, f" {lbl} ", curses.A_REVERSE if view == name else curses.A_DIM)
                 x += len(lbl) + 3
-            put(4, max(x + 2, w - 30), "[tab]switch [↑↓]scroll", curses.A_DIM)
+            put(4, max(x + 2, w - 24), "[tab]switch [↑↓]scroll", curses.A_DIM)
 
             row = 6
             if view == "overview":
@@ -1229,10 +1335,30 @@ class CursesFrontend(Frontend):
                     put(row, 1, f"{f['slug']:<34} {f['error']}", RED); row += 1
                 if not fails:
                     put(row, 1, "(no failures)", GREEN)
+            elif view == "stats":
+                put(row, 0, " Timing — phases ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
+                for ph, sec in sorted(snap.get("phase_durations", {}).items(),
+                                      key=lambda kv: -kv[1]):
+                    put(row, 1, f"{ph:<12} {hms(sec)}"); row += 1
+                row += 1
+                put(row, 0, " Timing — operations (total / count / mean / max, s) ".ljust(w - 1, "-"),
+                    curses.A_BOLD); row += 1
+                ops = sorted(snap.get("op_stats", {}).items(), key=lambda kv: -kv[1]["total"])
+                vis = max(1, h - row - 1)
+                scroll = min(scroll, max(0, len(ops) - vis))
+                for op, s in ops[scroll:scroll + vis]:
+                    put(row, 1, f"{op:<10} total {s['total']:>9.1f}   n {s['count']:>5}   "
+                                f"mean {s['mean']:>7.2f}   max {s['max']:>7.1f}", CYAN); row += 1
+                if not ops:
+                    put(row, 1, "(timing accrues as builds run)")
 
-            put(h - 1, 0, " [q]uit [p]ause   logs: " + str(self.orch.build_dir / "logs"), curses.A_DIM)
+            mon = getattr(self, "monitor", False)
+            foot = (" [q]uit monitor (build keeps running)" if mon else " [q]uit [p]ause")
+            if mon and not snap.get("daemon_alive", True):
+                foot = " [q]uit   ⚠ daemon not running (build finished or stopped)"
+            put(h - 1, 0, foot + "   logs: " + str(self.orch.build_dir / "logs"), curses.A_DIM)
             stdscr.refresh()
-            if snap["done"]:
+            if snap["done"] and not self.monitor:
                 time.sleep(1.0)
                 break
             time.sleep(0.25)
@@ -1252,6 +1378,23 @@ def pick_frontend(name: str) -> str:
         return "curses"
     except Exception:
         return "plain"
+
+
+def run_monitor(build_dir: Path, ui: str):
+    """Attach a read-only live monitor to a (possibly detached) build at build_dir."""
+    fe = FRONTENDS[ui if ui in FRONTENDS else "plain"](MonitorState(build_dir))
+    fe.monitor = True
+    fe.run()
+
+
+def print_timing_summary(data: dict):
+    e = sys.stderr
+    print("\nTiming (per-phase + per-operation; full detail in timings.json):", file=e)
+    for ph, sec in sorted(data.get("phases", {}).items(), key=lambda kv: -kv[1]):
+        print(f"  phase {ph:<10} {hms(sec)}", file=e)
+    for op, s in sorted(data.get("operations", {}).items(), key=lambda kv: -kv[1]["total"]):
+        print(f"  op    {op:<10} total {s['total']:>9.1f}s  n {s['count']:>5}  "
+              f"mean {s['mean']:>6.2f}s  max {s['max']:>6.1f}s", file=e)
 
 
 # =============================================================================== report
@@ -1303,6 +1446,99 @@ def cohorts_report(families: List[Family], archive: Path, jobs: int, out_path: O
 
 
 # ================================================================================= main
+
+# =============================================== config persistence / daemon / monitor
+
+CONFIG_KEYS = ("source", "google_fonts", "archive", "build_dir", "backend", "fontc_bin",
+               "jobs", "percent", "timeout", "populate_archive", "manage_venvs",
+               "base_requirements", "compare", "data_dir")
+
+
+def load_config(path: Path) -> dict:
+    try:
+        d = json.loads(path.read_text())
+        return {k: v for k, v in d.items() if k in CONFIG_KEYS}
+    except Exception:
+        return {}
+
+
+def save_config(path: Path, args) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {k: getattr(args, k, None) for k in CONFIG_KEYS}
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1))
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def read_daemon_pid(build_dir: Path) -> Optional[int]:
+    try:
+        pid = int((Path(build_dir) / "daemon.pid").read_text().strip())
+        return pid if _pid_alive(pid) else None
+    except (OSError, ValueError):
+        return None
+
+
+def daemonize(build_dir: Path) -> bool:
+    """Double-fork. Returns True in the detached daemon (which should run the build), and
+    False in the original parent (which can then attach a monitor). Writes daemon.pid and
+    redirects the daemon's stdio to daemon.log."""
+    pid = os.fork()
+    if pid > 0:                       # original parent
+        os.waitpid(pid, 0)            # reap the short-lived first child
+        return False
+    os.setsid()                       # first child
+    if os.fork() > 0:
+        os._exit(0)
+    sys.stdout.flush(); sys.stderr.flush()   # grandchild = daemon
+    log = open(Path(build_dir) / "daemon.log", "a", buffering=1)
+    nul = open(os.devnull, "r")
+    os.dup2(nul.fileno(), sys.stdin.fileno())
+    os.dup2(log.fileno(), sys.stdout.fileno())
+    os.dup2(log.fileno(), sys.stderr.fileno())
+    (Path(build_dir) / "daemon.pid").write_text(str(os.getpid()))
+    return True
+
+
+class MonitorState:
+    """Read-only view of a (possibly detached) build for the monitor UI. Mimics the slice of
+    the Orchestrator interface the frontends use (snapshot/stop/paused/build_dir/workers)."""
+    _EMPTY = {"phase": "(waiting for build…)",
+              "counts": {"built": 0, "failed": 0, "building": 0, "queued": 0, "skipped": 0},
+              "backends": {"fontc": 0, "fontmake": 0}, "building": [], "failures_recent": [],
+              "cohorts": [], "total": 0, "elapsed": 0, "disk_used_delta": 0, "disk_free": 0,
+              "jobs": 0, "paused": False, "phase_total": 0, "phase_done": 0, "phase_label": "",
+              "phase_error": "", "op_stats": {}, "phase_durations": {}, "done": False}
+
+    def __init__(self, build_dir: Path):
+        self.build_dir = Path(build_dir)
+        self.stop = threading.Event()
+        self.paused = threading.Event()
+        self.lock = threading.Lock()
+        self.workers: List = []
+        self.results: Dict = {}
+
+    def snapshot(self) -> dict:
+        try:
+            snap = json.loads((self.build_dir / "status.json").read_text())
+        except Exception:
+            snap = dict(self._EMPTY)
+        snap["daemon_alive"] = read_daemon_pid(self.build_dir) is not None
+        return snap
+
+    def all_done(self) -> bool:
+        return self.snapshot().get("done", False)
+
 
 def setup_wizard(spec, plan_fn):
     """Interactive ncurses settings form. `spec` is a list of field dicts:
@@ -1530,6 +1766,18 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--cohorts-report", action="store_true",
                     help="scan each family's requirements.txt (read-only) and print the "
                          "dependency-cohort grouping, then exit (no builds)")
+    ap.add_argument("--config", default=None,
+                    help="settings config file (default <data-dir>/gflib-build.config); loaded as "
+                         "defaults and updated with the chosen settings after each run")
+    ap.add_argument("--no-save-config", dest="save_config", action="store_false", default=True,
+                    help="do not persist the chosen settings to the config file")
+    ap.add_argument("--detach", action="store_true",
+                    help="run the build in a detached background daemon, then attach a live monitor "
+                         "(quit the monitor with q and the build keeps running)")
+    ap.add_argument("--attach", action="store_true",
+                    help="attach a live, read-only monitor to a build at --build-dir (q leaves it running)")
+    ap.add_argument("--stop", action="store_true",
+                    help="signal a detached build at --build-dir to stop gracefully")
     return ap
 
 
@@ -1553,9 +1801,35 @@ def _plan_lines(gf, archive, src, populate, percent, backend, jobs, manage_venvs
 
 
 def main():
-    args = build_argparser().parse_args()
+    # ---- load persisted config as defaults (CLI flags still override) ----
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--data-dir", default="gflib-data")
+    pre.add_argument("--build-dir", default=None)
+    pre.add_argument("--config", default=None)
+    known, _ = pre.parse_known_args()
+    cfg_path = Path(known.config) if known.config else Path(known.data_dir) / "gflib-build.config"
+    cfg = load_config(cfg_path)
+    ap = build_argparser()
+    if cfg:
+        ap.set_defaults(**{k: v for k, v in cfg.items() if k != "data_dir"})
+    args = ap.parse_args()
     if sys.platform == "win32":
         sys.exit("gflib-build targets macOS/Linux (POSIX venv layout, git archive, tar).")
+
+    # ---- attach / stop an existing (possibly detached) build, then exit ----
+    mon_build_dir = Path(args.build_dir) if args.build_dir else (Path(args.data_dir) / "build")
+    if args.stop:
+        pid = read_daemon_pid(mon_build_dir)
+        if pid is None:
+            sys.exit(f"no running build daemon at {mon_build_dir}")
+        os.kill(pid, signal.SIGTERM)
+        print(f"sent stop to build daemon {pid} at {mon_build_dir}", file=sys.stderr)
+        return
+    if args.attach:
+        if pick_frontend(args.ui) == "curses" and not sys.stdout.isatty():
+            sys.exit("--attach needs a terminal")
+        run_monitor(mon_build_dir, pick_frontend(args.ui))
+        return
 
     # ---- resolve paths (defaults from --data-dir; auto-detect where possible) ----
     data_dir = Path(args.data_dir)
@@ -1626,6 +1900,8 @@ def main():
                     lines.append(f"fontc        : {v['fontc_bin']}")
                 elif v.get("build_fontc"):
                     lines.append("fontc        : BUILD from source (cargo build --release)")
+                    if not detect_cargo():
+                        lines.append("  ⚠ cargo not found — " + RUST_INSTALL_HINT)
                 else:
                     lines.append("fontc        : none — 'auto' falls back to fontmake")
             lines.append("timeout      : " + (f"{v['timeout_seconds']}s"
@@ -1678,6 +1954,10 @@ def main():
     if args.source == "metadata" and gf is None:
         sys.exit("--source metadata needs a google/fonts clone")
 
+    read_only = args.list or args.cohorts_report
+    if args.save_config and not read_only:
+        save_config(cfg_path, args)               # persist the chosen settings for next time
+
     archive.mkdir(parents=True, exist_ok=True)
     build_dir.mkdir(parents=True, exist_ok=True)
     for sub in ("work", "out", "logs"):
@@ -1723,10 +2003,28 @@ def main():
     orch = Orchestrator(args, sampled, total, skipped)
     print(f"Selected {len(sampled)}/{len(families)} ({args.percent:g}%) via --source "
           f"{args.source}{ctx}. Queued {orch.q.qsize()}; backend={args.backend}"
-          f"{' (fontc-first)' if orch._backend_order()[0] == 'fontc' else ''}; "
-          f"ui={pick_frontend(args.ui)}.", file=sys.stderr)
+          f"{' (fontc-first)' if orch._backend_order()[0] == 'fontc' else ''}.", file=sys.stderr)
+
+    if args.detach:
+        if daemonize(build_dir):                  # detached daemon: run the build, headless
+            signal.signal(signal.SIGTERM, lambda *_: orch.stop.set())
+            signal.signal(signal.SIGINT, lambda *_: orch.stop.set())
+            orch.run()
+            orch.join()
+            orch.save_state()
+            return
+        # original parent: attach a live monitor (quit it and the build keeps running)
+        print(f"build running detached. reattach any time:\n"
+              f"  python3 {Path(sys.argv[0]).name} --attach --build-dir {build_dir}\n"
+              f"  python3 {Path(sys.argv[0]).name} --stop   --build-dir {build_dir}",
+              file=sys.stderr)
+        time.sleep(0.5)
+        if pick_frontend(args.ui) != "none":
+            run_monitor(build_dir, pick_frontend(args.ui))
+        return
 
     signal.signal(signal.SIGINT, lambda *_: orch.stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: orch.stop.set())
     orch.run()
     frontend = FRONTENDS[pick_frontend(args.ui)](orch)
     try:
@@ -1738,6 +2036,7 @@ def main():
     c = orch.snapshot()["counts"]
     print(f"\nDONE: built {c['built']}, failed {c['failed']}. "
           f"state: {orch.state_path}  events: {orch.build_dir / 'events.jsonl'}", file=sys.stderr)
+    print_timing_summary(orch.write_timings())
 
 
 if __name__ == "__main__":
