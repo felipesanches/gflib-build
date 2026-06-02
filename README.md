@@ -26,21 +26,34 @@ first (confirms before any heavy step), then drives the whole pipeline live in t
 python3 gflib_build.py            # uses ./gflib-data/ for everything
 ```
 
-The wizard shows what it will do and asks before proceeding:
+The wizard is an **interactive ncurses form** with the settings pre-populated to their
+defaults — you edit any field, watch the live "Plan" update, then choose **Start**:
 
 ```
-=== gflib-build setup wizard ===
-Bootstrapping a from-scratch Google Fonts library build. Planned steps:
-  1. clone google/fonts: https://github.com/google/fonts.git → gflib-data/google-fonts (shallow)
-  2. populate archive: mirror any missing upstream repos into gflib-data/archive
-Paths:  google/fonts : gflib-data/google-fonts   archive : gflib-data/archive   build dir : gflib-data/build
-Build : backend=auto  jobs=8  scope=full library
-Proceed? [y/N]
+ gflib-build — setup wizard
+ [↑↓/Tab] move   [space] toggle/cycle choices   type to edit text   [Esc] cancel
+
+ ▸ worklist source              ‹ metadata ›
+   google/fonts clone           gflib-data/google-fonts
+   repo archive                 gflib-data/archive
+   build output dir             gflib-data/build
+   build backend                ‹ auto ›
+   parallel jobs                8
+   percent of library           100
+   populate archive (mirror missing)  [x] yes
+   cohort venvs                 [ ] no
+ Plan -----------------------------------------------------------------------
+   google/fonts : CLONE https://github.com/google/fonts.git → gflib-data/google-fonts
+   archive      : POPULATE — mirror any missing upstream repos → gflib-data/archive
+   build        : backend=auto  jobs=8  scope=full library
+  Start    Cancel
 ```
 
-Then it runs the phases — **clone → populate archive → generate cohorts → build** — with a
-live, navigable ncurses dashboard. Add `--yes` for non-interactive bootstrap, `--percent 5`
-to validate on a sample first, and any of the paths/flags below to point at existing data.
+`↑`/`↓` or `Tab` move between fields; `space` toggles a checkbox or cycles a `‹choice›`;
+type to edit a text/number field; navigate to **Start** and press Enter to proceed (or
+`Esc` to cancel). Then it runs the phases — **clone → populate archive → generate cohorts →
+build** — with a live, navigable ncurses dashboard. `--yes` skips the wizard, `--wizard`
+forces it, `--percent 5` validates on a sample first.
 
 > Cloning google/fonts is a few GB; mirroring all upstream repos can be tens of GB and take
 > a long time. Sources are read-only and **archives are never deleted**.

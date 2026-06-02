@@ -1252,27 +1252,125 @@ def cohorts_report(families: List[Family], archive: Path, jobs: int, out_path: O
 
 # ================================================================================= main
 
-def setup_wizard(steps, gf_path, archive, build_dir, args) -> bool:
-    """Interactive confirmation before heavy bootstrap operations (clone / mirror).
-    Returns True to proceed. Plain terminal Q&A (runs before any ncurses UI)."""
+def setup_wizard(spec, plan_fn):
+    """Interactive ncurses settings form. `spec` is a list of field dicts:
+       {key, label, type: text|path|int|float|bool|choice, value, choices?}.
+    The fields are pre-populated with the resolved defaults; the user edits them and a live
+    'Plan' preview (plan_fn(typed_values) -> [str]) updates as they go. Returns the edited
+    {key: typed value} dict to proceed, or None to cancel. Raises if curses is unusable."""
+    import curses
+    fields = [dict(f) for f in spec]
+    buttons = ["Start", "Cancel"]
+
+    def typed():
+        out = {}
+        for f in fields:
+            t, v = f["type"], f["value"]
+            if t == "int":
+                out[f["key"]] = int(v) if str(v).strip().lstrip("-").isdigit() else 0
+            elif t == "float":
+                try:
+                    out[f["key"]] = float(v)
+                except (TypeError, ValueError):
+                    out[f["key"]] = 0.0
+            elif t == "bool":
+                out[f["key"]] = bool(v)
+            else:
+                out[f["key"]] = v
+        return out
+
+    def form(stdscr):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.keypad(True)
+        n, total, sel = len(fields), len(fields) + len(buttons), 0
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+
+            def put(y, x, s, a=0):
+                if 0 <= y < h and 0 <= x < w:
+                    stdscr.addnstr(y, x, str(s), max(0, w - x - 1), a)
+
+            put(0, 0, " gflib-build — setup wizard", curses.A_BOLD)
+            put(1, 0, " [↑↓/Tab] move   [space] toggle/cycle choices   type to edit text   "
+                      "[Esc] cancel", curses.A_DIM)
+            row = 3
+            for i, f in enumerate(fields):
+                active = sel == i
+                if f["type"] == "bool":
+                    val = "[x] yes" if f["value"] else "[ ] no"
+                elif f["type"] == "choice":
+                    val = f"‹ {f['value']} ›"
+                else:
+                    val = (str(f["value"]) or "") + ("_" if active else "")
+                put(row, 1, ("▸ " if active else "  ") + f["label"],
+                    curses.A_BOLD if active else 0)
+                put(row, 36, val, curses.A_REVERSE if active else 0)
+                row += 1
+            row += 1
+            put(row, 0, " Plan ".ljust(max(1, w - 1), "-"), curses.A_BOLD); row += 1
+            for line in plan_fn(typed())[:max(0, h - row - 3)]:
+                put(row, 2, line); row += 1
+            x = 2
+            for bi, b in enumerate(buttons):
+                put(h - 2, x, f" {b} ", curses.A_REVERSE if sel == n + bi else curses.A_BOLD)
+                x += len(b) + 4
+            stdscr.refresh()
+
+            ch = stdscr.getch()
+            if ch == 27:                                  # Esc
+                return None
+            elif ch == curses.KEY_UP:
+                sel = (sel - 1) % total
+            elif ch in (curses.KEY_DOWN, 9):              # Down / Tab
+                sel = (sel + 1) % total
+            elif sel >= n:                                # on a button
+                if ch in (10, 13, ord(" ")):
+                    return typed() if buttons[sel - n] == "Start" else None
+            else:
+                f = fields[sel]
+                if f["type"] == "bool":
+                    if ch in (ord(" "), 10, 13):
+                        f["value"] = not f["value"]
+                elif f["type"] == "choice":
+                    ci = f["choices"].index(f["value"])
+                    if ch in (ord(" "), curses.KEY_RIGHT):
+                        f["value"] = f["choices"][(ci + 1) % len(f["choices"])]
+                    elif ch == curses.KEY_LEFT:
+                        f["value"] = f["choices"][(ci - 1) % len(f["choices"])]
+                    elif ch in (10, 13):
+                        sel = (sel + 1) % total
+                else:                                     # text/path/int/float
+                    if ch in (curses.KEY_BACKSPACE, 127, 8):
+                        f["value"] = str(f["value"])[:-1]
+                    elif ch in (10, 13):
+                        sel = (sel + 1) % total
+                    elif 32 <= ch < 127:
+                        c = chr(ch)
+                        ok = (f["type"] not in ("int", "float")
+                              or (f["type"] == "int" and c.isdigit())
+                              or (f["type"] == "float" and (c.isdigit() or c == ".")))
+                        if ok:
+                            f["value"] = str(f["value"]) + c
+
+    return curses.wrapper(form)
+
+
+def setup_wizard_plain(steps, gf_path, archive, build_dir, args) -> bool:
+    """Fallback plain-terminal confirmation (used if curses is unavailable)."""
     e = sys.stderr
-    print("\n=== gflib-build setup wizard ===", file=e)
-    print("Bootstrapping a from-scratch Google Fonts library build. Planned steps:\n", file=e)
+    print("\n=== gflib-build setup ===", file=e)
     for i, (title, detail) in enumerate(steps, 1):
         print(f"  {i}. {title}: {detail}", file=e)
-    print("\nPaths:", file=e)
     if gf_path:
         print(f"  google/fonts : {gf_path}", file=e)
-    print(f"  archive      : {archive}", file=e)
-    print(f"  build dir    : {build_dir}", file=e)
-    scope = "full library" if args.percent >= 100 else f"{args.percent:g}% sample"
-    print(f"\nBuild       : backend={args.backend}  jobs={args.jobs}  scope={scope}", file=e)
-    print("\nNote: cloning google/fonts is a few GB; mirroring all upstream repos can be tens of\n"
-          "GB and take a long time. Sources are read-only and archives are never deleted.\n", file=e)
+    print(f"  archive      : {archive}\n  build dir    : {build_dir}", file=e)
     try:
         return input("Proceed? [y/N] ").strip().lower() in ("y", "yes")
     except (EOFError, KeyboardInterrupt):
-        print(file=e)
         return False
 
 
@@ -1300,7 +1398,9 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--no-populate-archive", dest="populate_archive", action="store_false",
                     help="do not pre-populate the archive (missing repos fail unless --mirror-missing)")
     ap.add_argument("--yes", "-y", action="store_true",
-                    help="assume yes to the setup wizard (non-interactive bootstrap)")
+                    help="skip the setup wizard (non-interactive bootstrap with current settings)")
+    ap.add_argument("--wizard", action="store_true",
+                    help="always show the interactive setup wizard (even when nothing needs bootstrapping)")
     ap.add_argument("--backend", choices=["auto", "fontc", "fontmake"], default="auto")
     ap.add_argument("--fontc-bin", default=None, help="path to the fontc (Rust) binary")
     ap.add_argument("--build-python", default=sys.executable,
@@ -1331,16 +1431,29 @@ def build_argparser() -> argparse.ArgumentParser:
     return ap
 
 
+def _plan_lines(gf, archive, src, populate, percent, backend, jobs, manage_venvs, compare):
+    lines = []
+    if src == "metadata":
+        if gf and (gf / "ofl").is_dir():
+            lines.append(f"google/fonts : use existing clone ({gf})")
+        else:
+            lines.append(f"google/fonts : CLONE {GOOGLE_FONTS_URL} → {gf or '(unset!)'}")
+    else:
+        lines.append("worklist     : every mirror in the archive (google/fonts optional)")
+    if populate:
+        lines.append(f"archive      : POPULATE — mirror any missing upstream repos → {archive}")
+    else:
+        lines.append(f"archive      : use as-is ({archive})" + ("" if archive.is_dir() else "  [ABSENT]"))
+    scope = "full library" if percent >= 100 else f"{percent:g}% sample"
+    extra = ("  +venvs" if manage_venvs else "") + ("  +compare" if compare and src == "metadata" else "")
+    lines.append(f"build        : backend={backend}  jobs={jobs}  scope={scope}{extra}")
+    return lines
+
+
 def main():
     args = build_argparser().parse_args()
     if sys.platform == "win32":
         sys.exit("gflib-build targets macOS/Linux (POSIX venv layout, git archive, tar).")
-    if not (0 < args.percent <= 100):
-        sys.exit("--percent must be in (0, 100]")
-    if args.backend == "fontc" and not args.fontc_bin:
-        sys.exit("--backend fontc requires --fontc-bin")
-    if args.manage_venvs and not args.base_requirements:
-        sys.exit("--manage-venvs requires --base-requirements (the pinned base toolchain)")
 
     # ---- resolve paths (defaults derived from --data-dir) ----
     data_dir = Path(args.data_dir)
@@ -1348,49 +1461,98 @@ def main():
           else (data_dir / "google-fonts" if args.source == "metadata" else None))
     archive = Path(args.archive) if args.archive else (data_dir / "archive")
     build_dir = Path(args.build_dir) if args.build_dir else (data_dir / "build")
-    args.google_fonts = str(gf) if gf else None
-    args.archive = str(archive)
-    args.build_dir = str(build_dir)
-    if args.compare and args.source != "metadata":
-        sys.exit("--compare requires --source metadata (it diffs against the shipped binaries)")
-    if args.compare and gf is None:
-        sys.exit("--compare needs --google-fonts (the shipped binaries to compare against)")
-
     read_only = args.list or args.cohorts_report
-    # default: populate the archive for a metadata build unless told otherwise
     if args.populate_archive is None:
         args.populate_archive = (args.source == "metadata") and not read_only
 
-    # ---- setup wizard: confirm heavy bootstrap steps before doing them ----
-    need_gf_clone = args.source == "metadata" and not (gf / "ofl").is_dir()
+    need_gf_clone = args.source == "metadata" and not (gf and (gf / "ofl").is_dir())
     steps = []
     if need_gf_clone:
         steps.append(("clone google/fonts", f"{GOOGLE_FONTS_URL} → {gf} (shallow)"))
     if args.populate_archive:
-        steps.append(("populate archive", f"mirror any missing upstream repos into {archive}"))
-    if steps and not args.yes and not read_only:
-        if sys.stdin.isatty():
-            if not setup_wizard(steps, gf, archive, build_dir, args):
-                sys.exit("aborted.")
-        else:
+        steps.append(("populate archive", f"mirror missing upstream repos into {archive}"))
+
+    # ---- interactive ncurses setup wizard (editable, pre-populated fields) ----
+    if (steps or args.wizard) and not args.yes and not read_only:
+        if not sys.stdin.isatty():
             sys.exit("missing prerequisites (google/fonts clone and/or archive). Re-run with "
-                     "--yes to auto-bootstrap, or pass --google-fonts/--archive explicitly.")
+                     "--yes to bootstrap non-interactively, or pass --google-fonts/--archive.")
+        spec = [
+            {"key": "source", "label": "worklist source", "type": "choice",
+             "value": args.source, "choices": ["metadata", "archive"]},
+            {"key": "google_fonts", "label": "google/fonts clone", "type": "path",
+             "value": str(gf) if gf else ""},
+            {"key": "archive", "label": "repo archive", "type": "path", "value": str(archive)},
+            {"key": "build_dir", "label": "build output dir", "type": "path", "value": str(build_dir)},
+            {"key": "backend", "label": "build backend", "type": "choice",
+             "value": args.backend, "choices": ["auto", "fontc", "fontmake"]},
+            {"key": "fontc_bin", "label": "fontc binary (for fontc)", "type": "path",
+             "value": args.fontc_bin or ""},
+            {"key": "jobs", "label": "parallel jobs", "type": "int", "value": str(args.jobs)},
+            {"key": "percent", "label": "percent of library", "type": "float", "value": f"{args.percent:g}"},
+            {"key": "timeout", "label": "per-build timeout (s)", "type": "int", "value": str(args.timeout)},
+            {"key": "populate_archive", "label": "populate archive (mirror missing)", "type": "bool",
+             "value": bool(args.populate_archive)},
+            {"key": "manage_venvs", "label": "cohort venvs (--manage-venvs)", "type": "bool",
+             "value": bool(args.manage_venvs)},
+            {"key": "compare", "label": "compare to shipped (metadata only)", "type": "bool",
+             "value": bool(args.compare)},
+        ]
+
+        def plan_fn(v):
+            g = Path(v["google_fonts"]) if v["google_fonts"] else None
+            return _plan_lines(g, Path(v["archive"]), v["source"], v["populate_archive"],
+                               v["percent"], v["backend"], v["jobs"], v["manage_venvs"], v["compare"])
+        try:
+            edited = setup_wizard(spec, plan_fn)
+        except Exception:                               # curses unusable → plain confirm
+            edited = {} if setup_wizard_plain(steps, gf, archive, build_dir, args) else None
+        if edited is None:
+            sys.exit("aborted.")
+        if edited:                                      # apply the user's edits
+            args.source = edited["source"]
+            gf = Path(edited["google_fonts"]) if edited["google_fonts"] else None
+            archive = Path(edited["archive"])
+            build_dir = Path(edited["build_dir"])
+            args.backend = edited["backend"]
+            args.fontc_bin = edited["fontc_bin"] or None
+            args.jobs = max(1, edited["jobs"])
+            args.percent = edited["percent"]
+            args.timeout = max(1, edited["timeout"])
+            args.populate_archive = edited["populate_archive"]
+            args.manage_venvs = edited["manage_venvs"]
+            args.compare = edited["compare"]
+            need_gf_clone = args.source == "metadata" and not (gf and (gf / "ofl").is_dir())
+
+    # ---- finalize + validate (after any wizard edits) ----
+    args.google_fonts = str(gf) if gf else None
+    args.archive = str(archive)
+    args.build_dir = str(build_dir)
+    if not (0 < args.percent <= 100):
+        sys.exit("percent must be in (0, 100]")
+    if args.backend == "fontc" and not args.fontc_bin:
+        sys.exit("backend 'fontc' requires a fontc binary path")
+    if args.manage_venvs and not args.base_requirements:
+        sys.exit("cohort venvs require --base-requirements (the pinned base toolchain)")
+    if args.compare and args.source != "metadata":
+        sys.exit("--compare requires --source metadata (it diffs against the shipped binaries)")
+    if args.compare and gf is None:
+        sys.exit("--compare needs a google/fonts clone")
+    if args.source == "metadata" and gf is None:
+        sys.exit("--source metadata needs a google/fonts clone")
 
     archive.mkdir(parents=True, exist_ok=True)
     build_dir.mkdir(parents=True, exist_ok=True)
     for sub in ("work", "out", "logs"):
         (build_dir / sub).mkdir(exist_ok=True)
 
-    # ---- clone google/fonts up front if needed (plain status; the live UI covers the rest) ----
     if need_gf_clone:
         try:
             ensure_google_fonts(gf, on_progress=lambda m: print(f"  {m}", file=sys.stderr))
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             sys.exit(str(e))
     if args.source == "metadata" and not (gf / "ofl").is_dir():
-        sys.exit(f"--google-fonts {gf} is not a google/fonts clone (no ofl/)")
-    if args.source == "metadata" and not args.google_fonts:
-        sys.exit("--source metadata needs a google/fonts clone")
+        sys.exit(f"google/fonts {gf} is not a clone (no ofl/)")
     if not archive.is_dir():
         sys.exit(f"archive {archive} not available")
 
