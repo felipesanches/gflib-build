@@ -269,7 +269,7 @@ Under `--build-dir`:
 ```
 state.json            resumable per-family status (built/failed/…) + durations
 out/<slug>/           built fonts (omit with --discard-fonts)
-logs/<slug>.log       full build log (kept for every failure)
+logs/<slug>.<backend>.log  full build log (kept for every failure)
 venvs/<cohort>/       shared cohort virtualenvs (with --manage-venvs)
 pip-cache/            shared pip download cache
 work/<slug>/          throwaway extraction (deleted after each build)

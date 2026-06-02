@@ -20,8 +20,12 @@ class MyFrontend(Frontend):
                 break
             time.sleep(0.5)
 
-FRONTENDS["mine"] = MyFrontend               # now selectable with --ui mine
+FRONTENDS["mine"] = MyFrontend               # register the frontend
 ```
+
+Then add `"mine"` to the `--ui` argparse `choices` list in `build_argparser` (mirroring
+the backend step in Option C, step 2) — otherwise `argparse` rejects `--ui mine` with an
+"invalid choice" error before the registry is ever consulted.
 
 Guidelines:
 - **Poll `self.orch.snapshot()`** for the live aggregate; it copies state under the lock.

@@ -34,9 +34,10 @@ the `fontc` binary.
 4. **backend attempts** (`_backend_order`: `fontc` then `fontmake` for `auto`) — for each
    attempt: a fresh extraction on fallback, `preclean_outputs` (wipe committed
    `fonts/`, `*_ufo/`, `build*.ninja`, …), `resolve_config`, then `run_builder`.
-5. **`collect_outputs`** — copy produced `.ttf`/`.otf` from `work/fonts/{ttf,variable,otf}`
-   into `<build-dir>/out/<slug>`, matched against the family's shipped filenames; record
-   bytes and any missing shipped files (`out_missing`).
+5. **`collect_outputs`** — copy produced `.ttf`/`.otf` found under `FONT_SUBDIRS`
+   (`work/fonts/{ttf,variable,otf}`, `work/fonts`, and the extraction root `work/`) into
+   `<build-dir>/out/<slug>`, matched against the family's shipped filenames; record bytes
+   and any missing shipped files (`out_missing`).
 6. **`compare_to_shipped`** (with `--compare`) — sha256 the built vs shipped binaries →
    `identical` / `differ` / `missing`.
 7. **cleanup** — a `try/finally` always removes `work/<slug>` (unless `--keep-work`);
@@ -81,12 +82,15 @@ front. `_ready` (cohort → interpreter) is read/written under a single global l
   `snapshot()` takes a consistent copy under it.
 - `events.jsonl` writes are serialized by a dedicated lock.
 - Termination: a worker exits when `all_done()` (every result terminal) **and** the queue
-  is empty. `stop` (set by `q`, SIGINT, or a frontend) is also checked right after
-  dequeue so no new build starts during shutdown.
+  is empty. `stop` (set by `join()`/the frontend loop once `all_done()`, by SIGINT, or by
+  a frontend on quit) is also checked right after dequeue so no new build starts during
+  shutdown.
 
 ## State & events (consumable by any frontend or external tool)
 
-`<build-dir>/state.json` — full resumable state, written after every transition:
+`<build-dir>/state.json` — full resumable state, written after every **terminal**
+transition (built/failed) and at shutdown (the in-progress `building`/`started`
+transition is recorded only in `events.jsonl`):
 ```json
 { "saved_at": <epoch>, "build_dir": "...",
   "results": { "ofl/dmsans": { "status": "built", "backend": "fontmake",

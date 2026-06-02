@@ -131,24 +131,28 @@ def parse_metadata(meta_path: Path):
 
 
 def discover(google_fonts: Path) -> Tuple[List[Family], int, int]:
-    fams, total, skipped = [], 0, 0
+    """Return (buildable families, library_total, skipped). `library_total` counts every
+    family in the library (all METADATA.pb); `skipped` = library_total - buildable, i.e.
+    families with no gftools build config and/or no pinned commit (legacy/SFD/VFB sources,
+    missing_config, no source block)."""
+    fams: List[Family] = []
+    library_total = 0
     for lic in LICENSE_DIRS:
         base = google_fonts / lic
         if not base.is_dir():
             continue
         for meta in sorted(base.glob("*/METADATA.pb")):
+            library_total += 1
             parsed = parse_metadata(meta)
             if parsed is None:
                 continue
-            total += 1
             name, repo, commit, cfg, fonts = parsed
             slug = f"{lic}/{meta.parent.name}"
             has_override = (google_fonts / slug / "config.yaml").is_file()
             if not commit or not (has_override or cfg):
-                skipped += 1
                 continue
             fams.append(Family(slug, name, repo, commit, cfg, has_override, fonts))
-    return fams, total, skipped
+    return fams, library_total, library_total - len(fams)
 
 
 def sample_evenly(items: List[Family], percent: float) -> List[Family]:
@@ -940,7 +944,8 @@ def pick_frontend(name: str) -> str:
 
 # =============================================================================== report
 
-def cohorts_report(families: List[Family], archive: Path, jobs: int, out_path: Optional[Path]):
+def cohorts_report(families: List[Family], archive: Path, jobs: int, out_path: Optional[Path],
+                   library_total: int = 0, skipped: int = 0):
     """Scan each family's requirements.txt (read-only, via git show on the mirror) and
     print the dependency-cohort grouping. No extraction, no builds, archives untouched."""
     from concurrent.futures import ThreadPoolExecutor
@@ -965,8 +970,10 @@ def cohorts_report(families: List[Family], archive: Path, jobs: int, out_path: O
         sigs.setdefault(cohort, sig)
 
     real = [k for k in groups if k not in ("base", "(mirror-absent)")]
-    print(f"Cohort report: {len(families)} families -> {len(real)} distinct dependency "
-          f"cohort(s), plus 'base' (no requirements file) and any mirror-absent.\n")
+    ctx = (f" (of {library_total} total in the library; {skipped} not buildable — no "
+           f"gftools config/commit)") if library_total else ""
+    print(f"Cohort report: {len(families)} buildable families{ctx} -> {len(real)} distinct "
+          f"dependency cohort(s), plus 'base' (no requirements file) and any mirror-absent.\n")
     for cohort, slugs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         label = {"base": "base — no requirements file",
                  "(mirror-absent)": "mirror absent — not scanned"}.get(cohort, cohort)
@@ -1049,7 +1056,8 @@ def main():
             cfg = "override" if f.has_override else (f.config_yaml or "?")
             print(f"{f.slug:<40} {cfg:<26} {f.repo_url}")
         print(f"\n{len(sampled)} selected ({args.percent:g}% of {len(families)} buildable; "
-              f"{total} with source, {skipped} skipped)", file=sys.stderr)
+              f"{total} total in library, {skipped} not buildable: no config/commit)",
+              file=sys.stderr)
         return
 
     if args.cohorts_report:
@@ -1057,11 +1065,13 @@ def main():
         if args.only:
             keep = set(args.only.split(","))
             sel = [f for f in sampled if f.slug in keep]
-        cohorts_report(sel, Path(args.archive), args.jobs, Path(args.build_dir) / "cohorts.json")
+        cohorts_report(sel, Path(args.archive), args.jobs, Path(args.build_dir) / "cohorts.json",
+                       library_total=total, skipped=skipped)
         return
 
     orch = Orchestrator(args, sampled, total, skipped)
-    print(f"Selected {len(sampled)}/{len(families)} buildable ({args.percent:g}%). "
+    print(f"Selected {len(sampled)}/{len(families)} buildable ({args.percent:g}%) of {total} "
+          f"total in the library ({skipped} not buildable). "
           f"Queued {orch.q.qsize()}; backend={args.backend}"
           f"{' (fontc-first)' if orch._backend_order()[0] == 'fontc' else ''}; "
           f"ui={pick_frontend(args.ui)}.", file=sys.stderr)
