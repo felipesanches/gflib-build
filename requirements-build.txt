@@ -1,10 +1,16 @@
 # Base build toolchain (the "base" dependency cohort) for gflib-build.
 # Pinned to the gfonts_agents build_registry baseline so results are comparable to the
 # existing reproducible-build run (most diffs then categorize as "compiler-version").
-# Adjust to taste; a newer/dev gftools may need installing from git instead of PyPI.
+#
+# NOTE: gftools is pinned to the published tag 0.9.99 (on PyPI). The earlier pin
+# `0.9.100.dev4` was a setuptools_scm dev version (4 commits past tag v0.9.99) that only
+# ever existed in a local editable install — it is NOT on PyPI, so every venv's `pip
+# install` failed with "No matching distribution found for gftools==0.9.100.dev4", leaving
+# every cohort interpreter without fontmake/gftools. To reproduce the exact dev build, instead
+# install from git, e.g.:  gftools @ git+https://github.com/googlefonts/gftools@<commit>
 fontmake==3.11.1
 fonttools==4.61.1
 glyphsLib==6.12.7
 ufo2ft==3.7.0
 ttfautohint-py==0.6.0
-gftools==0.9.100.dev4
+gftools==0.9.99
