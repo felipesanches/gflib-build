@@ -275,6 +275,8 @@ GOOGLE_FONTS_URL = "https://github.com/google/fonts.git"
 
 def ensure_google_fonts(path: Path, on_progress: Optional[Callable[[str], None]] = None) -> Path:
     """Clone google/fonts (shallow) if `path` is not already a clone. Returns `path`."""
+    if path is None:
+        raise ValueError("google/fonts path is required")
     if (path / "ofl").is_dir():
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -288,10 +290,11 @@ def ensure_google_fonts(path: Path, on_progress: Optional[Callable[[str], None]]
 
 
 def populate_archive(repo_urls, archive: Path, jobs: int,
-                     on_progress: Optional[Callable[[int, int, str], None]] = None):
+                     on_progress: Optional[Callable[[int, int, str], None]] = None,
+                     stop: "Optional[threading.Event]" = None):
     """Ensure every repo_url has a bare mirror in the archive; clone --mirror the missing
-    ones (append-only — never deletes). Returns (added, failed, present). Read-only on any
-    existing mirror; parallel across `jobs`."""
+    ones (APPEND-ONLY — existing mirrors are skipped read-only and NEVER modified/deleted).
+    Returns (added, failed, present). Parallel across `jobs`; aborts promptly if `stop` set."""
     from concurrent.futures import ThreadPoolExecutor
     urls = sorted(set(repo_urls))
     added: List[str] = []
@@ -301,9 +304,11 @@ def populate_archive(repo_urls, archive: Path, jobs: int,
     done = [0]
 
     def one(url: str):
+        if stop is not None and stop.is_set():
+            return ("skipped", url, "")
         mp = mirror_path(archive, url)
         if mp.is_dir():
-            return ("present", url, "")
+            return ("present", url, "")  # existing mirror: read-only, never touched
         mp.parent.mkdir(parents=True, exist_ok=True)
         rc, _, err = git(["clone", "--mirror", url, str(mp)], timeout=1800)
         if rc != 0:
@@ -327,9 +332,11 @@ def populate_archive(repo_urls, archive: Path, jobs: int,
 
 
 def scan_cohorts(families: List[Family], archive: Path, jobs: int,
-                 on_progress: Optional[Callable[[int, int, str], None]] = None):
+                 on_progress: Optional[Callable[[int, int, str], None]] = None,
+                 stop: "Optional[threading.Event]" = None):
     """Group families by their normalized repo requirements (read-only `git show` on the
-    mirrors). Returns (groups: cohort_key -> [slug], sigs: cohort_key -> requirements)."""
+    mirrors). Returns (groups: cohort_key -> [slug], sigs: cohort_key -> requirements).
+    Aborts promptly if `stop` is set."""
     from concurrent.futures import ThreadPoolExecutor
     from collections import defaultdict
     groups: Dict[str, List[str]] = defaultdict(list)
@@ -338,6 +345,8 @@ def scan_cohorts(families: List[Family], archive: Path, jobs: int,
     done = [0]
 
     def one(fam: Family):
+        if stop is not None and stop.is_set():
+            return fam.slug, "(stopped)", ""
         mp = mirror_path(archive, fam.repo_url)
         if not mp.is_dir():
             return fam.slug, "(mirror-absent)", ""
@@ -618,6 +627,7 @@ class Orchestrator:
         self.workers: List[threading.Thread] = []
         self._events = open(self.build_dir / "events.jsonl", "a", buffering=1)
         self._events_lock = threading.Lock()
+        self._events_closed = False
 
         self.venvs: Optional[VenvManager] = None
         if args.manage_venvs:
@@ -677,6 +687,8 @@ class Orchestrator:
         ev.update(extra)
         try:
             with self._events_lock:
+                if self._events_closed:
+                    return
                 self._events.write(json.dumps(ev) + "\n")
         except Exception:
             pass
@@ -884,47 +896,55 @@ class Orchestrator:
 
     def _drive(self):
         try:
-            # Phase: populate the archive (mirror any missing upstream repos) — append-only
-            if getattr(self.args, "populate_archive", False) and self.families:
+            # Phase: populate the archive (mirror any missing upstream repos) — append-only.
+            # `stop` is threaded through so Ctrl-C aborts these long phases promptly.
+            if getattr(self.args, "populate_archive", False) and self.families and not self.stop.is_set():
                 urls = sorted({f.repo_url for f in self.families.values()})
                 self._begin_phase("archive", len(urls))
                 populate_archive(urls, self.archive, self.args.jobs,
-                                 on_progress=lambda d, t, u: self._phase_progress(d, u))
+                                 on_progress=lambda d, t, u: self._phase_progress(d, u),
+                                 stop=self.stop)
             # Phase: scan/generate the dependency cohorts (read-only)
-            if self.families:
+            if self.families and not self.stop.is_set():
                 self._begin_phase("cohorts", len(self.families))
                 groups, sigs = scan_cohorts(
                     list(self.families.values()), self.archive, self.args.jobs,
-                    on_progress=lambda d, t, s: self._phase_progress(d, s))
+                    on_progress=lambda d, t, s: self._phase_progress(d, s), stop=self.stop)
                 with self.lock:
                     self.cohorts = {k: {"count": len(v), "requirements": sigs.get(k, "")}
                                     for k, v in sorted(groups.items(), key=lambda kv: -len(kv[1]))}
             # Phase: build
-            if self.venvs is not None:
-                self.venvs.ensure_base()
-            self._begin_phase("build", self.q.qsize())
-            for i in range(max(1, self.args.jobs)):
-                t = threading.Thread(target=self.worker, args=(i + 1,), daemon=True)
-                t.start()
-                self.workers.append(t)
-            while any(t.is_alive() for t in self.workers):
-                if self.stop.is_set() or self.all_done():
-                    self.stop.set()
-                time.sleep(0.2)
+            if not self.stop.is_set():
+                if self.venvs is not None:
+                    self.venvs.ensure_base()
+                self._begin_phase("build", self.q.qsize())
+                for i in range(max(1, self.args.jobs)):
+                    t = threading.Thread(target=self.worker, args=(i + 1,), daemon=True)
+                    t.start()
+                    self.workers.append(t)
+                # exits only once every worker has stopped (no _emit can follow)
+                while any(t.is_alive() for t in self.workers):
+                    if self.stop.is_set() or self.all_done():
+                        self.stop.set()
+                    time.sleep(0.2)
         except Exception as e:
             with self.lock:
                 self.phase_error = str(e)
         finally:
             self.save_state()
-            self._set_phase("done")
-            try:
-                self._events.close()
-            except Exception:
-                pass
+            self._set_phase("done")  # workers are guaranteed stopped here
 
     def join(self):
         if self.driver is not None:
             self.driver.join()
+        # close the events file only after the driver (and thus all workers) have stopped
+        with self._events_lock:
+            if not self._events_closed:
+                self._events_closed = True
+                try:
+                    self._events.close()
+                except Exception:
+                    pass
 
 
 # ============================================================================ frontends
@@ -1034,6 +1054,7 @@ class CursesFrontend(Frontend):
     def _draw(self, stdscr):
         import curses
         stdscr.nodelay(True)
+        stdscr.keypad(True)   # map arrow keys to curses.KEY_UP/KEY_DOWN (defensive; wrapper also does this)
         try:
             curses.curs_set(0)
         except curses.error:
@@ -1330,6 +1351,8 @@ def main():
     args.google_fonts = str(gf) if gf else None
     args.archive = str(archive)
     args.build_dir = str(build_dir)
+    if args.compare and args.source != "metadata":
+        sys.exit("--compare requires --source metadata (it diffs against the shipped binaries)")
     if args.compare and gf is None:
         sys.exit("--compare needs --google-fonts (the shipped binaries to compare against)")
 

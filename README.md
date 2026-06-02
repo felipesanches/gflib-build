@@ -17,6 +17,36 @@ backend; [`docs/cohort-map.md`](docs/cohort-map.md) is the generated full-librar
 
 ---
 
+## Quick start — zero to built
+
+With no existing data, a single command bootstraps everything. It runs a **setup wizard**
+first (confirms before any heavy step), then drives the whole pipeline live in the TUI:
+
+```sh
+python3 gflib_build.py            # uses ./gflib-data/ for everything
+```
+
+The wizard shows what it will do and asks before proceeding:
+
+```
+=== gflib-build setup wizard ===
+Bootstrapping a from-scratch Google Fonts library build. Planned steps:
+  1. clone google/fonts: https://github.com/google/fonts.git → gflib-data/google-fonts (shallow)
+  2. populate archive: mirror any missing upstream repos into gflib-data/archive
+Paths:  google/fonts : gflib-data/google-fonts   archive : gflib-data/archive   build dir : gflib-data/build
+Build : backend=auto  jobs=8  scope=full library
+Proceed? [y/N]
+```
+
+Then it runs the phases — **clone → populate archive → generate cohorts → build** — with a
+live, navigable ncurses dashboard. Add `--yes` for non-interactive bootstrap, `--percent 5`
+to validate on a sample first, and any of the paths/flags below to point at existing data.
+
+> Cloning google/fonts is a few GB; mirroring all upstream repos can be tens of GB and take
+> a long time. Sources are read-only and **archives are never deleted**.
+
+---
+
 ## Specifications (as given by Felipe)
 
 This tool is built to the following requirements. They are recorded here verbatim in
@@ -55,6 +85,13 @@ intent so nothing is lost as the tool evolves.
     others can customize the frontend.
 14. **Allow building only a percentage of the library** (e.g. 5%) instead of the whole
     thing — useful for validating the tool during development.
+15. **Bootstrap from nothing.** With `--source metadata` (and by default, no flags), the
+    tool should `git clone` google/fonts, read all `METADATA.pb`, **create/populate a local
+    archive** of upstream repos (building one from scratch if none exists), generate the
+    cohorts, and build them all — so any user can bootstrap the whole process. All of it
+    shown live on an ncurses UI the user can observe and **navigate** as the data updates.
+16. **Setup-wizard mode.** It must **ask the user before** doing those heavy things
+    (cloning, mirroring) — a setup wizard, not silent.
 
 ---
 
@@ -203,29 +240,36 @@ across the alphabetical family list, so 5% still spans many foundries rather tha
 corner). Ideal for validating the tool end-to-end before committing to a full run.
 `--only ofl/a,ofl/b` picks an explicit subset.
 
-## The live dashboard (TUI)
+## Phases & the live dashboard (TUI)
+
+A run drives a background pipeline through phases, each reported live:
+**`archive`** (mirror any missing upstream repos) → **`cohorts`** (scan/generate the
+dependency cohorts) → **`build`** → **`done`**. The ncurses dashboard shows a phase banner +
+progress bar and is **navigable** — three views switchable with `1`/`2`/`3` or `Tab`:
 
 ```
  Google Fonts library build                                   elapsed 01:23:45
- disk: +12.3GiB used   free 290.0GiB   jobs 8
-
- Built 412/1503   Failed 7   Building 8   Queued 1076
+ disk +12.3GiB  free 290.0GiB  jobs 8  cohorts 28  fontc 980/fontmake 240
+ Phase: building   built 412/1503  failed 7  building 8  queued 1076
  [######################------------------------------------]  31%
-
+  1 overview   2 cohorts   3 failures               [tab]switch [↑↓]scroll
  Now building ----------------------------------------------------------------
-  w 1 ofl/notosanstc                       02:10  building…  (fontc)
-  w 2 ofl/roboto                           00:42  building…  (fontmake · cohort c3f1a…)
-  ...
+  w 1 ofl/notosanstc                       02:10  fontc
+  w 2 ofl/roboto                           00:42  fontmake
  Recent failures (7) --------------------------------------------------------
   ofl/foldit                       gftools.builder exit 1: KeyError 'instances'
-  ...
- [q]uit  [p]ause/resume   logs: <build-dir>/logs
+ [q]uit [p]ause   logs: <build-dir>/logs
 ```
 
-Keys: `q` quit (lets in-flight builds finish), `p` pause/resume dispatch. Full
-per-family logs are always on disk under `<build-dir>/logs/<slug>.<backend>.log`;
-failures keep their log for inspection. For non-interactive use pick `--ui plain`,
-`--ui json`, or `--ui none`.
+- **overview** — build dashboard (now-building + recent failures).
+- **cohorts** — the dependency cohorts, live and scrollable (largest first).
+- **failures** — all failures, newest first, scrollable.
+
+Keys: `1`/`2`/`3` or `Tab` switch views, `↑`/`↓` scroll, `p` pause/resume, `q` quit (lets
+in-flight builds finish). During the `archive`/`cohorts` phases the banner shows that
+phase's progress (e.g. `Phase: populating archive  340/1320`). Full per-family logs are at
+`<build-dir>/logs/<slug>.<backend>.log`. For non-interactive use pick `--ui plain`
+(prints phase transitions + progress), `--ui json`, or `--ui none`.
 
 ---
 
@@ -306,6 +350,8 @@ failures; `--rebuild` starts over.
 - [x] Modular, optional frontends (curses / plain / json / none) + state.json/events.jsonl for external/web UIs.
 - [x] Partial runs via `--percent` (evenly-spaced sample).
 - [x] Two worklist sources: `--source metadata` (google/fonts) and `--source archive` (the mirrors directly).
+- [x] Zero-to-built bootstrap: auto-clone google/fonts + populate the archive, behind a setup wizard (`--yes` to skip); default paths under `--data-dir`.
+- [x] Phase-driven pipeline (archive → cohorts → build) with a phase-aware, navigable TUI (overview / cohorts / failures).
 - [ ] Emit a migration report: % of library building under fontc, and the blockers per family.
 - [ ] Feed results back to the gfonts_agents dashboard (`reproducible_build` + provenance levels).
 - [ ] Track toward an **all-Rust** build with no Python orchestration in the loop.

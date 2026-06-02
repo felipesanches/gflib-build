@@ -13,6 +13,7 @@ the `fontc` binary.
 | `Family`, `Result` | dataclasses: the work item and its evolving state |
 | discovery | `parse_metadata`, `discover` (METADATA-driven), `discover_from_archive` (mirror-driven, `--source archive`), `sample_evenly` — build the worklist, sample for `--percent` |
 | mirror/git | `mirror_path`, `git`, `ensure_mirror`, `extract_tree`, `preclean_outputs` — archive-safe source access |
+| bootstrap | `ensure_google_fonts` (shallow-clone if absent), `populate_archive` (parallel mirror-missing, append-only), `scan_cohorts`, `setup_wizard` |
 | config | `resolve_config`, `read_requirements`, `normalize_requirements`, `cohort_key_for`, `read_requirements_from_mirror` |
 | `VenvManager` | dependency cohorts: one shared venv per distinct requirements set |
 | building | `run_builder` (backend-aware), `collect_outputs`, `sha256`, `compare_to_shipped` |
@@ -20,6 +21,26 @@ the `fontc` binary.
 | frontends | `Frontend` base + `Curses/Plain/Json/None` + `FRONTENDS` registry + `pick_frontend` |
 | report | `cohorts_report` — read-only cohort preview |
 | main | argument parsing and wiring |
+
+## Phase pipeline (`Orchestrator._drive`, background thread)
+
+`run()` starts a single background **driver** thread that walks the run through phases,
+each publishing live progress (`phase`, `phase_done`, `phase_total`, `phase_label` — all
+under `self.lock`, exposed via `snapshot()`):
+
+1. **`archive`** (if `--populate-archive`) — `populate_archive()` mirrors any referenced
+   upstream repo not already present (parallel; append-only; never mutates/deletes).
+2. **`cohorts`** — `scan_cohorts()` reads each family's `requirements.txt` (read-only `git
+   show`) and groups them; the live list is published in `self.cohorts`.
+3. **`build`** — creates the base venv (if `--manage-venvs`), starts the worker pool, and
+   waits until `all_done()`.
+4. **`done`** — set in `_drive`'s `finally` (even on error: `phase_error` is recorded),
+   which also saves state and closes the events file.
+
+`main()` performs the **google/fonts clone** (`ensure_google_fonts`) and the **setup
+wizard** up front (plain Q&A) *before* the UI, since those are one-shot and interactive;
+the bulk live work (mirror / cohorts / build) happens in the driver. `join()` awaits the
+driver. Frontends treat `phase == "done"` as the completion signal.
 
 ## Per-family build pipeline (`Orchestrator._build_one`)
 
