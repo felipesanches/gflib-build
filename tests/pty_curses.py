@@ -53,23 +53,45 @@ if pid == 0:
     os.environ["TERM"] = "xterm"
     os.execvp(sys.executable, [sys.executable, "-c", harness])
 else:
-    time.sleep(1.5)
-    for seq in (b"\t", b"2", b"3", b"4", b"1", b"\x1b[C", b"\x1b[D", b"\x1bOC", b"\x1bOD"):
-        os.write(fd, seq); time.sleep(0.2)
-    time.sleep(0.3)
-    os.write(fd, b"q")                       # quit the monitor
     out = b""
-    deadline = time.time() + 5
-    while time.time() < deadline:
-        r, _, _ = select.select([fd], [], [], 0.3)
-        if r:
-            try:
-                chunk = os.read(fd, 65536)
-            except OSError:
-                break
-            if not chunk:
-                break
-            out += chunk
+
+    def drain(seconds):                              # keep reading so the pty buffer never fills
+        global out
+        end = time.time() + seconds
+        while time.time() < end:
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    return False
+                if not chunk:
+                    return False
+                out += chunk
+        return True
+
+    drain(1.5)
+    DOWN, UP, RIGHT, LEFT, ENTER, ESC = b"\x1b[B", b"\x1b[A", b"\x1b[C", b"\x1b[D", b"\r", b"\x1b"
+    seqs = [
+        DOWN, DOWN,              # overview: move task selection
+        ENTER, DOWN, DOWN, ESC,  # open a task detail, scroll it, close
+        RIGHT,                   # -> cohorts
+        DOWN, ENTER, ESC,        # select a cohort, open requirements detail, close
+        RIGHT,                   # -> failures
+        DOWN, ENTER, DOWN, ESC,  # select a failure, open log detail, scroll, close
+        RIGHT,                   # -> stats
+        DOWN, ENTER, ESC,        # select an op, open detail, close
+        LEFT, LEFT,              # arrow tabs backwards
+        b"1", b"2", b"3", b"4",  # number jumps
+    ]
+    for seq in seqs:
+        os.write(fd, seq)
+        drain(0.18)
+    os.write(fd, b"q")                       # quit the monitor
+    end = time.time() + 10                    # drain until the child exits (EOF) so we see CURSES_OK
+    while time.time() < end:
+        if not drain(0.4):                    # drain() returns False on EOF
+            break
     _, st = os.waitpid(pid, 0)
     ok = b"CURSES_OK" in out
     print("exit status:", os.waitstatus_to_exitcode(st))

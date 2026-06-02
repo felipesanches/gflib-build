@@ -137,6 +137,13 @@ intent so nothing is lost as the tool evolves.
     gradually growing list in the UI.
 26. **Arrow-key tabs.** The dashboard's view tabs are driven by the ←/→ arrows (number keys
     still jump directly).
+27. **Now-building shows checkouts.** A family appears in the "Now building" list (with a
+    `checkout` tag) from the moment its source is being extracted, not only once it compiles.
+28. **List selection + detail.** On every tab, `↑`/`↓` select an item in that tab's list and
+    `↵` opens a detail overlay (a failure's full error + log tail, a cohort's requirements,
+    etc.); `Esc`/`←`/`↵` returns.
+29. **Cumulative clock.** The elapsed timer represents the real time spent so far across
+    reopen/resume — it is not reset to zero when the program is reopened.
 
 ---
 
@@ -300,8 +307,8 @@ arrows** (or `Tab`):
  disk +12.3GiB  free 290.0GiB  jobs 8  cohorts 28  fontc 980/fontmake 240
  Phase: building   built 412/1503  failed 7  building 8  queued 1076
  [######################------------------------------------]  31%
-  1 overview   2 cohorts   3 failures   4 stats        [←→]tabs [↑↓]scroll
- Pipeline -------------------------------------------------------------------
+  1 overview   2 cohorts   3 failures   4 stats     [←→]tabs [↑↓]select [↵]info
+ Pipeline  (↑↓ select · ↵ details) -----------------------------------------
   ✅ clone google/fonts          00:00:31   <build-dir>/google-fonts
   ➖ build fontc from source                 (skipped — binary detected)
   ✅ discover worklist           00:00:04   1503 queued of 1503 selected
@@ -311,20 +318,25 @@ arrows** (or `Tab`):
  Archive — repos mirrored (newest last) -------------------------------------
   + google/fonts-sources    + notofonts/latin-greek-cyrillic   ✗ owner/dead-repo
  Now building ----------------------------------------------------------------
-  w 1 ofl/notosanstc                       02:10  fontc
- [q]uit — build keeps running (re-run to reattach; --stop to cancel)
+  w 1 ofl/notosanstc                       02:10  checkout
+  w 2 ofl/roboto                           00:42  fontmake
+ [q]uit — build runs on  [↑↓]select [↵]details [←→]tabs
 ```
 
 - **overview** — the pipeline task-list, the live archive-population list (repos appear as
-  they are mirrored), now-building, and recent failures.
-- **cohorts** — the dependency cohorts, live and scrollable (largest first).
-- **failures** — all failures, newest first, scrollable.
+  they are mirrored), now-building (each entry shows its step: `checkout` while the source
+  is being extracted, then the cohort/backend), and recent failures.
+- **cohorts** — the dependency cohorts, live (largest first).
+- **failures** — all failures, newest first.
 - **stats** — fontc-migration tally + per-phase / per-operation timing.
 
-Keys: **`←`/`→`** (or `Tab`) switch views, `1`/`2`/`3`/`4` jump to a view, `↑`/`↓` scroll,
-`q` quit. Full per-family logs are at `<build-dir>/logs/<slug>.<backend>.log`. For
-non-interactive use pick `--ui plain` (prints phase transitions + progress), `--ui json`, or
-`--ui none`.
+Keys: **`←`/`→`** (or `Tab`) switch views, `1`/`2`/`3`/`4` jump to a view, **`↑`/`↓` select**
+an item in the current tab's list, **`↵` open a detail overlay** for the selected item (a
+failure's full error + log tail, a cohort's requirements, a task's detail, an op's timing;
+`Esc`/`←`/`↵` returns), `q` quit. The **elapsed clock is cumulative** — it reflects the real
+time the build has spent across reopen/resume, not reset to zero. Full per-family logs are at
+`<build-dir>/logs/<slug>.log`. For non-interactive use pick `--ui plain` (prints phase
+transitions + progress), `--ui json`, or `--ui none`.
 
 ### Quit anytime — the build keeps running, resume straight to live updates
 

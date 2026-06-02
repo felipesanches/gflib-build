@@ -609,7 +609,11 @@ def run_builder(python: str, config_path: Path, work: Path, log_path: Path,
     # gftools.builder shells out to fontmake / ninja / gftools / ttfautohint BY NAME, so
     # the chosen interpreter's bin/ must be on PATH (running venv/bin/python does not, by
     # itself, activate the venv).
-    bindir = os.path.dirname(os.path.abspath(python))
+    # ABSOLUTE interpreter path: the builder subprocess runs with cwd=work (the extraction
+    # dir), so a relative python path (e.g. from a relative --data-dir) would resolve against
+    # work and fail with "could not launch builder: No such file or directory".
+    python = os.path.abspath(python)
+    bindir = os.path.dirname(python)
     env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
     cmd = [python, "-m", "gftools.builder", str(config_path)]
     if backend == "fontc":
@@ -760,6 +764,8 @@ class Orchestrator:
         self.stop = threading.Event()
         self.paused = threading.Event()
         self.start_time = time.time()
+        self._resumed_elapsed = 0.0   # active wall-time from prior sessions (so the clock
+                                       # is cumulative across reopen/resume, not reset to 0)
         self.disk_baseline = self._disk_used()
         self.failures: List[str] = []
         self.workers: List[threading.Thread] = []
@@ -903,12 +909,15 @@ class Orchestrator:
                 for slug, r in data.get("results", {}).items():
                     self.results[slug] = Result(**{k: v for k, v in r.items()
                                                    if k in Result.__dataclass_fields__})
+                # carry the prior sessions' elapsed so the clock continues, not resets
+                self._resumed_elapsed = float(data.get("elapsed_so_far", 0.0))
             except Exception:
                 pass
 
     def save_state(self):
         with self.lock:
             data = {"saved_at": time.time(), "build_dir": str(self.build_dir),
+                    "elapsed_so_far": self._resumed_elapsed + (time.time() - self.start_time),
                     "results": {s: asdict(r) for s, r in self.results.items()}}
         tmp = self.state_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, indent=1))
@@ -1007,7 +1016,7 @@ class Orchestrator:
                       "total": t.total, "detail": t.detail} for t in self.tasks]
             archive_recent = [{"status": s, "repo": r} for s, r in self.archive_log[-60:]]
         return {
-            "elapsed": time.time() - self.start_time,
+            "elapsed": self._resumed_elapsed + (time.time() - self.start_time),
             "disk_used_delta": disk_delta, "disk_free": disk_free,
             "jobs": self.args.jobs, "paused": self.paused.is_set(),
             "total": len(rs), "counts": counts, "backends": backends,
@@ -1092,8 +1101,10 @@ class Orchestrator:
             self._record_op(slug, op, time.time() - t0)
             return r
 
+        # note="checkout" from the very start so the family's name + step is visible in the
+        # "Now building" panel while its checkout (mirror + extract) is still happening
         self._set(slug, status="building", started=time.time(), worker=wid,
-                  ended=0.0, error="", note="", backend="", log=log_rel)
+                  ended=0.0, error="", note="checkout", backend="", log=log_rel)
         self._emit("started", slug, worker=wid)
         try:
             mirror, err = timed("mirror", lambda: ensure_mirror(
@@ -1105,6 +1116,7 @@ class Orchestrator:
             flog("extract: " + ("ok" if not err else f"FAIL {err}"))
             if err:
                 return self._fail(slug, err)
+            self._set(slug, note="")           # checked out — next step sets its own tag
 
             if self.venvs is not None:
                 req = read_requirements(work)
@@ -1414,6 +1426,15 @@ def hms(secs: float) -> str:
     return f"{secs // 3600:02d}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"
 
 
+def _read_log_tail(path: Path, n: int = 120) -> List[str]:
+    """Last `n` lines of a per-family log, for the failure detail overlay."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ["(log not available)"]
+    return lines[-n:] if lines else ["(empty log)"]
+
+
 class Frontend:
     """Base frontend: observe an Orchestrator and render progress. Subclass and register
     in FRONTENDS, or write your own (e.g. web) that tails <build-dir>/events.jsonl +
@@ -1517,6 +1538,46 @@ class CursesFrontend(Frontend):
     ASCII = {"pending": "..", "running": ">>", "done": "OK", "failed": "XX", "skipped": "--"}
     VIEWS = ("overview", "cohorts", "failures", "stats")
 
+    def _nav_items(self, view: str, snap: dict) -> list:
+        """The selectable list for a view (↑/↓ moves the selection; ↵ opens its detail)."""
+        if view == "overview":
+            return snap.get("tasks", [])
+        if view == "cohorts":
+            return snap.get("cohorts", [])
+        if view == "failures":
+            return snap.get("failures_recent", [])
+        if view == "stats":
+            return sorted(snap.get("op_stats", {}).items(), key=lambda kv: -kv[1]["total"])
+        return []
+
+    def _detail_lines(self, view: str, item) -> List[str]:
+        """Full detail for the selected list item, shown in the overlay."""
+        out: List[str] = []
+        if view == "overview":                       # a pipeline Task dict
+            out += [f"Task: {item.get('name', '')}", f"key: {item.get('key', '')}",
+                    f"status: {item.get('status', '')}",
+                    f"elapsed: {hms(item.get('elapsed', 0))}"]
+            if item.get("total"):
+                out.append(f"progress: {item['done']}/{item['total']}")
+            if item.get("detail"):
+                out += ["", "detail:", "  " + str(item["detail"])]
+        elif view == "cohorts":                      # {key, count, requirements}
+            out += [f"Cohort: {item.get('key', '')}", f"families: {item.get('count', 0)}", "",
+                    "requirements:"]
+            reqs = (item.get("requirements") or "").splitlines()
+            out += ["  " + r for r in reqs] or ["  (none — the 'base' cohort has no requirements file)"]
+        elif view == "failures":                     # {slug, error, log}
+            log = item.get("log", "")
+            out += [f"Failed: {item.get('slug', '')}", "", "error:", "  " + str(item.get("error", "")),
+                    "", f"log: {self.orch.build_dir / log if log else '(none)'}", "", "log tail:"]
+            if log:
+                out += ["  " + ln for ln in _read_log_tail(self.orch.build_dir / log, 120)]
+        elif view == "stats":                        # (op, {total,count,mean,max})
+            op, s = item
+            out += [f"Operation: {op}", f"total: {s['total']} s", f"count: {s['count']}",
+                    f"mean: {s['mean']} s", f"max: {s['max']} s"]
+        return out
+
     def _draw(self, stdscr):
         import curses
         stdscr.nodelay(True)
@@ -1548,37 +1609,54 @@ class CursesFrontend(Frontend):
         SATTR = {"done": GREEN, "failed": RED, "running": YEL, "skipped": curses.A_DIM,
                  "pending": curses.A_NORMAL}
         mon = getattr(self, "monitor", False)
-        view, scroll = "overview", 0
+        view, sel, detail, dscroll = "overview", 0, None, 0
         while True:
             if self.orch.stop.is_set() and not mon:
                 break
+            snap = self.orch.snapshot()
             ch = stdscr.getch()
             if ch in (ord("q"), ord("Q")):
                 if not mon:
                     self.orch.stop.set()
                 break
+            elif detail is not None:                 # inside the detail overlay
+                if ch in (27, 10, 13, curses.KEY_BACKSPACE, 127, 8, curses.KEY_LEFT):
+                    detail = None
+                elif ch == curses.KEY_DOWN:
+                    dscroll += 1
+                elif ch == curses.KEY_UP:
+                    dscroll = max(0, dscroll - 1)
             elif ch in (ord("p"), ord("P")):
                 (self.orch.paused.clear if self.orch.paused.is_set() else self.orch.paused.set)()
             elif ch in (ord("1"), ord("o"), ord("O")):
-                view, scroll = "overview", 0
+                view, sel = "overview", 0
             elif ch in (ord("2"),):
-                view, scroll = "cohorts", 0
+                view, sel = "cohorts", 0
             elif ch in (ord("3"),):
-                view, scroll = "failures", 0
+                view, sel = "failures", 0
             elif ch in (ord("4"),):
-                view, scroll = "stats", 0
+                view, sel = "stats", 0
             elif ch in (9, curses.KEY_RIGHT):        # Tab / → : next view
                 view = self.VIEWS[(self.VIEWS.index(view) + 1) % len(self.VIEWS)]
-                scroll = 0
+                sel = 0
             elif ch == curses.KEY_LEFT:              # ← : previous view
                 view = self.VIEWS[(self.VIEWS.index(view) - 1) % len(self.VIEWS)]
-                scroll = 0
-            elif ch == curses.KEY_DOWN:
-                scroll += 1
-            elif ch == curses.KEY_UP:
-                scroll = max(0, scroll - 1)
+                sel = 0
+            elif ch == curses.KEY_DOWN:              # ↓ : move selection down the list
+                sel += 1
+            elif ch == curses.KEY_UP:                # ↑ : move selection up
+                sel = max(0, sel - 1)
+            elif ch in (10, 13):                     # Enter : open details for the selected item
+                items = self._nav_items(view, snap)
+                if items:
+                    # snapshot the detail text once (so failure-log tails aren't re-read each frame)
+                    detail = self._detail_lines(view, items[min(sel, len(items) - 1)])
+                    dscroll = 0
 
+            # re-snapshot after the keypress so the view reflects the latest state + clamp sel
             snap = self.orch.snapshot()
+            items = self._nav_items(view, snap)
+            sel = max(0, min(sel, len(items) - 1)) if items else 0
             c, bk = snap["counts"], snap["backends"]
             h, w = stdscr.getmaxyx()
             stdscr.erase()
@@ -1624,20 +1702,38 @@ class CursesFrontend(Frontend):
                               ("3 failures", "failures"), ("4 stats", "stats")):
                 put(4, x, f" {lbl} ", curses.A_REVERSE if view == name else curses.A_DIM)
                 x += len(lbl) + 3
-            put(4, max(x + 2, w - 22), "[←→]tabs [↑↓]scroll", curses.A_DIM)
+            put(4, max(x + 2, w - 26), "[←→]tabs [↑↓]select [↵]info", curses.A_DIM)
+
+            # ---- selected-row renderer: highlights `sel`, auto-scrolls to keep it visible ----
+            def draw_list(row0, lst, fmt, color=None):
+                vis = max(1, h - row0 - 1)
+                top = 0 if sel < vis else min(sel - vis + 1, max(0, len(lst) - vis))
+                for idx in range(top, min(len(lst), top + vis)):
+                    a = (color(lst[idx]) if color else 0)
+                    if idx == sel:
+                        a |= curses.A_REVERSE
+                    put(row0 + idx - top, 1, fmt(lst[idx]), a)
 
             row = 6
-            if view == "overview":
+            if detail is not None:                   # ---- detail overlay for the selected item ----
+                put(5, 0, " Details — [Esc/←/↵] back   [↑↓] scroll ".ljust(w - 1, "-"), curses.A_BOLD)
+                lines = detail                        # captured once when opened (no per-frame I/O)
+                dscroll = min(dscroll, max(0, len(lines) - 1))
+                for i, ln in enumerate(lines[dscroll:dscroll + max(1, h - row - 1)]):
+                    put(row + i, 2, ln, curses.A_BOLD if ln and not ln.startswith(" ") and ln.endswith(":") else 0)
+            elif view == "overview":
                 # end-to-end pipeline task-list (clone → fontc → discover → archive → cohorts → build)
-                put(row, 0, " Pipeline ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
-                for t in snap.get("tasks", []):
+                put(row, 0, " Pipeline  (↑↓ select · ↵ details) ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
+                tasks = snap.get("tasks", [])
+                for i, t in enumerate(tasks):
                     mark = MARK.get(t["status"], "?")
                     prog = ""
                     if t["total"]:
                         prog = f"{t['done']}/{t['total']} {int(100 * t['done'] / max(1, t['total'])):>3}%"
                     el = hms(t["elapsed"]) if t["elapsed"] else ""
                     line = f"{mark} {t['name']:<30} {prog:<13} {el:>8}  {t['detail']}"
-                    put(row, 1, line, SATTR.get(t["status"], 0)); row += 1
+                    a = SATTR.get(t["status"], 0) | (curses.A_REVERSE if i == sel else 0)
+                    put(row, 1, line, a); row += 1
                 # live, growing list of repos as they are mirrored into the archive
                 arch = snap.get("archive_recent", [])
                 if arch and ph == "archive":
@@ -1658,30 +1754,27 @@ class CursesFrontend(Frontend):
                 if not snap["building"]:
                     put(row, 1, "(idle)" if ph in ("build", "done") else f"… {plabel}"); row += 1
                 row += 1
-                put(row, 0, f" Recent failures ({c['failed']}) ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
+                put(row, 0, f" Recent failures ({c['failed']}) — open the Failures tab to inspect "
+                            .ljust(w - 1, "-"), curses.A_BOLD); row += 1
                 for f in snap["failures_recent"][:max(0, h - row - 2)]:
                     put(row, 1, f"{f['slug']:<36} {f['error']}", RED); row += 1
             elif view == "cohorts":
                 cohorts = snap["cohorts"]
-                put(row, 0, f" Dependency cohorts ({len(cohorts)}) — live ".ljust(w - 1, "-"),
-                    curses.A_BOLD); row += 1
-                vis = max(1, h - row - 1)
-                scroll = min(scroll, max(0, len(cohorts) - vis))
-                for co in cohorts[scroll:scroll + vis]:
-                    reqs = co["requirements"].splitlines()
-                    sig = (reqs[0][:48] if reqs else "(no requirements)")
-                    put(row, 1, f"{co['count']:>4}  {co['key']:<16} {sig}",
-                        CYAN if co["key"] != "base" else 0); row += 1
+                put(row, 0, f" Dependency cohorts ({len(cohorts)}) — ↑↓ select · ↵ requirements "
+                            .ljust(w - 1, "-"), curses.A_BOLD); row += 1
+                draw_list(row, cohorts,
+                          lambda co: "%4d  %-16s %s" % (
+                              co["count"], co["key"],
+                              (co["requirements"].splitlines()[0][:48]
+                               if co["requirements"].splitlines() else "(no requirements)")),
+                          color=lambda co: 0 if co["key"] == "base" else CYAN)
                 if not cohorts:
                     put(row, 1, f"(cohorts appear during the '{self.PHASE_LABEL['cohorts']}' phase)")
             elif view == "failures":
                 fails = snap["failures_recent"]
-                put(row, 0, f" Failures ({c['failed']}) — newest first ".ljust(w - 1, "-"),
-                    curses.A_BOLD); row += 1
-                vis = max(1, h - row - 1)
-                scroll = min(scroll, max(0, len(fails) - vis))
-                for f in fails[scroll:scroll + vis]:
-                    put(row, 1, f"{f['slug']:<34} {f['error']}", RED); row += 1
+                put(row, 0, f" Failures ({c['failed']}) — newest first · ↑↓ select · ↵ log "
+                            .ljust(w - 1, "-"), curses.A_BOLD); row += 1
+                draw_list(row, fails, lambda f: f"{f['slug']:<34} {f['error']}", color=lambda f: RED)
                 if not fails:
                     put(row, 1, "(no failures)", GREEN)
             elif view == "stats":
@@ -1693,23 +1786,25 @@ class CursesFrontend(Frontend):
                                if (m.get('both_identical') or m.get('both_differ')) else ""),
                     GREEN); row += 2
                 put(row, 0, " Timing — phases ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
-                for ph, sec in sorted(snap.get("phase_durations", {}).items(),
-                                      key=lambda kv: -kv[1]):
-                    put(row, 1, f"{ph:<12} {hms(sec)}"); row += 1
+                for phn, sec in sorted(snap.get("phase_durations", {}).items(),
+                                       key=lambda kv: -kv[1]):
+                    put(row, 1, f"{phn:<12} {hms(sec)}"); row += 1
                 row += 1
-                put(row, 0, " Timing — operations (total / count / mean / max, s) ".ljust(w - 1, "-"),
+                put(row, 0, " Timing — operations (↑↓ select · ↵ details) ".ljust(w - 1, "-"),
                     curses.A_BOLD); row += 1
-                ops = sorted(snap.get("op_stats", {}).items(), key=lambda kv: -kv[1]["total"])
-                vis = max(1, h - row - 1)
-                scroll = min(scroll, max(0, len(ops) - vis))
-                for op, s in ops[scroll:scroll + vis]:
-                    put(row, 1, f"{op:<10} total {s['total']:>9.1f}   n {s['count']:>5}   "
-                                f"mean {s['mean']:>7.2f}   max {s['max']:>7.1f}", CYAN); row += 1
+                ops = self._nav_items("stats", snap)
+                draw_list(row, ops,
+                          lambda kv: f"{kv[0]:<10} total {kv[1]['total']:>9.1f}   n {kv[1]['count']:>5}   "
+                                     f"mean {kv[1]['mean']:>7.2f}   max {kv[1]['max']:>7.1f}",
+                          color=lambda kv: CYAN)
                 if not ops:
                     put(row, 1, "(timing accrues as builds run)")
 
-            foot = (" [q]uit — build keeps running (re-run to reattach; --stop to cancel)"
-                    if mon else " [q]uit [p]ause")
+            if detail is not None:
+                foot = " [esc/←/↵] back to list   [↑↓] scroll"
+            else:
+                foot = (" [q]uit — build runs on  [↑↓]select [↵]details [←→]tabs"
+                        if mon else " [q]uit [p]ause  [↑↓]select [↵]details")
             if mon and not snap.get("daemon_alive", True):
                 foot = " [q]uit   ⚠ daemon not running (build finished or stopped)"
             put(h - 1, 0, foot + "   logs: " + str(self.orch.build_dir / "logs"), curses.A_DIM)
@@ -2215,7 +2310,8 @@ def main():
         sys.exit("gflib-build targets macOS/Linux (POSIX venv layout, git archive, tar).")
 
     # ---- attach / stop an existing (possibly detached) build, then exit ----
-    mon_build_dir = Path(args.build_dir) if args.build_dir else (Path(args.data_dir) / "build")
+    mon_build_dir = (Path(args.build_dir) if args.build_dir
+                     else (Path(args.data_dir) / "build")).resolve()
     if args.stop:
         pid = read_daemon_pid(mon_build_dir)
         if pid is None:
@@ -2230,15 +2326,19 @@ def main():
         return
 
     # ---- resolve paths (defaults from --data-dir; auto-detect where possible) ----
-    data_dir = Path(args.data_dir)
+    # All paths are made ABSOLUTE: the per-build subprocess runs with cwd=<extraction dir>,
+    # so a relative build dir would make the venv interpreter / config paths unresolvable.
+    data_dir = Path(args.data_dir).resolve()
     gf = (Path(args.google_fonts) if args.google_fonts
           else (data_dir / "google-fonts" if args.source == "metadata" else None))
+    gf = gf.resolve() if gf else None
     if args.archive:
         archive = Path(args.archive)
     else:
         det = detect_archive(data_dir)        # auto-detect a pre-existing archive
         archive = Path(det) if det else (data_dir / "archive")
-    build_dir = Path(args.build_dir) if args.build_dir else (data_dir / "build")
+    archive = archive.resolve()
+    build_dir = (Path(args.build_dir) if args.build_dir else (data_dir / "build")).resolve()
     if not args.fontc_bin:
         args.fontc_bin = detect_fontc()       # auto-detect a fontc binary
     read_only = args.list or args.cohorts_report
@@ -2346,6 +2446,12 @@ def main():
             args.base_requirements = str(bundled)
 
     # ---- finalize + validate FIRST — before any expensive clone/build (fail fast) ----
+    gf = gf.resolve() if gf else None         # re-resolve (the wizard may have set relatives)
+    archive = archive.resolve()
+    build_dir = build_dir.resolve()
+    if args.fontc_bin:
+        args.fontc_bin = str(Path(args.fontc_bin).resolve())
+    args.data_dir = str(data_dir)
     args.google_fonts = str(gf) if gf else None
     args.archive = str(archive)
     args.build_dir = str(build_dir)
