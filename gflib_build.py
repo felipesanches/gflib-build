@@ -270,6 +270,91 @@ def preclean_outputs(work: Path) -> None:
             pass
 
 
+GOOGLE_FONTS_URL = "https://github.com/google/fonts.git"
+
+
+def ensure_google_fonts(path: Path, on_progress: Optional[Callable[[str], None]] = None) -> Path:
+    """Clone google/fonts (shallow) if `path` is not already a clone. Returns `path`."""
+    if (path / "ofl").is_dir():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if on_progress:
+        on_progress(f"cloning google/fonts → {path} (shallow)…")
+    rc, _, err = git(["clone", "--depth", "1", GOOGLE_FONTS_URL, str(path)], timeout=3600)
+    if rc != 0:
+        tail = err.strip().splitlines()[-1] if err.strip() else str(rc)
+        raise RuntimeError(f"google/fonts clone failed: {tail}")
+    return path
+
+
+def populate_archive(repo_urls, archive: Path, jobs: int,
+                     on_progress: Optional[Callable[[int, int, str], None]] = None):
+    """Ensure every repo_url has a bare mirror in the archive; clone --mirror the missing
+    ones (append-only — never deletes). Returns (added, failed, present). Read-only on any
+    existing mirror; parallel across `jobs`."""
+    from concurrent.futures import ThreadPoolExecutor
+    urls = sorted(set(repo_urls))
+    added: List[str] = []
+    failed: List[Tuple[str, str]] = []
+    present = 0
+    lock = threading.Lock()
+    done = [0]
+
+    def one(url: str):
+        mp = mirror_path(archive, url)
+        if mp.is_dir():
+            return ("present", url, "")
+        mp.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = git(["clone", "--mirror", url, str(mp)], timeout=1800)
+        if rc != 0:
+            tail = err.strip().splitlines()[-1] if err.strip() else str(rc)
+            return ("failed", url, tail)
+        return ("added", url, "")
+
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
+        for status, url, msg in ex.map(one, urls):
+            with lock:
+                done[0] += 1
+                if status == "added":
+                    added.append(url)
+                elif status == "failed":
+                    failed.append((url, msg))
+                else:
+                    present += 1
+                if on_progress:
+                    on_progress(done[0], len(urls), url)
+    return added, failed, present
+
+
+def scan_cohorts(families: List[Family], archive: Path, jobs: int,
+                 on_progress: Optional[Callable[[int, int, str], None]] = None):
+    """Group families by their normalized repo requirements (read-only `git show` on the
+    mirrors). Returns (groups: cohort_key -> [slug], sigs: cohort_key -> requirements)."""
+    from concurrent.futures import ThreadPoolExecutor
+    from collections import defaultdict
+    groups: Dict[str, List[str]] = defaultdict(list)
+    sigs: Dict[str, str] = {}
+    lock = threading.Lock()
+    done = [0]
+
+    def one(fam: Family):
+        mp = mirror_path(archive, fam.repo_url)
+        if not mp.is_dir():
+            return fam.slug, "(mirror-absent)", ""
+        req = read_requirements_from_mirror(mp, fam.commit)
+        return fam.slug, cohort_key_for(req), normalize_requirements(req)
+
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
+        for slug, cohort, sig in ex.map(one, families):
+            with lock:
+                groups[cohort].append(slug)
+                sigs.setdefault(cohort, sig)
+                done[0] += 1
+                if on_progress:
+                    on_progress(done[0], len(families), slug)
+    return dict(groups), sigs
+
+
 # ============================================================================== config
 
 def resolve_config(google_fonts: Optional[Path], fam: Family, work: Path):
@@ -539,8 +624,30 @@ class Orchestrator:
             self.venvs = VenvManager(self.build_dir, args.base_python,
                                      Path(args.base_requirements) if args.base_requirements else None)
 
+        # phase pipeline state (archive → cohorts → build → done)
+        self.phase = "init"
+        self.phase_total = 0
+        self.phase_done = 0
+        self.phase_label = ""
+        self.phase_error = ""
+        self.cohorts: Dict[str, dict] = {}
+        self.driver: Optional[threading.Thread] = None
+
         self._load_state()
         self._enqueue()
+
+    # ---- phase helpers
+    def _begin_phase(self, name: str, total: int):
+        with self.lock:
+            self.phase, self.phase_total, self.phase_done, self.phase_label = name, total, 0, ""
+
+    def _phase_progress(self, done: int, label: str = ""):
+        with self.lock:
+            self.phase_done, self.phase_label = done, label
+
+    def _set_phase(self, name: str):
+        with self.lock:
+            self.phase = name
 
     # ---- persistence / events
     @property
@@ -629,6 +736,10 @@ class Orchestrator:
             disk_delta, disk_free = max(0, du.used - self.disk_baseline), du.free
         except OSError:
             disk_delta, disk_free = 0, 0
+        with self.lock:
+            phase, ptot, pdone, plabel, perr = (self.phase, self.phase_total,
+                                                self.phase_done, self.phase_label, self.phase_error)
+            cohorts = list(self.cohorts.items())
         return {
             "elapsed": time.time() - self.start_time,
             "disk_used_delta": disk_delta, "disk_free": disk_free,
@@ -636,7 +747,11 @@ class Orchestrator:
             "total": len(rs), "counts": counts, "backends": backends,
             "building": building, "failures_recent": fails,
             "cohorts_ready": self.venvs.ready_count() if self.venvs else 0,
-            "done": self.all_done(),
+            "phase": phase, "phase_total": ptot, "phase_done": pdone,
+            "phase_label": plabel, "phase_error": perr,
+            "cohorts": [{"key": k, "count": v["count"],
+                         "requirements": v["requirements"]} for k, v in cohorts],
+            "done": phase == "done",
         }
 
     def all_done(self) -> bool:
@@ -762,25 +877,54 @@ class Orchestrator:
             return ["fontc"]
         return ["fontc", "fontmake"] if self.args.fontc_bin else ["fontmake"]
 
-    # ---- lifecycle
+    # ---- lifecycle: a background driver runs the phases (archive → cohorts → build)
     def run(self):
-        if self.venvs is not None:
-            self.venvs.ensure_base()
-        for i in range(max(1, self.args.jobs)):
-            t = threading.Thread(target=self.worker, args=(i + 1,), daemon=True)
-            t.start()
-            self.workers.append(t)
+        self.driver = threading.Thread(target=self._drive, daemon=True)
+        self.driver.start()
+
+    def _drive(self):
+        try:
+            # Phase: populate the archive (mirror any missing upstream repos) — append-only
+            if getattr(self.args, "populate_archive", False) and self.families:
+                urls = sorted({f.repo_url for f in self.families.values()})
+                self._begin_phase("archive", len(urls))
+                populate_archive(urls, self.archive, self.args.jobs,
+                                 on_progress=lambda d, t, u: self._phase_progress(d, u))
+            # Phase: scan/generate the dependency cohorts (read-only)
+            if self.families:
+                self._begin_phase("cohorts", len(self.families))
+                groups, sigs = scan_cohorts(
+                    list(self.families.values()), self.archive, self.args.jobs,
+                    on_progress=lambda d, t, s: self._phase_progress(d, s))
+                with self.lock:
+                    self.cohorts = {k: {"count": len(v), "requirements": sigs.get(k, "")}
+                                    for k, v in sorted(groups.items(), key=lambda kv: -len(kv[1]))}
+            # Phase: build
+            if self.venvs is not None:
+                self.venvs.ensure_base()
+            self._begin_phase("build", self.q.qsize())
+            for i in range(max(1, self.args.jobs)):
+                t = threading.Thread(target=self.worker, args=(i + 1,), daemon=True)
+                t.start()
+                self.workers.append(t)
+            while any(t.is_alive() for t in self.workers):
+                if self.stop.is_set() or self.all_done():
+                    self.stop.set()
+                time.sleep(0.2)
+        except Exception as e:
+            with self.lock:
+                self.phase_error = str(e)
+        finally:
+            self.save_state()
+            self._set_phase("done")
+            try:
+                self._events.close()
+            except Exception:
+                pass
 
     def join(self):
-        while any(t.is_alive() for t in self.workers):
-            if self.all_done():
-                self.stop.set()
-            time.sleep(0.2)
-        self.save_state()
-        try:
-            self._events.close()
-        except Exception:
-            pass
+        if self.driver is not None:
+            self.driver.join()
 
 
 # ============================================================================ frontends
@@ -820,9 +964,13 @@ class NoneFrontend(Frontend):
 class PlainFrontend(Frontend):
     """Traditional terminal output: one line per completion + periodic summaries."""
     def run(self):
-        seen, last = set(), 0.0
+        seen, last, last_phase = set(), 0.0, None
         while True:
             snap = self.orch.snapshot()
+            ph = snap["phase"]
+            if ph != last_phase:
+                print(f"== phase: {ph} ==", flush=True)
+                last_phase = ph
             with self.orch.lock:
                 done = [(r.slug, r.status, r.backend, r.error, r.dur(), r.out_missing)
                         for r in self.orch.results.values()
@@ -837,10 +985,15 @@ class PlainFrontend(Frontend):
             now = time.time()
             if now - last > 5:
                 c = snap["counts"]
-                print(f"  -- {hms(snap['elapsed'])}  built {c['built']} failed {c['failed']} "
-                      f"building {c['building']} queued {c['queued']}  disk +{human(snap['disk_used_delta'])} "
-                      f"[fontc {snap['backends']['fontc']}/fontmake {snap['backends']['fontmake']}]",
-                      flush=True)
+                if ph in ("archive", "cohorts") and snap["phase_total"]:
+                    print(f"  -- {hms(snap['elapsed'])}  {ph}: {snap['phase_done']}/"
+                          f"{snap['phase_total']}  disk +{human(snap['disk_used_delta'])}", flush=True)
+                else:
+                    print(f"  -- {hms(snap['elapsed'])}  built {c['built']} failed {c['failed']} "
+                          f"building {c['building']} queued {c['queued']}  "
+                          f"disk +{human(snap['disk_used_delta'])} "
+                          f"[fontc {snap['backends']['fontc']}/fontmake {snap['backends']['fontmake']}]",
+                          flush=True)
                 last = now
             if snap["done"]:
                 self.orch.stop.set()
@@ -875,6 +1028,9 @@ class CursesFrontend(Frontend):
             print(f"curses error ({e}); switching to plain output.", file=sys.stderr)
             return PlainFrontend(self.orch).run()
 
+    PHASE_LABEL = {"init": "starting…", "archive": "populating archive (mirroring repos)",
+                   "cohorts": "scanning dependency cohorts", "build": "building", "done": "done"}
+
     def _draw(self, stdscr):
         import curses
         stdscr.nodelay(True)
@@ -895,15 +1051,29 @@ class CursesFrontend(Frontend):
             GREEN, RED, YEL, CYAN = (curses.color_pair(i) for i in range(1, 5))
         else:
             GREEN = RED = YEL = CYAN = curses.A_NORMAL
+        view, scroll = "overview", 0
         while True:
             if self.orch.stop.is_set():
                 break
             ch = stdscr.getch()
             if ch in (ord("q"), ord("Q")):
-                self.orch.stop.set()
-                break
-            if ch in (ord("p"), ord("P")):
+                self.orch.stop.set(); break
+            elif ch in (ord("p"), ord("P")):
                 (self.orch.paused.clear if self.orch.paused.is_set() else self.orch.paused.set)()
+            elif ch in (ord("1"), ord("o"), ord("O")):
+                view, scroll = "overview", 0
+            elif ch in (ord("2"), ord("c"), ord("C")):
+                view, scroll = "cohorts", 0
+            elif ch in (ord("3"), ord("f"), ord("F")):
+                view, scroll = "failures", 0
+            elif ch == 9:  # Tab cycles views
+                view = {"overview": "cohorts", "cohorts": "failures", "failures": "overview"}[view]
+                scroll = 0
+            elif ch == curses.KEY_DOWN:
+                scroll += 1
+            elif ch == curses.KEY_UP:
+                scroll = max(0, scroll - 1)
+
             snap = self.orch.snapshot()
             c, bk = snap["counts"], snap["backends"]
             h, w = stdscr.getmaxyx()
@@ -911,41 +1081,83 @@ class CursesFrontend(Frontend):
 
             def put(y, x, s, attr=0):
                 if 0 <= y < h and 0 <= x < w:
-                    stdscr.addnstr(y, x, s, max(0, w - x - 1), attr)
+                    stdscr.addnstr(y, x, str(s), max(0, w - x - 1), attr)
 
-            done = c["built"] + c["failed"]
             grand = snap["total"] or 1
+            done = c["built"] + c["failed"]
+            ph = snap["phase"]
+            plabel = self.PHASE_LABEL.get(ph, ph)
+            # header
             put(0, 0, " Google Fonts library build" + (" [PAUSED]" if snap["paused"] else ""),
                 curses.A_BOLD)
             put(0, max(0, w - 24), f"elapsed {hms(snap['elapsed'])}", curses.A_BOLD)
-            put(1, 0, f" disk: +{human(snap['disk_used_delta'])} used   free {human(snap['disk_free'])}"
-                      f"   jobs {snap['jobs']}   cohorts {snap['cohorts_ready']}", CYAN)
-            put(3, 0, " Built", curses.A_BOLD); put(3, 7, f"{c['built']}/{grand}", GREEN | curses.A_BOLD)
-            put(3, 22, "Failed", curses.A_BOLD); put(3, 29, str(c["failed"]), RED | curses.A_BOLD)
-            put(3, 38, "Building", curses.A_BOLD); put(3, 47, str(c["building"]), YEL | curses.A_BOLD)
-            put(3, 54, "Queued", curses.A_BOLD); put(3, 61, str(c["queued"]))
-            if w > 84:
-                put(3, 70, f"fontc {bk['fontc']}/fontmake {bk['fontmake']}", CYAN)
+            put(1, 0, f" disk +{human(snap['disk_used_delta'])}  free {human(snap['disk_free'])}  "
+                      f"jobs {snap['jobs']}  cohorts {len(snap['cohorts'])}  "
+                      f"fontc {bk['fontc']}/fontmake {bk['fontmake']}", CYAN)
+            # phase banner + progress
+            phasey = ph in ("archive", "cohorts") and snap["phase_total"]
+            if phasey:
+                pd, pt = snap["phase_done"], snap["phase_total"]
+                put(2, 0, f" Phase: {plabel}  {pd}/{pt}  {snap['phase_label'][:30]}",
+                    YEL | curses.A_BOLD)
+                frac = pd / max(1, pt)
+            else:
+                put(2, 0, f" Phase: {plabel}   built {c['built']}/{grand}  failed {c['failed']}  "
+                          f"building {c['building']}  queued {c['queued']}", curses.A_BOLD)
+                frac = done / grand
+            if snap["phase_error"]:
+                put(2, max(0, w - 30), f"ERR {snap['phase_error'][:24]}", RED)
             barw = max(10, w - 4)
-            filled = int(barw * done / grand)
-            put(4, 1, "[" + "#" * filled + "-" * (barw - filled) + "]")
-            put(4, max(2, barw // 2), f" {100 * done // grand}% ", curses.A_BOLD)
+            fill = int(barw * frac)
+            put(3, 1, "[" + "#" * fill + "-" * (barw - fill) + "]")
+            put(3, max(2, barw // 2), f" {int(100 * frac)}% ", curses.A_BOLD)
+            # tabs
+            x = 1
+            for lbl, name in (("1 overview", "overview"), ("2 cohorts", "cohorts"),
+                              ("3 failures", "failures")):
+                put(4, x, f" {lbl} ", curses.A_REVERSE if view == name else curses.A_DIM)
+                x += len(lbl) + 3
+            put(4, max(x + 2, w - 30), "[tab]switch [↑↓]scroll", curses.A_DIM)
 
             row = 6
-            put(row, 0, " Now building ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
-            cap = max(0, (h - row) // 2 - 2)
-            for bld in snap["building"][:cap]:
-                tag = bld["note"] or (bld["backend"] or "")
-                put(row, 1, f"w{bld['worker']:>2} {bld['slug']:<36} {hms(bld['dur']):>8}  {tag}", YEL)
+            if view == "overview":
+                put(row, 0, " Now building ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
+                cap = max(0, (h - row) // 2 - 1)
+                for bld in snap["building"][:cap]:
+                    tag = bld["note"] or bld["backend"] or ""
+                    put(row, 1, f"w{bld['worker']:>2} {bld['slug']:<36} {hms(bld['dur']):>8}  {tag}", YEL)
+                    row += 1
+                if not snap["building"]:
+                    put(row, 1, "(idle)" if ph in ("build", "done") else f"… {plabel}"); row += 1
                 row += 1
-            if not snap["building"]:
-                put(row, 1, "(idle)"); row += 1
-            row += 1
-            put(row, 0, f" Recent failures ({c['failed']}) ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
-            for f in snap["failures_recent"][:max(0, h - row - 2)]:
-                put(row, 1, f"{f['slug']:<36} {f['error']}", RED); row += 1
-            put(h - 1, 0, " [q]uit  [p]ause/resume   logs: " + str(self.orch.build_dir / "logs"),
-                curses.A_DIM)
+                put(row, 0, f" Recent failures ({c['failed']}) ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
+                for f in snap["failures_recent"][:max(0, h - row - 2)]:
+                    put(row, 1, f"{f['slug']:<36} {f['error']}", RED); row += 1
+            elif view == "cohorts":
+                cohorts = snap["cohorts"]
+                put(row, 0, f" Dependency cohorts ({len(cohorts)}) — live ".ljust(w - 1, "-"),
+                    curses.A_BOLD); row += 1
+                vis = max(1, h - row - 1)
+                scroll = min(scroll, max(0, len(cohorts) - vis))
+                for co in cohorts[scroll:scroll + vis]:
+                    reqs = co["requirements"].splitlines()
+                    sig = (reqs[0][:48] if reqs else "(no requirements)")
+                    put(row, 1, f"{co['count']:>4}  {co['key']:<16} {sig}",
+                        CYAN if co["key"] != "base" else 0); row += 1
+                if not cohorts:
+                    put(row, 1, f"(cohorts appear during the '{self.PHASE_LABEL['cohorts']}' phase)")
+            elif view == "failures":
+                fails = snap["failures_recent"]
+                put(row, 0, f" Failures ({c['failed']}) — newest first ".ljust(w - 1, "-"),
+                    curses.A_BOLD); row += 1
+                vis = max(1, h - row - 1)
+                scroll = min(scroll, max(0, len(fails) - vis))
+                for f in fails[scroll:scroll + vis]:
+                    put(row, 1, f"{f['slug']:<34} {f['error']}", RED); row += 1
+                if not fails:
+                    put(row, 1, "(no failures)", GREEN)
+
+            put(h - 1, 0, " [q]uit [p]ause   logs: " + str(self.orch.build_dir / "logs"), curses.A_DIM)
             stdscr.refresh()
             if snap["done"]:
                 time.sleep(1.0)
@@ -1019,6 +1231,30 @@ def cohorts_report(families: List[Family], archive: Path, jobs: int, out_path: O
 
 # ================================================================================= main
 
+def setup_wizard(steps, gf_path, archive, build_dir, args) -> bool:
+    """Interactive confirmation before heavy bootstrap operations (clone / mirror).
+    Returns True to proceed. Plain terminal Q&A (runs before any ncurses UI)."""
+    e = sys.stderr
+    print("\n=== gflib-build setup wizard ===", file=e)
+    print("Bootstrapping a from-scratch Google Fonts library build. Planned steps:\n", file=e)
+    for i, (title, detail) in enumerate(steps, 1):
+        print(f"  {i}. {title}: {detail}", file=e)
+    print("\nPaths:", file=e)
+    if gf_path:
+        print(f"  google/fonts : {gf_path}", file=e)
+    print(f"  archive      : {archive}", file=e)
+    print(f"  build dir    : {build_dir}", file=e)
+    scope = "full library" if args.percent >= 100 else f"{args.percent:g}% sample"
+    print(f"\nBuild       : backend={args.backend}  jobs={args.jobs}  scope={scope}", file=e)
+    print("\nNote: cloning google/fonts is a few GB; mirroring all upstream repos can be tens of\n"
+          "GB and take a long time. Sources are read-only and archives are never deleted.\n", file=e)
+    try:
+        return input("Proceed? [y/N] ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print(file=e)
+        return False
+
+
 def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="From-scratch, archive-safe, Rust-first full-library build of Google Fonts.")
@@ -1026,13 +1262,24 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="where the worklist/stats come from: 'metadata' = parse google/fonts "
                          "METADATA.pb (pinned commits + configs + shipped refs); 'archive' = every "
                          "bare mirror in the archive at --archive-rev (google/fonts optional)")
+    ap.add_argument("--data-dir", default="gflib-data",
+                    help="root for default paths (google-fonts/, archive/, build/) when those "
+                         "are not given explicitly")
     ap.add_argument("--google-fonts", default=None,
-                    help="path to a google/fonts clone (required for --source metadata and "
-                         "--compare; optional for --source archive)")
-    ap.add_argument("--archive", required=True, help="repo archive of bare mirrors ({owner}/{repo}.git)")
+                    help="path to a google/fonts clone (default <data-dir>/google-fonts; cloned if "
+                         "absent in metadata mode). Required-ish for --source metadata and --compare")
+    ap.add_argument("--archive", default=None,
+                    help="repo archive of bare mirrors (default <data-dir>/archive)")
     ap.add_argument("--archive-rev", default="HEAD",
                     help="revision to build for --source archive (default HEAD = default-branch tip)")
-    ap.add_argument("--build-dir", required=True, help="output dir (NOT inside any repo)")
+    ap.add_argument("--build-dir", default=None, help="output dir (default <data-dir>/build; NOT in a repo)")
+    ap.add_argument("--populate-archive", dest="populate_archive", action="store_true", default=None,
+                    help="mirror any missing upstream repos into the archive before building "
+                         "(default ON for a metadata bootstrap; append-only)")
+    ap.add_argument("--no-populate-archive", dest="populate_archive", action="store_false",
+                    help="do not pre-populate the archive (missing repos fail unless --mirror-missing)")
+    ap.add_argument("--yes", "-y", action="store_true",
+                    help="assume yes to the setup wizard (non-interactive bootstrap)")
     ap.add_argument("--backend", choices=["auto", "fontc", "fontmake"], default="auto")
     ap.add_argument("--fontc-bin", default=None, help="path to the fontc (Rust) binary")
     ap.add_argument("--build-python", default=sys.executable,
@@ -1067,29 +1314,62 @@ def main():
     args = build_argparser().parse_args()
     if sys.platform == "win32":
         sys.exit("gflib-build targets macOS/Linux (POSIX venv layout, git archive, tar).")
-    if not Path(args.archive).is_dir():
-        sys.exit(f"--archive {args.archive} not found")
-    if args.source == "metadata":
-        if not args.google_fonts:
-            sys.exit("--source metadata requires --google-fonts")
-        gf = Path(args.google_fonts)
-        if not (gf / "ofl").is_dir():
-            sys.exit(f"--google-fonts {gf} has no ofl/ — is this a google/fonts clone?")
-    else:
-        gf = Path(args.google_fonts) if args.google_fonts else None
-        if gf is not None and not (gf / "ofl").is_dir():
-            sys.exit(f"--google-fonts {gf} has no ofl/")
-    if args.compare and gf is None:
-        sys.exit("--compare needs --google-fonts (the shipped binaries to compare against)")
+    if not (0 < args.percent <= 100):
+        sys.exit("--percent must be in (0, 100]")
     if args.backend == "fontc" and not args.fontc_bin:
         sys.exit("--backend fontc requires --fontc-bin")
     if args.manage_venvs and not args.base_requirements:
         sys.exit("--manage-venvs requires --base-requirements (the pinned base toolchain)")
-    if not (0 < args.percent <= 100):
-        sys.exit("--percent must be in (0, 100]")
-    Path(args.build_dir).mkdir(parents=True, exist_ok=True)
+
+    # ---- resolve paths (defaults derived from --data-dir) ----
+    data_dir = Path(args.data_dir)
+    gf = (Path(args.google_fonts) if args.google_fonts
+          else (data_dir / "google-fonts" if args.source == "metadata" else None))
+    archive = Path(args.archive) if args.archive else (data_dir / "archive")
+    build_dir = Path(args.build_dir) if args.build_dir else (data_dir / "build")
+    args.google_fonts = str(gf) if gf else None
+    args.archive = str(archive)
+    args.build_dir = str(build_dir)
+    if args.compare and gf is None:
+        sys.exit("--compare needs --google-fonts (the shipped binaries to compare against)")
+
+    read_only = args.list or args.cohorts_report
+    # default: populate the archive for a metadata build unless told otherwise
+    if args.populate_archive is None:
+        args.populate_archive = (args.source == "metadata") and not read_only
+
+    # ---- setup wizard: confirm heavy bootstrap steps before doing them ----
+    need_gf_clone = args.source == "metadata" and not (gf / "ofl").is_dir()
+    steps = []
+    if need_gf_clone:
+        steps.append(("clone google/fonts", f"{GOOGLE_FONTS_URL} → {gf} (shallow)"))
+    if args.populate_archive:
+        steps.append(("populate archive", f"mirror any missing upstream repos into {archive}"))
+    if steps and not args.yes and not read_only:
+        if sys.stdin.isatty():
+            if not setup_wizard(steps, gf, archive, build_dir, args):
+                sys.exit("aborted.")
+        else:
+            sys.exit("missing prerequisites (google/fonts clone and/or archive). Re-run with "
+                     "--yes to auto-bootstrap, or pass --google-fonts/--archive explicitly.")
+
+    archive.mkdir(parents=True, exist_ok=True)
+    build_dir.mkdir(parents=True, exist_ok=True)
     for sub in ("work", "out", "logs"):
-        (Path(args.build_dir) / sub).mkdir(exist_ok=True)
+        (build_dir / sub).mkdir(exist_ok=True)
+
+    # ---- clone google/fonts up front if needed (plain status; the live UI covers the rest) ----
+    if need_gf_clone:
+        try:
+            ensure_google_fonts(gf, on_progress=lambda m: print(f"  {m}", file=sys.stderr))
+        except RuntimeError as e:
+            sys.exit(str(e))
+    if args.source == "metadata" and not (gf / "ofl").is_dir():
+        sys.exit(f"--google-fonts {gf} is not a google/fonts clone (no ofl/)")
+    if args.source == "metadata" and not args.google_fonts:
+        sys.exit("--source metadata needs a google/fonts clone")
+    if not archive.is_dir():
+        sys.exit(f"archive {archive} not available")
 
     if args.source == "archive":
         families, total, skipped = discover_from_archive(Path(args.archive), args.archive_rev, args.jobs)
