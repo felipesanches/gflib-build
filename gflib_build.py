@@ -709,6 +709,8 @@ class Orchestrator:
         self.phase_durations: Dict[str, float] = {}
         self._phase_t0: Optional[float] = None
         self._status_thread: Optional[threading.Thread] = None
+        self._status_stop = threading.Event()
+        self._status_lock = threading.Lock()
 
         self._load_state()
         self._enqueue()
@@ -1012,19 +1014,18 @@ class Orchestrator:
 
     # ---- status snapshot file (for the monitor UI / detached builds) + timings report
     def _write_status(self):
-        try:
-            tmp = self.build_dir / "status.json.tmp"
-            tmp.write_text(json.dumps(self.snapshot()))
-            tmp.replace(self.build_dir / "status.json")
-        except OSError:
-            pass
+        with self._status_lock:                  # serialize writers (writer thread + final write)
+            try:
+                tmp = self.build_dir / "status.json.tmp"
+                tmp.write_text(json.dumps(self.snapshot()))
+                tmp.replace(self.build_dir / "status.json")
+            except OSError:
+                pass
 
     def _status_writer(self):
-        while True:
+        while not self._status_stop.is_set():
             self._write_status()
-            if self.phase == "done":
-                break
-            time.sleep(1.0)
+            self._status_stop.wait(1.0)
 
     def write_timings(self):
         snap = self.snapshot()
@@ -1085,13 +1086,13 @@ class Orchestrator:
         finally:
             self.save_state()
             self._set_phase("done")  # workers are guaranteed stopped here
+            self._status_stop.set()                       # stop the periodic writer first…
+            if self._status_thread is not None:
+                self._status_thread.join(timeout=3)
             self.write_timings()
-            self._write_status()
+            self._write_status()                          # …then write the final status alone
 
-    def join(self):
-        if self.driver is not None:
-            self.driver.join()
-        # close the events file only after the driver (and thus all workers) have stopped
+    def _close_events(self):
         with self._events_lock:
             if not self._events_closed:
                 self._events_closed = True
@@ -1099,6 +1100,11 @@ class Orchestrator:
                     self._events.close()
                 except Exception:
                     pass
+
+    def join(self):
+        if self.driver is not None:
+            self.driver.join()
+        self._close_events()   # after the driver (and thus all workers) have stopped
 
 
 # ============================================================================ frontends
@@ -1129,11 +1135,13 @@ class Frontend:
 
 class NoneFrontend(Frontend):
     def run(self):
-        while any(t.is_alive() for t in self.orch.workers):
-            if self.orch.all_done():
-                self.orch.stop.set()
+        # works for both a real build (snapshot done == phase done) and a monitor (status.json)
+        while not self.orch.snapshot().get("done", False):
+            if self.orch.stop.is_set():
                 break
             time.sleep(0.3)
+        if not self.monitor:
+            self.orch.stop.set()
 
 
 class PlainFrontend(Frontend):
@@ -1481,12 +1489,28 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _proc_cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+    except OSError:
+        try:
+            return subprocess.run(["ps", "-p", str(pid), "-o", "args="],
+                                  capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            return ""
+
+
 def read_daemon_pid(build_dir: Path) -> Optional[int]:
     try:
         pid = int((Path(build_dir) / "daemon.pid").read_text().strip())
-        return pid if _pid_alive(pid) else None
     except (OSError, ValueError):
         return None
+    if not _pid_alive(pid):
+        return None
+    cl = _proc_cmdline(pid)                 # guard against PID reuse by an unrelated process
+    if cl and "gflib_build" not in cl and "gflib-build" not in cl:
+        return None
+    return pid
 
 
 def daemonize(build_dir: Path) -> bool:
@@ -1742,8 +1766,10 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--fontc-bin", default=None, help="path to the fontc (Rust) binary")
     ap.add_argument("--build-python", default=sys.executable,
                     help="interpreter for builds when --manage-venvs is off")
-    ap.add_argument("--manage-venvs", action="store_true",
+    ap.add_argument("--manage-venvs", dest="manage_venvs", action="store_true",
                     help="create & share one venv per dependency cohort")
+    ap.add_argument("--no-manage-venvs", dest="manage_venvs", action="store_false",
+                    help="disable cohort venvs (override a persisted setting)")
     ap.add_argument("--base-python", default=sys.executable, help="python used to create cohort venvs")
     ap.add_argument("--base-requirements", default=None, help="pinned base toolchain requirements file")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
@@ -1752,7 +1778,10 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--percent", type=float, default=100.0,
                     help="build only this %% of the library (evenly-spaced sample) for validation")
     ap.add_argument("--only", default="", help="comma-separated slugs (e.g. ofl/dmsans)")
-    ap.add_argument("--compare", action="store_true", help="sha256-compare built fonts to shipped")
+    ap.add_argument("--compare", dest="compare", action="store_true",
+                    help="sha256-compare built fonts to shipped")
+    ap.add_argument("--no-compare", dest="compare", action="store_false",
+                    help="disable comparison (override a persisted setting)")
     ap.add_argument("--mirror-missing", action="store_true",
                     help="clone absent upstream repos into the archive (append-only)")
     ap.add_argument("--retry-failed", action="store_true")
@@ -1778,6 +1807,7 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="attach a live, read-only monitor to a build at --build-dir (q leaves it running)")
     ap.add_argument("--stop", action="store_true",
                     help="signal a detached build at --build-dir to stop gracefully")
+    ap.set_defaults(manage_venvs=False, compare=False)   # pin defaults (overridden by config/CLI)
     return ap
 
 
@@ -2005,15 +2035,18 @@ def main():
           f"{args.source}{ctx}. Queued {orch.q.qsize()}; backend={args.backend}"
           f"{' (fontc-first)' if orch._backend_order()[0] == 'fontc' else ''}.", file=sys.stderr)
 
+    # register handlers BEFORE daemonize so the daemon inherits them (no kill-before-handler window)
+    signal.signal(signal.SIGINT, lambda *_: orch.stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: orch.stop.set())
+
     if args.detach:
         if daemonize(build_dir):                  # detached daemon: run the build, headless
-            signal.signal(signal.SIGTERM, lambda *_: orch.stop.set())
-            signal.signal(signal.SIGINT, lambda *_: orch.stop.set())
             orch.run()
             orch.join()
             orch.save_state()
             return
-        # original parent: attach a live monitor (quit it and the build keeps running)
+        # original parent: drop our copy of the daemon's events file, then attach a monitor
+        orch._close_events()
         print(f"build running detached. reattach any time:\n"
               f"  python3 {Path(sys.argv[0]).name} --attach --build-dir {build_dir}\n"
               f"  python3 {Path(sys.argv[0]).name} --stop   --build-dir {build_dir}",
@@ -2023,8 +2056,6 @@ def main():
             run_monitor(build_dir, pick_frontend(args.ui))
         return
 
-    signal.signal(signal.SIGINT, lambda *_: orch.stop.set())
-    signal.signal(signal.SIGTERM, lambda *_: orch.stop.set())
     orch.run()
     frontend = FRONTENDS[pick_frontend(args.ui)](orch)
     try:
