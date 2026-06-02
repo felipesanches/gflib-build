@@ -96,6 +96,7 @@ class Result:
     error: str = ""
     log: str = ""
     out_bytes: int = 0
+    out_missing: int = 0
     compare: str = ""
     config_used: str = ""
 
@@ -315,22 +316,30 @@ class VenvManager:
         py, err = self._create("base", "")
         if err:
             raise RuntimeError(f"base venv creation failed: {err}")
-        self._ready["base"] = py
+        with self._global:
+            self._ready["base"] = py
         return py
 
     def get_python(self, req_text: str, on_install: Optional[Callable[[str], None]] = None):
         key = self.cohort_key(req_text)
-        if key in self._ready:
-            return self._ready[key], key, ""
-        with self._lock_for(key):
+        with self._global:
             if key in self._ready:
                 return self._ready[key], key, ""
+        with self._lock_for(key):
+            with self._global:
+                if key in self._ready:
+                    return self._ready[key], key, ""
             if on_install:
                 on_install(key)
             py, err = self._create(key, req_text)
             if not err:
-                self._ready[key] = py
+                with self._global:
+                    self._ready[key] = py
             return py, key, err
+
+    def ready_count(self) -> int:
+        with self._global:
+            return len(self._ready)
 
     def _create(self, key: str, req_text: str):
         vdir = self.root / key
@@ -478,6 +487,7 @@ class Orchestrator:
         self.failures: List[str] = []
         self.workers: List[threading.Thread] = []
         self._events = open(self.build_dir / "events.jsonl", "a", buffering=1)
+        self._events_lock = threading.Lock()
 
         self.venvs: Optional[VenvManager] = None
         if args.manage_venvs:
@@ -514,7 +524,8 @@ class Orchestrator:
         ev = {"t": round(time.time() - self.start_time, 2), "type": etype, "slug": slug}
         ev.update(extra)
         try:
-            self._events.write(json.dumps(ev) + "\n")
+            with self._events_lock:
+                self._events.write(json.dumps(ev) + "\n")
         except Exception:
             pass
 
@@ -579,7 +590,7 @@ class Orchestrator:
             "jobs": self.args.jobs, "paused": self.paused.is_set(),
             "total": len(rs), "counts": counts, "backends": backends,
             "building": building, "failures_recent": fails,
-            "cohorts_ready": len(self.venvs._ready) if self.venvs else 0,
+            "cohorts_ready": self.venvs.ready_count() if self.venvs else 0,
             "done": self.all_done(),
         }
 
@@ -603,9 +614,12 @@ class Orchestrator:
             try:
                 slug = self.q.get(timeout=0.3)
             except queue.Empty:
-                if self.all_done():
+                if self.all_done() and self.q.empty():
                     return
                 continue
+            if self.stop.is_set():
+                self.q.task_done()
+                return
             try:
                 self._build_one(wid, slug)
             except Exception as e:  # never let a worker die silently
@@ -613,13 +627,15 @@ class Orchestrator:
             finally:
                 self.q.task_done()
 
-    def _fail(self, slug: str, msg: str, work: Optional[Path] = None):
+    def _fail(self, slug: str, msg: str):
+        # NOTE: the throwaway work/ extraction is cleaned by _build_one's finally; here we
+        # only drop any partial collected outputs so failures never leak disk under out/.
         self._set(slug, status="failed", ended=time.time(), error=msg, note="")
         with self.lock:
-            self.failures.append(slug)
+            if slug not in self.failures:
+                self.failures.append(slug)
         self._emit("failed", slug, error=msg)
-        if work:
-            shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(self.build_dir / "out" / slug.replace("/", "__"), ignore_errors=True)
         self.save_state()
 
     def _build_one(self, wid: int, slug: str):
@@ -630,59 +646,69 @@ class Orchestrator:
         self._set(slug, status="building", started=time.time(), worker=wid,
                   ended=0.0, error="", note="", backend="")
         self._emit("started", slug, worker=wid)
+        try:
+            mirror, err = ensure_mirror(self.archive, fam.repo_url, fam.commit,
+                                        self.args.mirror_missing)
+            if err:
+                return self._fail(slug, err)
+            err = extract_tree(mirror, fam.commit, work, self.args.timeout)
+            if err:
+                return self._fail(slug, err)
 
-        mirror, err = ensure_mirror(self.archive, fam.repo_url, fam.commit, self.args.mirror_missing)
-        if err:
-            return self._fail(slug, err)
-        err = extract_tree(mirror, fam.commit, work, self.args.timeout)
-        if err:
-            return self._fail(slug, err, work)
+            # pick interpreter (cohort venv or single build-python) from the extracted tree
+            if self.venvs is not None:
+                req = read_requirements(work)
 
-        cfg, label, err = resolve_config(self.google_fonts, fam, work)
-        if err:
-            return self._fail(slug, err, work)
-        self._set(slug, config_used=label)
+                def installing(key):
+                    self._set(slug, note=f"installing deps ({key})")
+                    self._emit("venv", slug, cohort=key)
+                python, cohort, verr = self.venvs.get_python(req, installing)
+                self._set(slug, cohort=cohort, note="")
+                if verr:
+                    return self._fail(slug, f"venv: {verr}")
+            else:
+                python = self.args.build_python
 
-        if self.venvs is not None:
-            req = read_requirements(work)
+            # backend attempts; each fallback gets a FRESH extraction (truly from scratch)
+            order = self._backend_order()
+            ok, berr, used = False, "", ""
+            for i, b in enumerate(order):
+                if i > 0:
+                    err = extract_tree(mirror, fam.commit, work, self.args.timeout)
+                    if err:
+                        berr = err
+                        break
+                preclean_outputs(work)
+                cfg, label, cerr = resolve_config(self.google_fonts, fam, work)
+                if cerr:
+                    berr = cerr
+                    break
+                log_rel = f"logs/{safe}.{b}.log"
+                self._set(slug, backend=b, config_used=label, log=log_rel)
+                ok, berr = run_builder(python, cfg, work, self.build_dir / log_rel,
+                                       self.args.timeout, b, self.args.fontc_bin)
+                if ok:
+                    used = b
+                    break
+            if not ok:
+                return self._fail(slug, berr or "build failed")
 
-            def installing(key):
-                self._set(slug, note=f"installing deps ({key})")
-                self._emit("venv", slug, cohort=key)
-            python, cohort, verr = self.venvs.get_python(req, installing)
-            self._set(slug, cohort=cohort, note="")
-            if verr:
-                return self._fail(slug, f"venv: {verr}", work)
-        else:
-            python = self.args.build_python
-
-        order = self._backend_order()
-        ok, berr, used = False, "", ""
-        for b in order:
-            preclean_outputs(work)
-            log_rel = f"logs/{safe}.{b}.log"
-            self._set(slug, backend=b, log=log_rel)
-            ok, berr = run_builder(python, cfg, work, self.build_dir / log_rel,
-                                   self.args.timeout, b, self.args.fontc_bin)
-            if ok:
-                used = b
-                break
-        if not ok:
-            return self._fail(slug, berr, work)
-
-        nbytes, built = collect_outputs(work, out_dir, fam.shipped_fonts)
-        if nbytes == 0 and fam.shipped_fonts:
-            return self._fail(slug, f"{used}: produced no matching font files", work)
-        cmp_label = compare_to_shipped(self.google_fonts, fam, built) if self.args.compare else ""
-        self._set(slug, status="built", ended=time.time(), out_bytes=nbytes,
-                  compare=cmp_label, backend=used, note="")
-        self._emit("built", slug, backend=used, bytes=nbytes, compare=cmp_label,
-                   dur=round(self.results[slug].dur(), 1))
-        if not self.args.keep_work:
-            shutil.rmtree(work, ignore_errors=True)
-        if not self.args.keep_fonts:
-            shutil.rmtree(out_dir, ignore_errors=True)
-        self.save_state()
+            nbytes, built = collect_outputs(work, out_dir, fam.shipped_fonts)
+            if fam.shipped_fonts and not built:
+                return self._fail(slug, f"{used}: produced no expected font files")
+            missing = [f for f in fam.shipped_fonts if f not in built]
+            cmp_label = (compare_to_shipped(self.google_fonts, fam, built)
+                         if self.args.compare else "")
+            self._set(slug, status="built", ended=time.time(), out_bytes=nbytes,
+                      out_missing=len(missing), compare=cmp_label, backend=used, note="")
+            self._emit("built", slug, backend=used, bytes=nbytes, compare=cmp_label,
+                       missing=len(missing), dur=round(self.results[slug].dur(), 1))
+            if not self.args.keep_fonts:
+                shutil.rmtree(out_dir, ignore_errors=True)
+            self.save_state()
+        finally:
+            if not self.args.keep_work:
+                shutil.rmtree(work, ignore_errors=True)
 
     def _backend_order(self) -> List[str]:
         if self.args.backend == "fontmake":
@@ -753,13 +779,14 @@ class PlainFrontend(Frontend):
         while True:
             snap = self.orch.snapshot()
             with self.orch.lock:
-                done = [(r.slug, r.status, r.backend, r.error, r.dur())
+                done = [(r.slug, r.status, r.backend, r.error, r.dur(), r.out_missing)
                         for r in self.orch.results.values()
                         if r.status in ("built", "failed") and r.slug not in seen]
-            for slug, status, backend, error, dur in done:
+            for slug, status, backend, error, dur, missing in done:
                 seen.add(slug)
                 if status == "built":
-                    print(f"[OK ] {slug}  ({backend}, {dur:.0f}s)", flush=True)
+                    extra = f"  (partial: missing {missing})" if missing else ""
+                    print(f"[OK ] {slug}  ({backend}, {dur:.0f}s){extra}", flush=True)
                 else:
                     print(f"[FAIL] {slug}  {error}", flush=True)
             now = time.time()
@@ -792,22 +819,40 @@ class JsonFrontend(Frontend):
 class CursesFrontend(Frontend):
     """Optional ncurses dashboard (A built, B building, C disk, D elapsed, E failures)."""
     def run(self):
-        import curses
-        curses.wrapper(self._draw)
+        try:
+            import curses
+        except Exception as e:
+            print(f"curses unavailable ({e}); using --ui plain.", file=sys.stderr)
+            return PlainFrontend(self.orch).run()
+        try:
+            curses.wrapper(self._draw)
+        except Exception as e:
+            print(f"curses error ({e}); switching to plain output.", file=sys.stderr)
+            return PlainFrontend(self.orch).run()
 
     def _draw(self, stdscr):
         import curses
-        curses.curs_set(0)
         stdscr.nodelay(True)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        has_color = False
         try:
             curses.start_color(); curses.use_default_colors()
             for i, col in enumerate((curses.COLOR_GREEN, curses.COLOR_RED,
                                      curses.COLOR_YELLOW, curses.COLOR_CYAN), 1):
                 curses.init_pair(i, col, -1)
+            has_color = True
         except curses.error:
             pass
-        GREEN, RED, YEL, CYAN = (curses.color_pair(i) for i in range(1, 5))
+        if has_color:
+            GREEN, RED, YEL, CYAN = (curses.color_pair(i) for i in range(1, 5))
+        else:
+            GREEN = RED = YEL = CYAN = curses.A_NORMAL
         while True:
+            if self.orch.stop.is_set():
+                break
             ch = stdscr.getch()
             if ch in (ord("q"), ord("Q")):
                 self.orch.stop.set()
@@ -834,7 +879,8 @@ class CursesFrontend(Frontend):
             put(3, 22, "Failed", curses.A_BOLD); put(3, 29, str(c["failed"]), RED | curses.A_BOLD)
             put(3, 38, "Building", curses.A_BOLD); put(3, 47, str(c["building"]), YEL | curses.A_BOLD)
             put(3, 54, "Queued", curses.A_BOLD); put(3, 61, str(c["queued"]))
-            put(3, 70, f"fontc {bk['fontc']}/fontmake {bk['fontmake']}", CYAN)
+            if w > 84:
+                put(3, 70, f"fontc {bk['fontc']}/fontmake {bk['fontmake']}", CYAN)
             barw = max(10, w - 4)
             filled = int(barw * done / grand)
             put(4, 1, "[" + "#" * filled + "-" * (barw - filled) + "]")
@@ -915,6 +961,8 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main():
     args = build_argparser().parse_args()
+    if sys.platform == "win32":
+        sys.exit("gflib-build targets macOS/Linux (POSIX venv layout, git archive, tar).")
     gf = Path(args.google_fonts)
     if not (gf / "ofl").is_dir():
         sys.exit(f"--google-fonts {gf} has no ofl/ — is this a google/fonts clone?")
