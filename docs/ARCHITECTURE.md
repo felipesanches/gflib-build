@@ -13,7 +13,9 @@ the `fontc` binary.
 | `Family`, `Result` | dataclasses: the work item and its evolving state |
 | discovery | `parse_metadata`, `discover` (METADATA-driven), `discover_from_archive` (mirror-driven, `--source archive`), `sample_evenly` — build the worklist, sample for `--percent` |
 | mirror/git | `mirror_path`, `git`, `ensure_mirror`, `extract_tree`, `preclean_outputs` — archive-safe source access |
-| bootstrap | `ensure_google_fonts` (shallow-clone if absent), `populate_archive` (parallel mirror-missing, append-only), `scan_cohorts`, `setup_wizard` |
+| bootstrap | `ensure_google_fonts` (shallow-clone if absent), `populate_archive` (parallel mirror-missing, append-only), `scan_cohorts`, `setup_wizard` (editable ncurses form), `detect_fontc`/`detect_archive`/`detect_cargo`, `build_fontc_from_source` |
+| detach/monitor | `daemonize` (double-fork), `read_daemon_pid`, `MonitorState` (read-only view from `status.json`), `run_monitor`; `Orchestrator._status_writer` writes `status.json` every ~1 s |
+| persistence/timing | `load_config`/`save_config` (`gflib-build.config`); `Orchestrator._record_op`/`phase_durations`/`write_timings` (per-op + per-phase timing → `timings.json`); per-family log `logs/<slug>.log` (pipeline narrative + full gftools output) |
 | config | `resolve_config`, `read_requirements`, `normalize_requirements`, `cohort_key_for`, `read_requirements_from_mirror` |
 | `VenvManager` | dependency cohorts: one shared venv per distinct requirements set |
 | building | `run_builder` (backend-aware), `collect_outputs`, `sha256`, `compare_to_shipped` |

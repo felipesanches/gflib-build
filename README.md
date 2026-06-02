@@ -120,6 +120,12 @@ intent so nothing is lost as the tool evolves.
     library* reacts to ←/→ in ±5 steps yet stays typeable for finer control; the *fontc*
     binary is auto-detected (offering to build it from source, or to type a path, if not
     found); and a pre-existing **repo archive is auto-detected** too.
+18. **Persist the chosen settings** to a config file and pre-fill them on the next run.
+19. **Auto-detect cargo**; if missing, give the user clear install instructions.
+20. **Save all build log output** so failures can be read for troubleshooting.
+21. **Time-measure every operation** to surface bottlenecks and guide performance work.
+22. **Detach & reattach.** The user can quit the program and leave the builds running
+    autonomously; reopening shows the live stats of what's going on.
 
 ---
 
@@ -352,14 +358,35 @@ Useful flags: `--percent 5` (sample), `--only ofl/dmsans,ofl/roboto` (subset),
 `--discard-fonts` (keep only the comparison result, not the built binaries),
 `--keep-work` (debug: keep the extraction).
 
+## Detached builds, monitoring & persistence
+
+- **Run autonomously, watch later.** `--detach` runs the build in a background daemon and
+  opens a live monitor; **quit the monitor with `q` and the build keeps running.** Reattach
+  any time with `--attach --build-dir <dir>` (read-only live view), or stop it with
+  `--stop --build-dir <dir>` (graceful). The daemon writes `status.json` every ~1 s, which
+  the monitor (and any external tool) reads.
+- **Persisted settings.** Your wizard/CLI choices are saved to
+  `<data-dir>/gflib-build.config` and pre-fill the next run (CLI flags still override;
+  `--no-save-config` to skip, `--config` for a custom path).
+- **Full logs for troubleshooting.** Every family gets a complete `logs/<slug>.log` — a
+  timestamped pipeline narrative (mirror → extract → venv → config → build) **plus the full
+  `gftools.builder` output** of every backend attempt — kept whether it succeeds or fails.
+- **Everything is timed.** Each operation (mirror/extract/venv/config/build/collect/compare)
+  and each phase is measured into `timings.json`, printed as a summary at the end, and shown
+  live in the **stats** view (`4`) — to find and shrink bottlenecks over time.
+
 ## Outputs, state & resumability
 
 Under `--build-dir`:
 
 ```
 state.json            resumable per-family status (built/failed/…) + durations
+status.json           live full snapshot (read by the monitor / external tools)
+timings.json          per-phase + per-operation timing (bottleneck analysis)
 out/<slug>/           built fonts (omit with --discard-fonts)
-logs/<slug>.<backend>.log  full build log (kept for every failure)
+logs/<slug>.log       complete per-family log: pipeline narrative + gftools output
+events.jsonl          append-only event stream (started/built/failed/venv)
+daemon.pid, daemon.log   present when run with --detach
 venvs/<cohort>/       shared cohort virtualenvs (with --manage-venvs)
 pip-cache/            shared pip download cache
 work/<slug>/          throwaway extraction (deleted after each build)
@@ -379,7 +406,10 @@ failures; `--rebuild` starts over.
 - [x] Partial runs via `--percent` (evenly-spaced sample).
 - [x] Two worklist sources: `--source metadata` (google/fonts) and `--source archive` (the mirrors directly).
 - [x] Zero-to-built bootstrap: auto-clone google/fonts + populate the archive, behind a setup wizard (`--yes` to skip); default paths under `--data-dir`.
-- [x] Phase-driven pipeline (archive → cohorts → build) with a phase-aware, navigable TUI (overview / cohorts / failures).
+- [x] Phase-driven pipeline (archive → cohorts → build) with a phase-aware, navigable TUI (overview / cohorts / failures / stats).
+- [x] Editable ncurses setup wizard (cursor, conditional fields, ±5 stepping, fontc/cargo/archive auto-detect); persisted to a config file.
+- [x] Detach/reattach: run the build as a daemon (`--detach`), monitor live (`--attach`), stop gracefully (`--stop`).
+- [x] Comprehensive per-family logs + per-operation/per-phase timing (`timings.json`, stats view).
 - [ ] Emit a migration report: % of library building under fontc, and the blockers per family.
 - [ ] Feed results back to the gfonts_agents dashboard (`reproducible_build` + provenance levels).
 - [ ] Track toward an **all-Rust** build with no Python orchestration in the loop.
