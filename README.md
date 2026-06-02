@@ -126,6 +126,13 @@ with `--manage-venvs` the harness groups families by their **build dependency se
 Without `--manage-venvs`, all builds use a single interpreter you point at with
 `--build-python`.
 
+**Preview the grouping first** with `--cohorts-report`: it scans every family's
+`requirements.txt` **read-only** (`git show` on the mirror — no extraction, no builds,
+archives untouched) and prints how many distinct cohorts exist and which families fall
+in each, plus a `cohorts.json`. Example (3% sample): 43 families → 17 cohorts, e.g. one
+shared by 6 Noto families (notobuilder deps), one by 4 Playwrite families (a 138-package
+pinned set), and 15 with no requirements in `base`.
+
 ---
 
 ## Parallelism & scheduling
@@ -222,6 +229,10 @@ Prerequisites (native, **outside** the VM):
 ```sh
 # Preview the worklist:
 python3 gflib_build.py --list \
+  --google-fonts ~/google/fonts --archive ~/repo_archive --build-dir ~/gfbuild
+
+# Preview the dependency-cohort grouping (read-only, no builds):
+python3 gflib_build.py --cohorts-report \
   --google-fonts ~/google/fonts --archive ~/repo_archive --build-dir ~/gfbuild
 
 # Full library build, Rust-first, with cohorts and the live TUI:

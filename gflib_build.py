@@ -282,6 +282,23 @@ def normalize_requirements(text: str) -> str:
     return "\n".join(sorted(lines))
 
 
+def cohort_key_for(req_text: str) -> str:
+    norm = normalize_requirements(req_text)
+    if not norm:
+        return "base"
+    return "c-" + hashlib.sha1(norm.encode()).hexdigest()[:12]
+
+
+def read_requirements_from_mirror(mirror: Path, commit: str) -> str:
+    """Read a repo's requirements file at a commit WITHOUT extracting the tree — a
+    read-only `git show` on the bare mirror (never touches the archive)."""
+    for r in REQ_FILES:
+        rc, out, _ = git(["--git-dir", str(mirror), "show", f"{commit}:{r}"])
+        if rc == 0:
+            return out
+    return ""
+
+
 # =============================================================================== venvs
 
 class VenvManager:
@@ -303,10 +320,7 @@ class VenvManager:
         self._ready: Dict[str, str] = {}
 
     def cohort_key(self, req_text: str) -> str:
-        norm = normalize_requirements(req_text)
-        if not norm:
-            return "base"
-        return "c-" + hashlib.sha1(norm.encode()).hexdigest()[:12]
+        return cohort_key_for(req_text)
 
     def _lock_for(self, key: str) -> threading.Lock:
         with self._global:
@@ -924,6 +938,53 @@ def pick_frontend(name: str) -> str:
         return "plain"
 
 
+# =============================================================================== report
+
+def cohorts_report(families: List[Family], archive: Path, jobs: int, out_path: Optional[Path]):
+    """Scan each family's requirements.txt (read-only, via git show on the mirror) and
+    print the dependency-cohort grouping. No extraction, no builds, archives untouched."""
+    from concurrent.futures import ThreadPoolExecutor
+    from collections import defaultdict
+
+    def work(fam: Family):
+        mp = mirror_path(archive, fam.repo_url)
+        if not mp.is_dir():
+            return fam.slug, "(mirror-absent)", ""
+        req = read_requirements_from_mirror(mp, fam.commit)
+        return fam.slug, cohort_key_for(req), normalize_requirements(req)
+
+    rows: Dict[str, Tuple[str, str]] = {}
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
+        for slug, cohort, sig in ex.map(work, families):
+            rows[slug] = (cohort, sig)
+
+    groups: Dict[str, List[str]] = defaultdict(list)
+    sigs: Dict[str, str] = {}
+    for slug, (cohort, sig) in rows.items():
+        groups[cohort].append(slug)
+        sigs.setdefault(cohort, sig)
+
+    real = [k for k in groups if k not in ("base", "(mirror-absent)")]
+    print(f"Cohort report: {len(families)} families -> {len(real)} distinct dependency "
+          f"cohort(s), plus 'base' (no requirements file) and any mirror-absent.\n")
+    for cohort, slugs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        label = {"base": "base — no requirements file",
+                 "(mirror-absent)": "mirror absent — not scanned"}.get(cohort, cohort)
+        print(f"== {label}  ·  {len(slugs)} families ==")
+        pkgs = sigs.get(cohort, "").splitlines()
+        if pkgs:
+            print("   deps: " + ", ".join(pkgs[:8]) + (f"  (+{len(pkgs) - 8} more)" if len(pkgs) > 8 else ""))
+        shown = sorted(slugs)[:12]
+        print("   " + ", ".join(shown) + (f"  … (+{len(slugs) - 12} more)" if len(slugs) > 12 else ""))
+        print()
+    if out_path:
+        data = {"total": len(families), "distinct_cohorts": len(real),
+                "cohorts": {c: {"count": len(s), "requirements": sigs.get(c, ""),
+                                "families": sorted(s)} for c, s in groups.items()}}
+        out_path.write_text(json.dumps(data, indent=1))
+        print(f"(full JSON written to {out_path})", file=sys.stderr)
+
+
 # ================================================================================= main
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -956,6 +1017,9 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--ui", choices=["auto", "curses", "plain", "json", "none"], default="auto",
                     help="frontend (ncurses is optional; plain/json/none for other tooling)")
     ap.add_argument("--list", action="store_true", help="print the buildable worklist and exit")
+    ap.add_argument("--cohorts-report", action="store_true",
+                    help="scan each family's requirements.txt (read-only) and print the "
+                         "dependency-cohort grouping, then exit (no builds)")
     return ap
 
 
@@ -986,6 +1050,14 @@ def main():
             print(f"{f.slug:<40} {cfg:<26} {f.repo_url}")
         print(f"\n{len(sampled)} selected ({args.percent:g}% of {len(families)} buildable; "
               f"{total} with source, {skipped} skipped)", file=sys.stderr)
+        return
+
+    if args.cohorts_report:
+        sel = sampled
+        if args.only:
+            keep = set(args.only.split(","))
+            sel = [f for f in sampled if f.slug in keep]
+        cohorts_report(sel, Path(args.archive), args.jobs, Path(args.build_dir) / "cohorts.json")
         return
 
     orch = Orchestrator(args, sampled, total, skipped)
