@@ -363,6 +363,11 @@ def run_builder(python: str, config_path: Path, work: Path, log_path: Path,
                 timeout: int, backend: str, fontc_bin: Optional[str]):
     env = dict(os.environ)
     env["SOURCE_DATE_EPOCH"] = "0"
+    # gftools.builder shells out to fontmake / ninja / gftools / ttfautohint BY NAME, so
+    # the chosen interpreter's bin/ must be on PATH (running venv/bin/python does not, by
+    # itself, activate the venv).
+    bindir = os.path.dirname(os.path.abspath(python))
+    env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
     cmd = [python, "-m", "gftools.builder", str(config_path)]
     if backend == "fontc":
         cmd += ["--experimental-fontc", fontc_bin]
