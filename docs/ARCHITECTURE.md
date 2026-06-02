@@ -24,25 +24,45 @@ the `fontc` binary.
 | report | `cohorts_report` — read-only cohort preview |
 | main | argument parsing and wiring |
 
-## Phase pipeline (`Orchestrator._drive`, background thread)
+## Pipeline task-list (`Orchestrator._drive`, background thread)
 
-`run()` starts a single background **driver** thread that walks the run through phases,
-each publishing live progress (`phase`, `phase_done`, `phase_total`, `phase_label` — all
-under `self.lock`, exposed via `snapshot()`):
+`run()` starts a single background **driver** thread that walks the run through an
+end-to-end **task-list** — so the *entire* interaction (not just the builds) renders live
+in the UI. Each step is a `Task` (`key/name/status/t0/t1/done/total/detail`) exposed via
+`snapshot()["tasks"]`; the active step also drives the legacy `phase`/`phase_done`/
+`phase_total`/`phase_label` fields (for the banner + per-phase timing):
 
-1. **`archive`** (if `--populate-archive`) — `populate_archive()` mirrors any referenced
-   upstream repo not already present (parallel; append-only; never mutates/deletes).
-2. **`cohorts`** — `scan_cohorts()` reads each family's `requirements.txt` (read-only `git
+1. **`clone_gf`** — `ensure_google_fonts()` shallow-clones google/fonts if the worklist
+   needs METADATA and no clone is present (skipped otherwise).
+2. **`build_fontc`** — `build_fontc_from_source()` (`cargo build --release`) when the user
+   opted in and no binary was found/given (skipped otherwise). Sets `args.fontc_bin`.
+3. **`discover`** — `discover()` / `discover_from_archive()` + `sample_evenly()` build the
+   worklist, then `_enqueue()` populates the queue.
+4. **`archive`** (if `--populate-archive`) — `populate_archive()` mirrors any referenced
+   upstream repo not already present (parallel; append-only; never mutates/deletes). Each
+   newly-mirrored repo is appended to `self.archive_log` → `snapshot()["archive_recent"]`,
+   a live, growing list rendered in the UI.
+5. **`cohorts`** — `scan_cohorts()` reads each family's `requirements.txt` (read-only `git
    show`) and groups them; the live list is published in `self.cohorts`.
-3. **`build`** — creates the base venv (if `--manage-venvs`), starts the worker pool, and
+6. **`build`** — creates the base venv (if `--manage-venvs`), starts the worker pool, and
    waits until `all_done()`.
-4. **`done`** — set in `_drive`'s `finally` (even on error: `phase_error` is recorded),
-   which also saves state and closes the events file.
+7. **`done`** — set in `_drive`'s `finally` (even on error: `phase_error` is recorded, and
+   the in-flight task is marked `failed`), which also saves state and closes the events file.
 
-`main()` performs the **google/fonts clone** (`ensure_google_fonts`) and the **setup
-wizard** up front (plain Q&A) *before* the UI, since those are one-shot and interactive;
-the bulk live work (mirror / cohorts / build) happens in the driver. `join()` awaits the
-driver. Frontends treat `phase == "done"` as the completion signal.
+`main()` only resolves paths, runs the **setup wizard**, and validates (fail-fast) *before*
+the driver; every expensive/long step (clone, fontc, discover, mirror, cohorts, build) runs
+inside the driver so it shows in the task-list. `join()` awaits the driver. Frontends treat
+`phase == "done"` as the completion signal. Read-only paths (`--list`/`--cohorts-report`)
+discover synchronously in `main()` (no driver/UI).
+
+### Detach-by-default & auto-attach
+
+A fresh interactive (curses) build **detaches by default** (`daemonize()`): the build runs
+in a background daemon and the foreground process attaches a read-only **monitor**. Quitting
+the monitor with `q` frees the shell while the build keeps running. Re-running the program
+(from the same or any other terminal) detects the live daemon via `read_daemon_pid()` and
+**auto-attaches the monitor — skipping the wizard entirely** — so you resume straight to live
+updates. `--stop` cancels; `plain`/`json`/`none` UIs stay in the foreground for scripting.
 
 ## Per-family build pipeline (`Orchestrator._build_one`)
 

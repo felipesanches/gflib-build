@@ -36,6 +36,7 @@ build interpreter / venv (gftools.builder + fontmake, and/or the fontc binary).
 import argparse
 import hashlib
 import json
+import locale
 import math
 import os
 import queue
@@ -110,6 +111,25 @@ class Result:
         if self.started == 0:
             return 0.0
         return (self.ended or time.time()) - self.started
+
+
+@dataclass
+class Task:
+    """One step of the end-to-end pipeline, rendered as a live task-list line
+    (clone google/fonts, build fontc, discover, populate archive, cohorts, build)."""
+    key: str
+    name: str
+    status: str = "pending"          # pending|running|done|failed|skipped
+    t0: float = 0.0
+    t1: float = 0.0
+    done: int = 0                    # progress numerator (0 if not measurable)
+    total: int = 0                   # progress denominator (0 if not measurable)
+    detail: str = ""
+
+    def elapsed(self) -> float:
+        if not self.t0:
+            return 0.0
+        return (self.t1 or time.time()) - self.t0
 
 
 # =========================================================================== discovery
@@ -354,8 +374,17 @@ def ensure_google_fonts(path: Path, on_progress: Optional[Callable[[str], None]]
     return path
 
 
+def _repo_short(url: str) -> str:
+    """github.com/owner/repo(.git) -> 'owner/repo' for compact live display."""
+    u = url.rstrip("/")
+    if u.endswith(".git"):
+        u = u[:-4]
+    parts = [p for p in u.split("/") if p]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else url)
+
+
 def populate_archive(repo_urls, archive: Path, jobs: int,
-                     on_progress: Optional[Callable[[int, int, str], None]] = None,
+                     on_progress: Optional[Callable[[int, int, str, str], None]] = None,
                      stop: "Optional[threading.Event]" = None):
     """Ensure every repo_url has a bare mirror in the archive; clone --mirror the missing
     ones (APPEND-ONLY — existing mirrors are skipped read-only and NEVER modified/deleted).
@@ -392,7 +421,7 @@ def populate_archive(repo_urls, archive: Path, jobs: int,
                 else:
                     present += 1
                 if on_progress:
-                    on_progress(done[0], len(urls), url)
+                    on_progress(done[0], len(urls), url, status)
     return added, failed, present
 
 
@@ -715,14 +744,15 @@ def compare_to_shipped(google_fonts: Path, fam: Family, built: Dict[str, Path]) 
 class Orchestrator:
     """UI-agnostic build core. Exposes snapshot(); writes state.json + events.jsonl."""
 
-    def __init__(self, args, families: List[Family], total: int, skipped: int):
+    def __init__(self, args):
         self.args = args
         self.build_dir = Path(args.build_dir)
         self.google_fonts = Path(args.google_fonts) if args.google_fonts else None
         self.archive = Path(args.archive)
-        self.families = {f.slug: f for f in families}
-        self.total_with_source = total
-        self.skipped_no_config = skipped
+        # the worklist is discovered live, inside the driver (a task), so it shows in the UI
+        self.families: Dict[str, Family] = {}
+        self.total_with_source = 0
+        self.skipped_no_config = 0
 
         self.lock = threading.Lock()
         self.results: Dict[str, Result] = {}
@@ -742,14 +772,17 @@ class Orchestrator:
             self.venvs = VenvManager(self.build_dir, args.base_python,
                                      Path(args.base_requirements) if args.base_requirements else None)
 
-        # phase pipeline state (archive → cohorts → build → done)
+        # phase pipeline state (clone_gf → build_fontc → discover → archive → cohorts → build → done)
         self.phase = "init"
         self.phase_total = 0
         self.phase_done = 0
         self.phase_label = ""
         self.phase_error = ""
         self.cohorts: Dict[str, dict] = {}
+        self.archive_log: List[Tuple[str, str]] = []   # (status, owner/repo) as repos are mirrored
         self.driver: Optional[threading.Thread] = None
+        # end-to-end task-list rendered live in the UI (each maps to a phase key)
+        self.tasks: List[Task] = self._build_tasks()
         # timing instrumentation (every operation is measured, for bottleneck analysis)
         self.op_stats: Dict[str, List[float]] = {}   # op -> [total_seconds, count, max]
         self.phase_durations: Dict[str, float] = {}
@@ -758,8 +791,73 @@ class Orchestrator:
         self._status_stop = threading.Event()
         self._status_lock = threading.Lock()
 
-        self._load_state()
-        self._enqueue()
+        self._load_state()   # _enqueue() happens later, in the discover task of the driver
+
+    # ---- task-list (end-to-end pipeline shown live in the UI)
+    def _build_tasks(self) -> List[Task]:
+        gf = self.google_fonts
+        need_clone = (self.args.source == "metadata"
+                      and not (gf and (gf / "ofl").is_dir()))
+        want_fontc = bool(getattr(self.args, "_want_build_fontc", False))
+        populate = bool(getattr(self.args, "populate_archive", False))
+        return [
+            Task("clone_gf", "clone google/fonts",
+                 "pending" if need_clone else "skipped"),
+            Task("build_fontc", "build fontc from source",
+                 "pending" if want_fontc else "skipped"),
+            Task("discover", "discover worklist (METADATA / archive)"),
+            Task("archive", "populate archive (mirror missing)",
+                 "pending" if populate else "skipped"),
+            Task("cohorts", "scan dependency cohorts"),
+            Task("build", "build fonts"),
+        ]
+
+    def _task(self, key: str) -> Optional[Task]:
+        for t in self.tasks:
+            if t.key == key:
+                return t
+        return None
+
+    def _task_start(self, key: str, total: int = 0, detail: str = ""):
+        with self.lock:
+            t = self._task(key)
+            if t is not None:
+                t.status, t.t0, t.t1, t.total, t.done, t.detail = (
+                    "running", time.time(), 0.0, total, 0, detail)
+        self._begin_phase(key, total)            # drives the phase banner + per-phase timing
+
+    def _task_progress(self, key: str, done: int, detail: str = ""):
+        with self.lock:
+            t = self._task(key)
+            if t is not None:
+                t.done, t.detail = done, detail
+        self._phase_progress(done, detail)
+
+    def _task_done(self, key: str, detail: str = ""):
+        with self.lock:
+            t = self._task(key)
+            if t is not None:
+                t.status, t.t1 = "done", time.time()
+                if detail:
+                    t.detail = detail
+
+    def _task_fail(self, key: str, detail: str = ""):
+        with self.lock:
+            t = self._task(key)
+            if t is not None:
+                t.status, t.t1, t.detail = "failed", time.time(), detail
+            self.phase_error = detail
+
+    def _archive_progress(self, done: int, url: str, status: str):
+        """Per-repo callback from populate_archive: keep a live, growing list of the repos
+        actually mirrored into the archive (newly added / failed; 'present' is silent)."""
+        short = _repo_short(url)
+        if status in ("added", "failed"):
+            with self.lock:
+                self.archive_log.append((status, short))
+                if len(self.archive_log) > 400:
+                    del self.archive_log[:-400]
+        self._task_progress("archive", done, f"{status}: {short}")
 
     # ---- phase helpers (also accumulate per-phase wall-clock durations)
     def _close_phase(self, now: float):
@@ -851,7 +949,8 @@ class Orchestrator:
         todo.sort(key=weight, reverse=True)
 
         for slug in todo:
-            self.results[slug] = Result(slug=slug, status="queued")
+            with self.lock:    # _enqueue now runs in the driver thread, racing the status writer
+                self.results[slug] = Result(slug=slug, status="queued")
             self.q.put(slug)
 
     # ---- read-only views
@@ -903,6 +1002,10 @@ class Orchestrator:
                              "mean": round(s[0] / s[1], 3) if s[1] else 0.0, "max": round(s[2], 2)}
                         for op, s in self.op_stats.items()}
             phase_dur = {k: round(v, 1) for k, v in self.phase_durations.items()}
+            tasks = [{"key": t.key, "name": t.name, "status": t.status,
+                      "elapsed": round(t.elapsed(), 1), "done": t.done,
+                      "total": t.total, "detail": t.detail} for t in self.tasks]
+            archive_recent = [{"status": s, "repo": r} for s, r in self.archive_log[-60:]]
         return {
             "elapsed": time.time() - self.start_time,
             "disk_used_delta": disk_delta, "disk_free": disk_free,
@@ -915,6 +1018,7 @@ class Orchestrator:
             "cohorts": [{"key": k, "count": v["count"],
                          "requirements": v["requirements"]} for k, v in cohorts],
             "op_stats": op_stats, "phase_durations": phase_dur, "migration": migration,
+            "tasks": tasks, "archive_recent": archive_recent,
             "done": phase == "done",
         }
 
@@ -1167,40 +1271,109 @@ class Orchestrator:
 
     def _drive(self):
         try:
-            # Phase: populate the archive (mirror any missing upstream repos) — append-only.
+            # Task: clone google/fonts (shallow) if the worklist needs METADATA and it's absent.
+            t = self._task("clone_gf")
+            if t is not None and t.status == "pending" and not self.stop.is_set():
+                self._task_start("clone_gf")
+                try:
+                    ensure_google_fonts(
+                        self.google_fonts,
+                        on_progress=lambda m: self._task_progress("clone_gf", 0, m))
+                    self._task_done("clone_gf", str(self.google_fonts))
+                except (RuntimeError, ValueError) as e:
+                    self._task_fail("clone_gf", str(e))
+                    return
+
+            # Task: build fontc from source (cargo build --release) if requested.
+            t = self._task("build_fontc")
+            if t is not None and t.status == "pending" and not self.stop.is_set():
+                self._task_start("build_fontc")
+                try:
+                    dest = Path(getattr(self.args, "_data_dir", str(self.build_dir))) / "fontc"
+                    self.args.fontc_bin = build_fontc_from_source(
+                        dest, on_progress=lambda m: self._task_progress("build_fontc", 0, m))
+                    self._task_done("build_fontc", self.args.fontc_bin)
+                except RuntimeError as e:
+                    self._task_fail("build_fontc", str(e))
+                    return
+
+            # Task: discover the worklist (METADATA-driven or archive-driven) and enqueue it.
+            if not self.stop.is_set():
+                self._task_start("discover")
+                if self.args.source == "archive":
+                    fams, total, skipped = discover_from_archive(
+                        self.archive, self.args.archive_rev, self.args.jobs)
+                else:
+                    fams, total, skipped = discover(self.google_fonts)
+                fams = sample_evenly(fams, self.args.percent)
+                with self.lock:
+                    self.families = {f.slug: f for f in fams}
+                    self.total_with_source = total
+                    self.skipped_no_config = skipped
+                self._enqueue()
+                self._task_done(
+                    "discover",
+                    f"{self.q.qsize()} queued of {len(fams)} selected "
+                    f"({self.args.percent:g}%; {total} with source, {skipped} skipped)")
+
+            # Task: populate the archive (mirror any missing upstream repos) — append-only.
             # `stop` is threaded through so Ctrl-C aborts these long phases promptly.
-            if getattr(self.args, "populate_archive", False) and self.families and not self.stop.is_set():
+            t = self._task("archive")
+            if (t is not None and t.status == "pending"
+                    and self.families and not self.stop.is_set()):
                 urls = sorted({f.repo_url for f in self.families.values()})
-                self._begin_phase("archive", len(urls))
-                populate_archive(urls, self.archive, self.args.jobs,
-                                 on_progress=lambda d, t, u: self._phase_progress(d, u),
-                                 stop=self.stop)
-            # Phase: scan/generate the dependency cohorts (read-only)
+                self._task_start("archive", len(urls))
+                added, failed, present = populate_archive(
+                    urls, self.archive, self.args.jobs,
+                    on_progress=lambda d, n, u, st: self._archive_progress(d, u, st),
+                    stop=self.stop)
+                self._task_done("archive",
+                                f"{len(added)} added, {present} present, {len(failed)} failed")
+
+            # Task: scan/generate the dependency cohorts (read-only)
             if self.families and not self.stop.is_set():
-                self._begin_phase("cohorts", len(self.families))
+                self._task_start("cohorts", len(self.families))
                 groups, sigs = scan_cohorts(
                     list(self.families.values()), self.archive, self.args.jobs,
-                    on_progress=lambda d, t, s: self._phase_progress(d, s), stop=self.stop)
+                    on_progress=lambda d, n, s: self._task_progress("cohorts", d, s), stop=self.stop)
                 with self.lock:
                     self.cohorts = {k: {"count": len(v), "requirements": sigs.get(k, "")}
                                     for k, v in sorted(groups.items(), key=lambda kv: -len(kv[1]))}
-            # Phase: build
-            if not self.stop.is_set():
+                self._task_done("cohorts", f"{len(groups)} cohorts")
+
+            # Task: build — guard on the QUEUE, not just on families: when --only/resume
+            # filter everything out, the queue is empty and workers would never self-terminate
+            # (all_done() is False for an empty results dict), so we must skip starting them.
+            if self.q.qsize() and not self.stop.is_set():
                 if self.venvs is not None:
                     self.venvs.ensure_base()
-                self._begin_phase("build", self.q.qsize())
+                with self.lock:
+                    build_total = len(self.results)   # queued now + any already-built (resume)
+                self._task_start("build", build_total)
                 for i in range(max(1, self.args.jobs)):
-                    t = threading.Thread(target=self.worker, args=(i + 1,), daemon=True)
-                    t.start()
-                    self.workers.append(t)
+                    th = threading.Thread(target=self.worker, args=(i + 1,), daemon=True)
+                    th.start()
+                    self.workers.append(th)
                 # exits only once every worker has stopped (no _emit can follow)
-                while any(t.is_alive() for t in self.workers):
+                while any(th.is_alive() for th in self.workers):
                     if self.stop.is_set() or self.all_done():
                         self.stop.set()
+                    with self.lock:
+                        done_n = sum(1 for r in self.results.values()
+                                     if r.status in ("built", "failed", "skipped"))
+                    self._task_progress("build", done_n)
                     time.sleep(0.2)
+                self._task_done("build")
+            elif self._task("build") is not None and self._task("build").status == "pending":
+                done_note = ("nothing to build" if not self.families
+                             else "nothing new to build (already built / filtered out)")
+                self._task_done("build", done_note)
         except Exception as e:
             with self.lock:
                 self.phase_error = str(e)
+                cur = self._task(self.phase)
+                if cur is not None and cur.status == "running":
+                    cur.status, cur.t1, cur.detail = "failed", time.time(), str(e)
         finally:
             self.save_state()
             self._set_phase("done")  # workers are guaranteed stopped here
@@ -1325,13 +1498,24 @@ class CursesFrontend(Frontend):
             print(f"curses unavailable ({e}); using --ui plain.", file=sys.stderr)
             return PlainFrontend(self.orch).run()
         try:
+            locale.setlocale(locale.LC_ALL, "")   # enable UTF-8 wide chars (emoji status marks)
+        except locale.Error:
+            pass
+        try:
             curses.wrapper(self._draw)
         except Exception as e:
             print(f"curses error ({e}); switching to plain output.", file=sys.stderr)
             return PlainFrontend(self.orch).run()
 
-    PHASE_LABEL = {"init": "starting…", "archive": "populating archive (mirroring repos)",
+    PHASE_LABEL = {"init": "starting…", "clone_gf": "cloning google/fonts",
+                   "build_fontc": "building fontc from source",
+                   "discover": "discovering worklist",
+                   "archive": "populating archive (mirroring repos)",
                    "cohorts": "scanning dependency cohorts", "build": "building", "done": "done"}
+    # emoji status marks (ASCII fallback chosen at runtime if the terminal can't render them)
+    EMOJI = {"pending": "⏳", "running": "🔄", "done": "✅", "failed": "❌", "skipped": "➖"}
+    ASCII = {"pending": "..", "running": ">>", "done": "OK", "failed": "XX", "skipped": "--"}
+    VIEWS = ("overview", "cohorts", "failures", "stats")
 
     def _draw(self, stdscr):
         import curses
@@ -1354,26 +1538,40 @@ class CursesFrontend(Frontend):
             GREEN, RED, YEL, CYAN = (curses.color_pair(i) for i in range(1, 5))
         else:
             GREEN = RED = YEL = CYAN = curses.A_NORMAL
+        # decide once whether the terminal can render emoji status marks
+        use_emoji = True
+        try:
+            stdscr.addstr(0, 0, self.EMOJI["done"]); stdscr.erase()
+        except curses.error:
+            use_emoji = False
+        MARK = self.EMOJI if use_emoji else self.ASCII
+        SATTR = {"done": GREEN, "failed": RED, "running": YEL, "skipped": curses.A_DIM,
+                 "pending": curses.A_NORMAL}
+        mon = getattr(self, "monitor", False)
         view, scroll = "overview", 0
         while True:
-            if self.orch.stop.is_set():
+            if self.orch.stop.is_set() and not mon:
                 break
             ch = stdscr.getch()
             if ch in (ord("q"), ord("Q")):
-                self.orch.stop.set(); break
+                if not mon:
+                    self.orch.stop.set()
+                break
             elif ch in (ord("p"), ord("P")):
                 (self.orch.paused.clear if self.orch.paused.is_set() else self.orch.paused.set)()
             elif ch in (ord("1"), ord("o"), ord("O")):
                 view, scroll = "overview", 0
-            elif ch in (ord("2"), ord("c"), ord("C")):
+            elif ch in (ord("2"),):
                 view, scroll = "cohorts", 0
-            elif ch in (ord("3"), ord("f"), ord("F")):
+            elif ch in (ord("3"),):
                 view, scroll = "failures", 0
-            elif ch in (ord("4"), ord("s"), ord("S")):
+            elif ch in (ord("4"),):
                 view, scroll = "stats", 0
-            elif ch == 9:  # Tab cycles views
-                view = {"overview": "cohorts", "cohorts": "failures",
-                        "failures": "stats", "stats": "overview"}[view]
+            elif ch in (9, curses.KEY_RIGHT):        # Tab / → : next view
+                view = self.VIEWS[(self.VIEWS.index(view) + 1) % len(self.VIEWS)]
+                scroll = 0
+            elif ch == curses.KEY_LEFT:              # ← : previous view
+                view = self.VIEWS[(self.VIEWS.index(view) - 1) % len(self.VIEWS)]
                 scroll = 0
             elif ch == curses.KEY_DOWN:
                 scroll += 1
@@ -1387,7 +1585,10 @@ class CursesFrontend(Frontend):
 
             def put(y, x, s, attr=0):
                 if 0 <= y < h and 0 <= x < w:
-                    stdscr.addnstr(y, x, str(s), max(0, w - x - 1), attr)
+                    try:
+                        stdscr.addnstr(y, x, str(s), max(0, w - x - 1), attr)
+                    except curses.error:
+                        pass
 
             grand = snap["total"] or 1
             done = c["built"] + c["failed"]
@@ -1423,10 +1624,31 @@ class CursesFrontend(Frontend):
                               ("3 failures", "failures"), ("4 stats", "stats")):
                 put(4, x, f" {lbl} ", curses.A_REVERSE if view == name else curses.A_DIM)
                 x += len(lbl) + 3
-            put(4, max(x + 2, w - 24), "[tab]switch [↑↓]scroll", curses.A_DIM)
+            put(4, max(x + 2, w - 22), "[←→]tabs [↑↓]scroll", curses.A_DIM)
 
             row = 6
             if view == "overview":
+                # end-to-end pipeline task-list (clone → fontc → discover → archive → cohorts → build)
+                put(row, 0, " Pipeline ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
+                for t in snap.get("tasks", []):
+                    mark = MARK.get(t["status"], "?")
+                    prog = ""
+                    if t["total"]:
+                        prog = f"{t['done']}/{t['total']} {int(100 * t['done'] / max(1, t['total'])):>3}%"
+                    el = hms(t["elapsed"]) if t["elapsed"] else ""
+                    line = f"{mark} {t['name']:<30} {prog:<13} {el:>8}  {t['detail']}"
+                    put(row, 1, line, SATTR.get(t["status"], 0)); row += 1
+                # live, growing list of repos as they are mirrored into the archive
+                arch = snap.get("archive_recent", [])
+                if arch and ph == "archive":
+                    row += 1
+                    put(row, 0, " Archive — repos mirrored (newest last) ".ljust(w - 1, "-"),
+                        curses.A_BOLD); row += 1
+                    for a in arch[-max(0, (h - row) // 3):]:
+                        col = RED if a["status"] == "failed" else GREEN
+                        put(row, 1, f"{'+ ' if a['status'] == 'added' else '✗ '}{a['repo']}", col)
+                        row += 1
+                row += 1
                 put(row, 0, " Now building ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
                 cap = max(0, (h - row) // 2 - 1)
                 for bld in snap["building"][:cap]:
@@ -1486,13 +1708,13 @@ class CursesFrontend(Frontend):
                 if not ops:
                     put(row, 1, "(timing accrues as builds run)")
 
-            mon = getattr(self, "monitor", False)
-            foot = (" [q]uit monitor (build keeps running)" if mon else " [q]uit [p]ause")
+            foot = (" [q]uit — build keeps running (re-run to reattach; --stop to cancel)"
+                    if mon else " [q]uit [p]ause")
             if mon and not snap.get("daemon_alive", True):
                 foot = " [q]uit   ⚠ daemon not running (build finished or stopped)"
             put(h - 1, 0, foot + "   logs: " + str(self.orch.build_dir / "logs"), curses.A_DIM)
             stdscr.refresh()
-            if snap["done"] and not self.monitor:
+            if snap["done"] and not mon:
                 time.sleep(1.0)
                 break
             time.sleep(0.25)
@@ -1684,7 +1906,8 @@ class MonitorState:
               "backends": {"fontc": 0, "fontmake": 0}, "building": [], "failures_recent": [],
               "cohorts": [], "total": 0, "elapsed": 0, "disk_used_delta": 0, "disk_free": 0,
               "jobs": 0, "paused": False, "phase_total": 0, "phase_done": 0, "phase_label": "",
-              "phase_error": "", "op_stats": {}, "phase_durations": {}, "done": False}
+              "phase_error": "", "op_stats": {}, "phase_durations": {}, "migration": {},
+              "tasks": [], "archive_recent": [], "done": False}
 
     def __init__(self, build_dir: Path):
         self.build_dir = Path(build_dir)
@@ -2022,6 +2245,18 @@ def main():
     if args.populate_archive is None:
         args.populate_archive = (args.source == "metadata") and not read_only
 
+    # ---- if a build is ALREADY RUNNING in this build_dir, just reattach a live monitor ----
+    # (resume straight to live updates — no wizard — from this or any other terminal; q leaves
+    #  it running, --stop cancels). Prevents accidentally starting a second build in one dir.
+    if not read_only and read_daemon_pid(build_dir) is not None:
+        ui = pick_frontend(args.ui)
+        if ui == "curses" and not sys.stdout.isatty():
+            sys.exit(f"a build is running at {build_dir}; attach from a terminal or use --attach")
+        print(f"a build is already running at {build_dir} — reattaching live monitor "
+              f"(q leaves it running; --stop to cancel).", file=sys.stderr)
+        run_monitor(build_dir, ui)
+        return
+
     need_gf_clone = args.source == "metadata" and not (gf and (gf / "ofl").is_dir())
     want_build_fontc = False
     steps = []
@@ -2140,43 +2375,35 @@ def main():
     for sub in ("work", "out", "logs"):
         (build_dir / sub).mkdir(exist_ok=True)
 
-    # ---- now the expensive bootstrap, only after all validations have passed ----
-    if need_gf_clone:
-        try:
-            ensure_google_fonts(gf, on_progress=lambda m: print(f"  {m}", file=sys.stderr))
-        except (RuntimeError, ValueError) as e:
-            sys.exit(str(e))
-    if want_build_fontc and not args.fontc_bin:
-        try:
-            args.fontc_bin = build_fontc_from_source(
-                data_dir / "fontc", on_progress=lambda m: print(f"  {m}", file=sys.stderr))
-        except RuntimeError as e:
-            sys.exit(str(e))
-    if args.source == "metadata" and not (gf / "ofl").is_dir():
-        sys.exit(f"google/fonts {gf} is not a clone (no ofl/)")
-    if not archive.is_dir():
-        sys.exit(f"archive {archive} not available")
-
-    if args.source == "archive":
-        families, total, skipped = discover_from_archive(Path(args.archive), args.archive_rev, args.jobs)
-    else:
-        families, total, skipped = discover(gf)
-    sampled = sample_evenly(families, args.percent)
-    if args.source == "metadata":
-        ctx = f" (of {total} total in the library; {skipped} not buildable: no config/commit)"
-    else:
-        ctx = (f" (of {total} mirrors in the archive; {skipped} with no resolvable rev "
-               f"at {args.archive_rev})")
-    if args.list:
-        for f in sampled:
-            cfg = "override" if f.has_override else (f.config_yaml or "(auto)")
-            print(f"{f.slug:<40} {cfg:<26} {f.repo_url}")
-        print(f"\n{len(sampled)} selected ({args.percent:g}% of {len(families)} via "
-              f"--source {args.source}){ctx}", file=sys.stderr)
-        return
-
-    if args.cohorts_report:
-        sel = sampled
+    # ---- read-only paths (--list / --cohorts-report) discover synchronously (no live UI) ----
+    if read_only:
+        if need_gf_clone:
+            try:
+                ensure_google_fonts(gf, on_progress=lambda m: print(f"  {m}", file=sys.stderr))
+            except (RuntimeError, ValueError) as e:
+                sys.exit(str(e))
+        if args.source == "metadata" and not (gf / "ofl").is_dir():
+            sys.exit(f"google/fonts {gf} is not a clone (no ofl/)")
+        if not archive.is_dir():
+            sys.exit(f"archive {archive} not available")
+        if args.source == "archive":
+            families, total, skipped = discover_from_archive(Path(args.archive), args.archive_rev, args.jobs)
+        else:
+            families, total, skipped = discover(gf)
+        sampled = sample_evenly(families, args.percent)
+        if args.source == "metadata":
+            ctx = f" (of {total} total in the library; {skipped} not buildable: no config/commit)"
+        else:
+            ctx = (f" (of {total} mirrors in the archive; {skipped} with no resolvable rev "
+                   f"at {args.archive_rev})")
+        if args.list:
+            for f in sampled:
+                cfg = "override" if f.has_override else (f.config_yaml or "(auto)")
+                print(f"{f.slug:<40} {cfg:<26} {f.repo_url}")
+            print(f"\n{len(sampled)} selected ({args.percent:g}% of {len(families)} via "
+                  f"--source {args.source}){ctx}", file=sys.stderr)
+            return
+        sel = sampled                              # --cohorts-report
         if args.only:
             keep = set(args.only.split(","))
             sel = [f for f in sampled if f.slug in keep]
@@ -2184,16 +2411,25 @@ def main():
                        context=ctx)
         return
 
-    orch = Orchestrator(args, sampled, total, skipped)
-    print(f"Selected {len(sampled)}/{len(families)} ({args.percent:g}%) via --source "
-          f"{args.source}{ctx}. Queued {orch.q.qsize()}; backend={args.backend}"
-          f"{' (fontc-first)' if orch._backend_order()[0] == 'fontc' else ''}.", file=sys.stderr)
+    # ---- build path: clone google/fonts, build fontc, discover, populate archive, cohorts and
+    #      the builds ALL run live inside the driver, rendered as a task-list in the UI ----
+    args._want_build_fontc = want_build_fontc
+    args._data_dir = str(data_dir)
+    orch = Orchestrator(args)
+
+    ui = pick_frontend(args.ui)
+    # A fresh interactive (curses) build runs detached by default: quitting the UI (q) frees the
+    # shell while the build keeps running, and re-running reattaches a live monitor. plain/json/
+    # none stay in the foreground for scripting/logging; --detach forces detach for any UI.
+    detach = args.detach or ui == "curses"
+    print(f"Starting build pipeline (backend={args.backend}); the live UI shows clone / fontc / "
+          f"discover / archive / cohorts / build as a task-list.", file=sys.stderr)
 
     # register handlers BEFORE daemonize so the daemon inherits them (no kill-before-handler window)
     signal.signal(signal.SIGINT, lambda *_: orch.stop.set())
     signal.signal(signal.SIGTERM, lambda *_: orch.stop.set())
 
-    if args.detach:
+    if detach:
         if daemonize(build_dir):                  # detached daemon: run the build, headless
             orch.run()
             orch.join()
@@ -2201,17 +2437,17 @@ def main():
             return
         # original parent: drop our copy of the daemon's events file, then attach a monitor
         orch._close_events()
-        print(f"build running detached. reattach any time:\n"
+        print(f"build running detached at {build_dir}. reattach any time by re-running, or:\n"
               f"  python3 {Path(sys.argv[0]).name} --attach --build-dir {build_dir}\n"
               f"  python3 {Path(sys.argv[0]).name} --stop   --build-dir {build_dir}",
               file=sys.stderr)
         time.sleep(0.5)
-        if pick_frontend(args.ui) != "none":
-            run_monitor(build_dir, pick_frontend(args.ui))
+        if ui != "none":
+            run_monitor(build_dir, ui)
         return
 
     orch.run()
-    frontend = FRONTENDS[pick_frontend(args.ui)](orch)
+    frontend = FRONTENDS[ui](orch)
     try:
         frontend.run()
         orch.join()

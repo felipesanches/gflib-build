@@ -126,6 +126,17 @@ intent so nothing is lost as the tool evolves.
 21. **Time-measure every operation** to surface bottlenecks and guide performance work.
 22. **Detach & reattach.** The user can quit the program and leave the builds running
     autonomously; reopening shows the live stats of what's going on.
+23. **The entire interaction is ncurses.** The bootstrap operations (clone fontc, build
+    fontc, clone google/fonts, populate archive, scan cohorts, build) all show up as a live
+    **task-list with emoji status** (✅ done · 🔄 running · ⏳ pending · ❌ failed · ➖ n/a),
+    plus per-task percentage and elapsed time — not plain CLI prints.
+24. **Quit frees the shell; resume is instant.** Pressing `q` returns to the shell with the
+    build still running; re-running the program (from the same or a different terminal)
+    reattaches straight to live updates **without showing the setup interface again**.
+25. **Live archive list.** As repos are populated into the archive, their names appear in a
+    gradually growing list in the UI.
+26. **Arrow-key tabs.** The dashboard's view tabs are driven by the ←/→ arrows (number keys
+    still jump directly).
 
 ---
 
@@ -274,36 +285,56 @@ across the alphabetical family list, so 5% still spans many foundries rather tha
 corner). Ideal for validating the tool end-to-end before committing to a full run.
 `--only ofl/a,ofl/b` picks an explicit subset.
 
-## Phases & the live dashboard (TUI)
+## Pipeline task-list & the live dashboard (TUI)
 
-A run drives a background pipeline through phases, each reported live:
-**`archive`** (mirror any missing upstream repos) → **`cohorts`** (scan/generate the
-dependency cohorts) → **`build`** → **`done`**. The ncurses dashboard shows a phase banner +
-progress bar and is **navigable** — three views switchable with `1`/`2`/`3` or `Tab`:
+The **entire interaction** is ncurses — not just the builds. A run drives a background
+pipeline rendered as a live **task-list** with emoji status (✅ done · 🔄 running · ⏳
+pending · ❌ failed · ➖ n/a) plus per-task progress and elapsed time:
+**`clone google/fonts`** → **`build fontc`** → **`discover worklist`** → **`populate
+archive`** → **`scan cohorts`** → **`build fonts`** → **`done`**. The dashboard also shows a
+phase banner + progress bar and is **navigable** — four views switchable with the **←/→
+arrows** (or `Tab`):
 
 ```
  Google Fonts library build                                   elapsed 01:23:45
  disk +12.3GiB  free 290.0GiB  jobs 8  cohorts 28  fontc 980/fontmake 240
  Phase: building   built 412/1503  failed 7  building 8  queued 1076
  [######################------------------------------------]  31%
-  1 overview   2 cohorts   3 failures               [tab]switch [↑↓]scroll
+  1 overview   2 cohorts   3 failures   4 stats        [←→]tabs [↑↓]scroll
+ Pipeline -------------------------------------------------------------------
+  ✅ clone google/fonts          00:00:31   <build-dir>/google-fonts
+  ➖ build fontc from source                 (skipped — binary detected)
+  ✅ discover worklist           00:00:04   1503 queued of 1503 selected
+  🔄 populate archive   340/1320  25% 03:12  added: notofonts/noto-cjk
+  ⏳ scan dependency cohorts
+  ⏳ build fonts
+ Archive — repos mirrored (newest last) -------------------------------------
+  + google/fonts-sources    + notofonts/latin-greek-cyrillic   ✗ owner/dead-repo
  Now building ----------------------------------------------------------------
   w 1 ofl/notosanstc                       02:10  fontc
-  w 2 ofl/roboto                           00:42  fontmake
- Recent failures (7) --------------------------------------------------------
-  ofl/foldit                       gftools.builder exit 1: KeyError 'instances'
- [q]uit [p]ause   logs: <build-dir>/logs
+ [q]uit — build keeps running (re-run to reattach; --stop to cancel)
 ```
 
-- **overview** — build dashboard (now-building + recent failures).
+- **overview** — the pipeline task-list, the live archive-population list (repos appear as
+  they are mirrored), now-building, and recent failures.
 - **cohorts** — the dependency cohorts, live and scrollable (largest first).
 - **failures** — all failures, newest first, scrollable.
+- **stats** — fontc-migration tally + per-phase / per-operation timing.
 
-Keys: `1`/`2`/`3` or `Tab` switch views, `↑`/`↓` scroll, `p` pause/resume, `q` quit (lets
-in-flight builds finish). During the `archive`/`cohorts` phases the banner shows that
-phase's progress (e.g. `Phase: populating archive  340/1320`). Full per-family logs are at
-`<build-dir>/logs/<slug>.<backend>.log`. For non-interactive use pick `--ui plain`
-(prints phase transitions + progress), `--ui json`, or `--ui none`.
+Keys: **`←`/`→`** (or `Tab`) switch views, `1`/`2`/`3`/`4` jump to a view, `↑`/`↓` scroll,
+`q` quit. Full per-family logs are at `<build-dir>/logs/<slug>.<backend>.log`. For
+non-interactive use pick `--ui plain` (prints phase transitions + progress), `--ui json`, or
+`--ui none`.
+
+### Quit anytime — the build keeps running, resume straight to live updates
+
+A fresh interactive (curses) build runs **detached by default**: it builds in a background
+daemon while you watch a live monitor. Press **`q`** and you're back at the shell with the
+build still running — go do anything else. **Re-run the program** (from the same terminal or
+a different window) and it detects the running build and **reattaches the live monitor,
+skipping the setup wizard entirely** — straight back to live updates. `--stop` cancels the
+build gracefully. (`plain`/`json`/`none` UIs stay in the foreground for scripting/logging;
+`--detach` forces detach for any UI.)
 
 ---
 
@@ -360,11 +391,13 @@ Useful flags: `--percent 5` (sample), `--only ofl/dmsans,ofl/roboto` (subset),
 
 ## Detached builds, monitoring & persistence
 
-- **Run autonomously, watch later.** `--detach` runs the build in a background daemon and
-  opens a live monitor; **quit the monitor with `q` and the build keeps running.** Reattach
-  any time with `--attach --build-dir <dir>` (read-only live view), or stop it with
-  `--stop --build-dir <dir>` (graceful). The daemon writes `status.json` every ~1 s, which
-  the monitor (and any external tool) reads.
+- **Run autonomously, watch later — by default.** A fresh interactive (curses) build
+  detaches automatically: it runs in a background daemon and opens a live monitor. **Quit the
+  monitor with `q` and the build keeps running.** **Just re-run the program** to reattach
+  (it detects the running daemon and skips the wizard), from this terminal or any other — or
+  use `--attach --build-dir <dir>` explicitly. Stop it with `--stop --build-dir <dir>`
+  (graceful). `--detach` forces this for non-curses UIs too. The daemon writes `status.json`
+  every ~1 s (atomic rename), which the monitor (and any external tool) reads.
 - **Persisted settings.** Your wizard/CLI choices are saved to
   `<data-dir>/gflib-build.config` and pre-fill the next run (CLI flags still override;
   `--no-save-config` to skip, `--config` for a custom path).
@@ -406,11 +439,11 @@ failures; `--rebuild` starts over.
 - [x] Partial runs via `--percent` (evenly-spaced sample).
 - [x] Two worklist sources: `--source metadata` (google/fonts) and `--source archive` (the mirrors directly).
 - [x] Zero-to-built bootstrap: auto-clone google/fonts + populate the archive, behind a setup wizard (`--yes` to skip); default paths under `--data-dir`.
-- [x] Phase-driven pipeline (archive → cohorts → build) with a phase-aware, navigable TUI (overview / cohorts / failures / stats).
+- [x] End-to-end ncurses task-list (clone gf → build fontc → discover → archive → cohorts → build) with emoji status, per-task %/elapsed, a live archive-population list, and ←/→ tab navigation.
 - [x] Editable ncurses setup wizard (cursor, conditional fields, ±5 stepping, fontc/cargo/archive auto-detect); persisted to a config file.
-- [x] Detach/reattach: run the build as a daemon (`--detach`), monitor live (`--attach`), stop gracefully (`--stop`).
+- [x] Detach-by-default + auto-attach: `q` frees the shell with the build still running; re-running reattaches live (any terminal) without the wizard; `--attach`/`--stop` explicit; `--detach` for non-curses UIs.
 - [x] Comprehensive per-family logs + per-operation/per-phase timing (`timings.json`, stats view).
-- [ ] Emit a migration report: % of library building under fontc, and the blockers per family.
+- [x] Migration tracking: per-family backend record + `--backend both` comparison; `migration.json` (fontc / fontmake-fallback blockers / both-identical-or-differ) + stats view + end summary.
 - [ ] Feed results back to the gfonts_agents dashboard (`reproducible_build` + provenance levels).
 - [ ] Track toward an **all-Rust** build with no Python orchestration in the loop.
 
