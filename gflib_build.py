@@ -271,6 +271,57 @@ def preclean_outputs(work: Path) -> None:
 
 
 GOOGLE_FONTS_URL = "https://github.com/google/fonts.git"
+FONTC_URL = "https://github.com/googlefonts/fontc.git"
+EXTRACT_TIMEOUT = 3600  # cap for `git archive` extraction (independent of the build timeout)
+
+
+def detect_fontc() -> Optional[str]:
+    """Best-effort auto-detect of a fontc binary: PATH, then common build locations."""
+    p = shutil.which("fontc")
+    if p:
+        return p
+    for c in (Path("fontc") / "target" / "release" / "fontc",
+              Path.home() / "fontc" / "target" / "release" / "fontc",
+              Path("..") / "fontc" / "target" / "release" / "fontc"):
+        if c.is_file():
+            return str(c.resolve())
+    return None
+
+
+def detect_archive(data_dir: Path) -> Optional[str]:
+    """Best-effort auto-detect of a pre-existing repo archive (a dir of {owner}/{repo}.git)."""
+    for c in (data_dir / "archive", Path("repo_archive"), Path("archive"),
+              Path.home() / "repo_archive", Path.home() / "upstream_repos" / "repo_archive"):
+        try:
+            if c.is_dir() and next(c.glob("*/*.git"), None) is not None:
+                return str(c.resolve())
+        except OSError:
+            pass
+    return None
+
+
+def build_fontc_from_source(dest: Path, on_progress: Optional[Callable[[str], None]] = None) -> str:
+    """Clone googlefonts/fontc and `cargo build --release -p fontc`. Returns the binary path."""
+    dest = Path(dest)
+    binp = dest / "target" / "release" / "fontc"
+    if binp.is_file():
+        return str(binp)
+    if shutil.which("cargo") is None:
+        raise RuntimeError("cannot build fontc: cargo (Rust toolchain) not found on PATH")
+    if not (dest / ".git").is_dir():
+        if on_progress:
+            on_progress(f"cloning fontc → {dest}")
+        rc, _, err = git(["clone", "--depth", "1", FONTC_URL, str(dest)], timeout=3600)
+        if rc != 0:
+            tail = err.strip().splitlines()[-1] if err.strip() else str(rc)
+            raise RuntimeError(f"fontc clone failed: {tail}")
+    if on_progress:
+        on_progress("building fontc (cargo build --release -p fontc) — this can take a while…")
+    p = subprocess.run(["cargo", "build", "--release", "-p", "fontc"], cwd=str(dest),
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=7200)
+    if p.returncode != 0 or not binp.is_file():
+        raise RuntimeError("fontc build failed: " + p.stdout.decode("utf-8", "replace")[-200:])
+    return str(binp)
 
 
 def ensure_google_fonts(path: Path, on_progress: Optional[Callable[[str], None]] = None) -> Path:
@@ -508,7 +559,8 @@ class VenvManager:
 # ============================================================================= building
 
 def run_builder(python: str, config_path: Path, work: Path, log_path: Path,
-                timeout: int, backend: str, fontc_bin: Optional[str]):
+                timeout: Optional[int], backend: str, fontc_bin: Optional[str]):
+    """`timeout=None` means the build never times out (the user can stop it via the UI)."""
     env = dict(os.environ)
     env["SOURCE_DATE_EPOCH"] = "0"
     # gftools.builder shells out to fontmake / ninja / gftools / ttfautohint BY NAME, so
@@ -823,7 +875,7 @@ class Orchestrator:
                                         self.args.mirror_missing)
             if err:
                 return self._fail(slug, err)
-            err = extract_tree(mirror, fam.commit, work, self.args.timeout)
+            err = extract_tree(mirror, fam.commit, work, EXTRACT_TIMEOUT)
             if err:
                 return self._fail(slug, err)
 
@@ -846,7 +898,7 @@ class Orchestrator:
             ok, berr, used = False, "", ""
             for i, b in enumerate(order):
                 if i > 0:
-                    err = extract_tree(mirror, fam.commit, work, self.args.timeout)
+                    err = extract_tree(mirror, fam.commit, work, EXTRACT_TIMEOUT)
                     if err:
                         berr = err
                         break
@@ -1254,13 +1306,25 @@ def cohorts_report(families: List[Family], archive: Path, jobs: int, out_path: O
 
 def setup_wizard(spec, plan_fn):
     """Interactive ncurses settings form. `spec` is a list of field dicts:
-       {key, label, type: text|path|int|float|bool|choice, value, choices?}.
-    The fields are pre-populated with the resolved defaults; the user edits them and a live
-    'Plan' preview (plan_fn(typed_values) -> [str]) updates as they go. Returns the edited
+       {key, label, type: text|path|int|stepnum|bool|choice, value, choices?, step?, min?,
+        max?, show_if?(values)->bool}.
+    Fields are pre-populated with the resolved defaults; the user edits them (editable
+    fields have a movable text cursor; `stepnum` also reacts to ←/→ with ±step; `choice`
+    cycles with ←/→/space; `bool` toggles with space; conditional fields appear/disappear via
+    `show_if`) while a live 'Plan' (plan_fn(values)->[str]) updates. Returns the edited
     {key: typed value} dict to proceed, or None to cancel. Raises if curses is unusable."""
     import curses
-    fields = [dict(f) for f in spec]
+    EDIT = ("text", "path", "int", "stepnum")
+    fields = []
+    for f in spec:
+        f = dict(f)
+        if f["type"] in EDIT:
+            f["value"] = str(f["value"])
+            f["_caret"] = len(f["value"])
+        fields.append(f)
+    by_key = {f["key"]: f for f in fields}
     buttons = ["Start", "Cancel"]
+    VALCOL = 38
 
     def typed():
         out = {}
@@ -1268,7 +1332,7 @@ def setup_wizard(spec, plan_fn):
             t, v = f["type"], f["value"]
             if t == "int":
                 out[f["key"]] = int(v) if str(v).strip().lstrip("-").isdigit() else 0
-            elif t == "float":
+            elif t == "stepnum":
                 try:
                     out[f["key"]] = float(v)
                 except (TypeError, ValueError):
@@ -1279,82 +1343,119 @@ def setup_wizard(spec, plan_fn):
                 out[f["key"]] = v
         return out
 
+    def visible(vals):
+        return [f for f in fields if "show_if" not in f or f["show_if"](vals)]
+
     def form(stdscr):
-        try:
-            curses.curs_set(0)
-        except curses.error:
-            pass
         stdscr.keypad(True)
-        n, total, sel = len(fields), len(fields) + len(buttons), 0
+        active = fields[0]["key"]
         while True:
+            vals = typed()
+            vis = visible(vals)
+            nav = [f["key"] for f in vis] + buttons
+            if active not in nav:
+                active = nav[0]
             stdscr.erase()
             h, w = stdscr.getmaxyx()
+            cursor = None
 
             def put(y, x, s, a=0):
                 if 0 <= y < h and 0 <= x < w:
                     stdscr.addnstr(y, x, str(s), max(0, w - x - 1), a)
 
             put(0, 0, " gflib-build — setup wizard", curses.A_BOLD)
-            put(1, 0, " [↑↓/Tab] move   [space] toggle/cycle choices   type to edit text   "
-                      "[Esc] cancel", curses.A_DIM)
+            put(1, 0, " [↑↓/Tab] move   [space] toggle   [←→] move cursor / step / cycle   "
+                      "type to edit   [Esc] cancel", curses.A_DIM)
             row = 3
-            for i, f in enumerate(fields):
-                active = sel == i
+            for f in vis:
+                act = active == f["key"]
                 if f["type"] == "bool":
                     val = "[x] yes" if f["value"] else "[ ] no"
+                    put(row, VALCOL, val, curses.A_REVERSE if act else 0)
                 elif f["type"] == "choice":
-                    val = f"‹ {f['value']} ›"
+                    put(row, VALCOL, f"‹ {f['value']} ›", curses.A_REVERSE if act else 0)
                 else:
-                    val = (str(f["value"]) or "") + ("_" if active else "")
-                put(row, 1, ("▸ " if active else "  ") + f["label"],
-                    curses.A_BOLD if active else 0)
-                put(row, 36, val, curses.A_REVERSE if active else 0)
+                    put(row, VALCOL, f["value"] if f["value"] else "")
+                    if act:
+                        cursor = (row, VALCOL + min(f.get("_caret", len(f["value"])), len(f["value"])))
+                put(row, 1, ("▸ " if act else "  ") + f["label"], curses.A_BOLD if act else 0)
                 row += 1
             row += 1
             put(row, 0, " Plan ".ljust(max(1, w - 1), "-"), curses.A_BOLD); row += 1
-            for line in plan_fn(typed())[:max(0, h - row - 3)]:
+            for line in plan_fn(vals)[:max(0, h - row - 3)]:
                 put(row, 2, line); row += 1
             x = 2
-            for bi, b in enumerate(buttons):
-                put(h - 2, x, f" {b} ", curses.A_REVERSE if sel == n + bi else curses.A_BOLD)
+            for b in buttons:
+                put(h - 2, x, f" {b} ", curses.A_REVERSE if active == b else curses.A_BOLD)
                 x += len(b) + 4
+            try:
+                if cursor:
+                    curses.curs_set(1)
+                    stdscr.move(min(cursor[0], h - 1), min(cursor[1], w - 1))
+                else:
+                    curses.curs_set(0)
+            except curses.error:
+                pass
             stdscr.refresh()
 
             ch = stdscr.getch()
-            if ch == 27:                                  # Esc
+            ai = nav.index(active)
+            if ch == 27:
                 return None
             elif ch == curses.KEY_UP:
-                sel = (sel - 1) % total
-            elif ch in (curses.KEY_DOWN, 9):              # Down / Tab
-                sel = (sel + 1) % total
-            elif sel >= n:                                # on a button
+                active = nav[(ai - 1) % len(nav)]
+            elif ch in (curses.KEY_DOWN, 9):
+                active = nav[(ai + 1) % len(nav)]
+            elif active in buttons:
                 if ch in (10, 13, ord(" ")):
-                    return typed() if buttons[sel - n] == "Start" else None
+                    return typed() if active == "Start" else None
             else:
-                f = fields[sel]
-                if f["type"] == "bool":
+                f = by_key[active]
+                t = f["type"]
+                if t == "bool":
                     if ch in (ord(" "), 10, 13):
                         f["value"] = not f["value"]
-                elif f["type"] == "choice":
+                elif t == "choice":
                     ci = f["choices"].index(f["value"])
                     if ch in (ord(" "), curses.KEY_RIGHT):
                         f["value"] = f["choices"][(ci + 1) % len(f["choices"])]
                     elif ch == curses.KEY_LEFT:
                         f["value"] = f["choices"][(ci - 1) % len(f["choices"])]
                     elif ch in (10, 13):
-                        sel = (sel + 1) % total
-                else:                                     # text/path/int/float
-                    if ch in (curses.KEY_BACKSPACE, 127, 8):
-                        f["value"] = str(f["value"])[:-1]
+                        active = nav[(ai + 1) % len(nav)]
+                else:                                     # editable text / int / stepnum
+                    cur = f.get("_caret", len(f["value"]))
+                    if t == "stepnum" and ch in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                        step = f.get("step", 5) * (1 if ch == curses.KEY_RIGHT else -1)
+                        try:
+                            x = float(f["value"] or 0)
+                        except ValueError:
+                            x = 0.0
+                        x = max(f.get("min", 0), min(f.get("max", 100), x + step))
+                        f["value"] = f"{x:g}"; f["_caret"] = len(f["value"])
+                    elif ch == curses.KEY_LEFT:
+                        f["_caret"] = max(0, cur - 1)
+                    elif ch == curses.KEY_RIGHT:
+                        f["_caret"] = min(len(f["value"]), cur + 1)
+                    elif ch == curses.KEY_HOME:
+                        f["_caret"] = 0
+                    elif ch == curses.KEY_END:
+                        f["_caret"] = len(f["value"])
+                    elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                        if cur > 0:
+                            f["value"] = f["value"][:cur - 1] + f["value"][cur:]; f["_caret"] = cur - 1
+                    elif ch == curses.KEY_DC:
+                        if cur < len(f["value"]):
+                            f["value"] = f["value"][:cur] + f["value"][cur + 1:]
                     elif ch in (10, 13):
-                        sel = (sel + 1) % total
+                        active = nav[(ai + 1) % len(nav)]
                     elif 32 <= ch < 127:
                         c = chr(ch)
-                        ok = (f["type"] not in ("int", "float")
-                              or (f["type"] == "int" and c.isdigit())
-                              or (f["type"] == "float" and (c.isdigit() or c == ".")))
+                        ok = (t == "text" or t == "path"
+                              or (t == "int" and c.isdigit())
+                              or (t == "stepnum" and (c.isdigit() or c == ".")))
                         if ok:
-                            f["value"] = str(f["value"]) + c
+                            f["value"] = f["value"][:cur] + c + f["value"][cur:]; f["_caret"] = cur + 1
 
     return curses.wrapper(form)
 
@@ -1410,7 +1511,8 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--base-python", default=sys.executable, help="python used to create cohort venvs")
     ap.add_argument("--base-requirements", default=None, help="pinned base toolchain requirements file")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
-    ap.add_argument("--timeout", type=int, default=1800, help="per-family build timeout (s)")
+    ap.add_argument("--timeout", type=int, default=None,
+                    help="per-build timeout in seconds (default: no timeout — stop manually via the UI)")
     ap.add_argument("--percent", type=float, default=100.0,
                     help="build only this %% of the library (evenly-spaced sample) for validation")
     ap.add_argument("--only", default="", help="comma-separated slugs (e.g. ofl/dmsans)")
@@ -1455,17 +1557,24 @@ def main():
     if sys.platform == "win32":
         sys.exit("gflib-build targets macOS/Linux (POSIX venv layout, git archive, tar).")
 
-    # ---- resolve paths (defaults derived from --data-dir) ----
+    # ---- resolve paths (defaults from --data-dir; auto-detect where possible) ----
     data_dir = Path(args.data_dir)
     gf = (Path(args.google_fonts) if args.google_fonts
           else (data_dir / "google-fonts" if args.source == "metadata" else None))
-    archive = Path(args.archive) if args.archive else (data_dir / "archive")
+    if args.archive:
+        archive = Path(args.archive)
+    else:
+        det = detect_archive(data_dir)        # auto-detect a pre-existing archive
+        archive = Path(det) if det else (data_dir / "archive")
     build_dir = Path(args.build_dir) if args.build_dir else (data_dir / "build")
+    if not args.fontc_bin:
+        args.fontc_bin = detect_fontc()       # auto-detect a fontc binary
     read_only = args.list or args.cohorts_report
     if args.populate_archive is None:
         args.populate_archive = (args.source == "metadata") and not read_only
 
     need_gf_clone = args.source == "metadata" and not (gf and (gf / "ofl").is_dir())
+    want_build_fontc = False
     steps = []
     if need_gf_clone:
         steps.append(("clone google/fonts", f"{GOOGLE_FONTS_URL} → {gf} (shallow)"))
@@ -1481,28 +1590,47 @@ def main():
             {"key": "source", "label": "worklist source", "type": "choice",
              "value": args.source, "choices": ["metadata", "archive"]},
             {"key": "google_fonts", "label": "google/fonts clone", "type": "path",
-             "value": str(gf) if gf else ""},
+             "value": str(gf) if gf else "", "show_if": lambda v: v["source"] == "metadata"},
             {"key": "archive", "label": "repo archive", "type": "path", "value": str(archive)},
             {"key": "build_dir", "label": "build output dir", "type": "path", "value": str(build_dir)},
             {"key": "backend", "label": "build backend", "type": "choice",
              "value": args.backend, "choices": ["auto", "fontc", "fontmake"]},
-            {"key": "fontc_bin", "label": "fontc binary (for fontc)", "type": "path",
-             "value": args.fontc_bin or ""},
+            {"key": "fontc_bin", "label": "fontc binary (auto-detected)", "type": "path",
+             "value": args.fontc_bin or "", "show_if": lambda v: v["backend"] != "fontmake"},
+            {"key": "build_fontc", "label": "build fontc from source (if none)", "type": "bool",
+             "value": False,
+             "show_if": lambda v: v["backend"] != "fontmake" and not v["fontc_bin"]},
             {"key": "jobs", "label": "parallel jobs", "type": "int", "value": str(args.jobs)},
-            {"key": "percent", "label": "percent of library", "type": "float", "value": f"{args.percent:g}"},
-            {"key": "timeout", "label": "per-build timeout (s)", "type": "int", "value": str(args.timeout)},
+            {"key": "percent", "label": "percent of library (←/→ ±5)", "type": "stepnum",
+             "value": f"{args.percent:g}", "step": 5, "min": 1, "max": 100},
+            {"key": "use_timeout", "label": "use per-build timeout", "type": "bool",
+             "value": args.timeout is not None},
+            {"key": "timeout_seconds", "label": "  timeout seconds", "type": "int",
+             "value": str(args.timeout if args.timeout is not None else 1800),
+             "show_if": lambda v: v["use_timeout"]},
             {"key": "populate_archive", "label": "populate archive (mirror missing)", "type": "bool",
              "value": bool(args.populate_archive)},
             {"key": "manage_venvs", "label": "cohort venvs (--manage-venvs)", "type": "bool",
              "value": bool(args.manage_venvs)},
             {"key": "compare", "label": "compare to shipped (metadata only)", "type": "bool",
-             "value": bool(args.compare)},
+             "value": bool(args.compare), "show_if": lambda v: v["source"] == "metadata"},
         ]
 
         def plan_fn(v):
-            g = Path(v["google_fonts"]) if v["google_fonts"] else None
-            return _plan_lines(g, Path(v["archive"]), v["source"], v["populate_archive"],
-                               v["percent"], v["backend"], v["jobs"], v["manage_venvs"], v["compare"])
+            g = Path(v["google_fonts"]) if v.get("google_fonts") else None
+            lines = _plan_lines(g, Path(v["archive"]), v["source"], v["populate_archive"],
+                                v["percent"], v["backend"], v["jobs"], v["manage_venvs"],
+                                v.get("compare", False))
+            if v["backend"] != "fontmake":
+                if v.get("fontc_bin"):
+                    lines.append(f"fontc        : {v['fontc_bin']}")
+                elif v.get("build_fontc"):
+                    lines.append("fontc        : BUILD from source (cargo build --release)")
+                else:
+                    lines.append("fontc        : none — 'auto' falls back to fontmake")
+            lines.append("timeout      : " + (f"{v['timeout_seconds']}s"
+                                              if v.get("use_timeout") else "none (stop manually)"))
+            return lines
         try:
             edited = setup_wizard(spec, plan_fn)
         except Exception:                               # curses unusable → plain confirm
@@ -1511,18 +1639,27 @@ def main():
             sys.exit("aborted.")
         if edited:                                      # apply the user's edits
             args.source = edited["source"]
-            gf = Path(edited["google_fonts"]) if edited["google_fonts"] else None
+            gf = Path(edited["google_fonts"]) if edited.get("google_fonts") else None
             archive = Path(edited["archive"])
             build_dir = Path(edited["build_dir"])
             args.backend = edited["backend"]
-            args.fontc_bin = edited["fontc_bin"] or None
+            args.fontc_bin = edited.get("fontc_bin") or None
+            want_build_fontc = bool(edited.get("build_fontc")) and args.backend != "fontmake"
             args.jobs = max(1, edited["jobs"])
             args.percent = edited["percent"]
-            args.timeout = max(1, edited["timeout"])
+            args.timeout = int(edited["timeout_seconds"]) if edited.get("use_timeout") else None
             args.populate_archive = edited["populate_archive"]
             args.manage_venvs = edited["manage_venvs"]
-            args.compare = edited["compare"]
+            args.compare = edited.get("compare", False) and args.source == "metadata"
             need_gf_clone = args.source == "metadata" and not (gf and (gf / "ofl").is_dir())
+
+    # ---- build fontc from source if requested (before validation/discovery) ----
+    if want_build_fontc and not args.fontc_bin:
+        try:
+            args.fontc_bin = build_fontc_from_source(
+                data_dir / "fontc", on_progress=lambda m: print(f"  {m}", file=sys.stderr))
+        except RuntimeError as e:
+            sys.exit(str(e))
 
     # ---- finalize + validate (after any wizard edits) ----
     args.google_fonts = str(gf) if gf else None
