@@ -9,3 +9,15 @@ pip-cache/
 state.json
 *.log
 *.tmp
+
+# tool data dir (auto-clones, archive, build outputs) + runtime files — never committed
+gflib-data/
+build/
+status.json
+status.json.tmp
+timings.json
+cohorts.json
+events.jsonl
+daemon.pid
+daemon.log
+gflib-build.config

@@ -1959,24 +1959,26 @@ def main():
             args.compare = edited.get("compare", False) and args.source == "metadata"
             need_gf_clone = args.source == "metadata" and not (gf and (gf / "ofl").is_dir())
 
-    # ---- build fontc from source if requested (before validation/discovery) ----
-    if want_build_fontc and not args.fontc_bin:
-        try:
-            args.fontc_bin = build_fontc_from_source(
-                data_dir / "fontc", on_progress=lambda m: print(f"  {m}", file=sys.stderr))
-        except RuntimeError as e:
-            sys.exit(str(e))
+    # ---- auto-default base requirements to the bundled file (so cohort venvs just work) ----
+    if args.manage_venvs and not args.base_requirements:
+        bundled = Path(__file__).resolve().parent / "requirements-build.txt"
+        if bundled.is_file():
+            args.base_requirements = str(bundled)
 
-    # ---- finalize + validate (after any wizard edits) ----
+    # ---- finalize + validate FIRST — before any expensive clone/build (fail fast) ----
     args.google_fonts = str(gf) if gf else None
     args.archive = str(archive)
     args.build_dir = str(build_dir)
     if not (0 < args.percent <= 100):
         sys.exit("percent must be in (0, 100]")
-    if args.backend == "fontc" and not args.fontc_bin:
-        sys.exit("backend 'fontc' requires a fontc binary path")
+    if args.backend == "fontc" and not args.fontc_bin and not want_build_fontc:
+        sys.exit("backend 'fontc' needs a fontc binary — set a path or enable 'build fontc "
+                 "from source' (or use --backend auto, which falls back to fontmake)")
     if args.manage_venvs and not args.base_requirements:
-        sys.exit("cohort venvs require --base-requirements (the pinned base toolchain)")
+        sys.exit("cohort venvs need a base requirements file and no bundled requirements-build.txt "
+                 "was found next to the script; pass --base-requirements or use --no-manage-venvs")
+    if want_build_fontc and not args.fontc_bin and detect_cargo() is None:
+        sys.exit("'build fontc from source' needs cargo (Rust). " + RUST_INSTALL_HINT)
     if args.compare and args.source != "metadata":
         sys.exit("--compare requires --source metadata (it diffs against the shipped binaries)")
     if args.compare and gf is None:
@@ -1993,10 +1995,17 @@ def main():
     for sub in ("work", "out", "logs"):
         (build_dir / sub).mkdir(exist_ok=True)
 
+    # ---- now the expensive bootstrap, only after all validations have passed ----
     if need_gf_clone:
         try:
             ensure_google_fonts(gf, on_progress=lambda m: print(f"  {m}", file=sys.stderr))
         except (RuntimeError, ValueError) as e:
+            sys.exit(str(e))
+    if want_build_fontc and not args.fontc_bin:
+        try:
+            args.fontc_bin = build_fontc_from_source(
+                data_dir / "fontc", on_progress=lambda m: print(f"  {m}", file=sys.stderr))
+        except RuntimeError as e:
             sys.exit(str(e))
     if args.source == "metadata" and not (gf / "ofl").is_dir():
         sys.exit(f"google/fonts {gf} is not a clone (no ofl/)")
