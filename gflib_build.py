@@ -258,6 +258,38 @@ def is_transient_clone_error(err: str) -> bool:
     return any(s in low for s in TRANSIENT_CLONE_ERRORS)
 
 
+def categorize_failure(error: str):
+    """Map a family's failure message to a short CAUSE + an actionable HINT, for the UI summary
+    (so the user sees *why* the majority failed and *what to do*, not just a wall of red lines)."""
+    e = error or ""
+    low = e.lower()
+    if ("no module named 'gftools'" in low or "no module named gftools" in low
+            or "could not launch builder" in low or "module specification" in low):
+        return ("broken dependency venv", "the cohort venv is missing its packages — it is rebuilt "
+                "automatically on the next run")
+    if "pip install" in low or low.startswith("venv:"):
+        return ("dependency install failed", "pip couldn't satisfy the cohort requirements; stale "
+                "pins are auto-relaxed — see the cohort's .install.log")
+    if is_transient_clone_error(e):
+        return ("transient fetch error", "a network hiccup while cloning — retried automatically; "
+                "re-run to try the rest")
+    if "mirror absent" in low:
+        return ("repo not mirrored", "turn on 'populate archive' (or --mirror-missing) so the "
+                "upstream repo is cloned into the archive")
+    if "not in mirror" in low:
+        return ("stale archive mirror", "the recorded commit isn't in the local mirror — run "
+                "git remote update on that repo in the archive")
+    if "mirror clone failed" in low or "repository not found" in low:
+        return ("repo unreachable", "the upstream repo may be private, renamed, or removed")
+    if "harness error" in low:
+        return ("internal/transient I/O", "a transient filesystem error — usually clears on re-run")
+    if "timed out" in low or "timeout" in low:
+        return ("build timed out", "raise or disable the per-build timeout")
+    if "builder" in low or "fontmake" in low or "fontc" in low or "gftools" in low:
+        return ("build error", "the source or build tooling failed — open the family log")
+    return ("other", "open the family log for details")
+
+
 def _clone_mirror_once(url: str, dest: str, timeout: int,
                        stop: "Optional[threading.Event]" = None):
     proc = subprocess.Popen(["git", "clone", "--mirror", "--quiet", url, dest],
@@ -1190,6 +1222,17 @@ class Orchestrator:
             return (1000 if fam.is_variable else 0) + len(fam.shipped_fonts)
         todo.sort(key=weight, reverse=True)
 
+        # Reconcile stale in-flight results from a PRIOR run that aren't in this run's worklist
+        # (e.g. families queued at a higher --percent, now outside the sample, or an interrupted
+        # build). Left as "queued"/"building" they'd show as perpetually pending though nothing
+        # will ever process them. Mark them skipped so the counts match the actual worklist; they
+        # re-enter naturally if the selection later includes them (skipped != built/failed).
+        todo_set = set(todo)
+        with self.lock:
+            for slug, r in self.results.items():
+                if slug not in todo_set and r.status in ("queued", "building"):
+                    r.status, r.note = "skipped", "not selected this run"
+
         for slug in todo:
             with self.lock:    # _enqueue now runs in the driver thread, racing the status writer
                 self.results[slug] = Result(slug=slug, status="queued")
@@ -1245,9 +1288,13 @@ class Orchestrator:
             backends = {"fontc": 0, "fontmake": 0}
             migration = {"fontc": 0, "fontmake_fallback": 0, "fontmake_only": 0,
                          "both_identical": 0, "both_differ": 0}
+            fail_cat = {}                            # cause -> [count, hint] for the failure summary
             building = []
             for r in rs:
                 counts[r.status] = counts.get(r.status, 0) + 1
+                if r.status == "failed":
+                    cat, hint = categorize_failure(r.error)
+                    slot = fail_cat.setdefault(cat, [0, hint]); slot[0] += 1
                 if r.status == "built" and r.backend:
                     backends[r.backend] = backends.get(r.backend, 0) + 1
                     if r.backend == "fontc":
@@ -1265,6 +1312,9 @@ class Orchestrator:
                     building.append({"slug": r.slug, "worker": r.worker, "dur": r.dur(),
                                      "backend": r.backend, "note": r.note})
             building.sort(key=lambda b: -b["dur"])
+            fail_categories = sorted(
+                [{"cat": k, "count": v[0], "hint": v[1]} for k, v in fail_cat.items()],
+                key=lambda c: -c["count"])
             fails = [{"slug": s, "error": self.results[s].error, "log": self.results[s].log}
                      for s in self.failures[-50:] if s in self.results][::-1]
             built = sorted(([{"slug": r.slug, "backend": r.backend, "bytes": r.out_bytes,
@@ -1306,6 +1356,7 @@ class Orchestrator:
             "jobs": self.args.jobs, "paused": self.paused.is_set(),
             "total": len(rs), "counts": counts, "backends": backends,
             "building": building, "failures_recent": fails, "built_recent": built,
+            "fail_categories": fail_categories,
             "cohorts_ready": self.venvs.ready_count() if self.venvs else 0,
             "phase": phase, "phase_total": ptot, "phase_done": pdone,
             "phase_label": plabel, "phase_error": perr,
@@ -2155,6 +2206,8 @@ class CursesFrontend(Frontend):
             return [f"cohort {item['key']}: {item['count']} families"
                     + (f" — needs {reqs[0]}" if reqs else " (base — no extra requirements)"),
                     "  " + (", ".join(fams) if fams else "(none assigned yet)")]
+        if kind == "failcat":                             # a failure-cause bucket {cat,count,hint}
+            return [f"{item['count']} families failed: {item['cat']}", "  → " + item.get("hint", "")]
         if kind == "stats":                               # an op: (op, {total,count,mean,max})
             op, st = item
             return [f"{op}: total {st['total']}s · n {st['count']} · mean {st['mean']}s · max {st['max']}s"]
@@ -2188,6 +2241,10 @@ class CursesFrontend(Frontend):
                 out.append(f"progress: {item['done']}/{item['total']}")
             if item.get("detail"):
                 out += ["", "detail:", "  " + str(item["detail"])]
+        elif view == "failcat":                      # {cat, count, hint}
+            out += [f"Failure cause: {item.get('cat', '')}",
+                    f"families affected: {item.get('count', 0)}", "",
+                    "what to do:", "  " + item.get("hint", "")]
         elif view == "cohorts":                      # {key, count, requirements, families}
             fams = item.get("families", [])
             out += [f"Cohort: {item.get('key', '')}", f"families: {item.get('count', 0)}", "",
@@ -2359,8 +2416,15 @@ class CursesFrontend(Frontend):
                          human(b.get("bytes", 0)), b.get("compare", "")),
                          lambda b: GREEN, "built")]
             if v == "failures":
-                return [("Failures — newest first", snap.get("failures_recent", []),
-                         lambda f: f"{f['slug']:<34} {f['error']}", lambda f: RED, "failures")]
+                secs = []
+                cats = snap.get("fail_categories", [])
+                if cats:
+                    secs.append(("Failures by cause", cats,
+                                 lambda c: f"{c['count']:>4}  {c['cat']:<24} {c['hint']}",
+                                 lambda c: YEL, "failcat"))
+                secs.append(("Failures — newest first", snap.get("failures_recent", []),
+                             lambda f: f"{f['slug']:<34} {f['error']}", lambda f: RED, "failures"))
+                return secs
             if v == "stats":
                 phases = sorted(snap.get("phase_durations", {}).items(), key=lambda kv: -kv[1])
                 ops = sorted(snap.get("op_stats", {}).items(), key=lambda kv: -kv[1]["total"])
@@ -2580,6 +2644,33 @@ class CursesFrontend(Frontend):
                         r += 1; slack -= 1
 
             row = 6
+            # ---- completion / stopped banner: when the build has finished or the daemon is gone,
+            # say so prominently (with the outcome + the top failure cause + what to do next) so the
+            # dashboard never just looks frozen mid-flight. ----
+            done_state = bool(snap.get("done")) or ph == "done"
+            stopped = mon and not snap.get("daemon_alive", True)
+            if (done_state or stopped) and detail is None and not pre_build and body_bottom - row >= 5:
+                cc = snap["counts"]
+                if done_state:
+                    head = (f" ✓ BUILD COMPLETE — {cc['built']} built · {cc['failed']} failed · "
+                            f"{cc.get('skipped', 0)} skipped  (of {snap['total']} selected)")
+                    battr = GREEN | curses.A_BOLD | curses.A_REVERSE
+                else:
+                    head = (f" ⚠ BUILD STOPPED — daemon not running · {cc['built']} built · "
+                            f"{cc['failed']} failed · {cc['queued']} still queued")
+                    battr = YEL | curses.A_BOLD | curses.A_REVERSE
+                put(row, 0, head.ljust(w - 1), battr); row += 1
+                cats = snap.get("fail_categories", [])
+                if cats and row < body_bottom:
+                    t = cats[0]
+                    put(row, 0, f"   top failure: {t['cat']} ({t['count']}) — {t['hint']}", YEL)
+                    row += 1
+                if row < body_bottom:
+                    nxt = "   next: press [C] to reconfigure · re-run to continue"
+                    if cc.get("skipped"):
+                        nxt += " · raise % in config to include skipped"
+                    put(row, 0, nxt, curses.A_DIM); row += 1
+                row += 1                              # blank separator below the banner
             if detail is not None:                   # ---- detail overlay for the selected item ----
                 put(5, 0, " Details — [Esc/←/↵] back   [↑↓] scroll ".ljust(w - 1, "-"), curses.A_BOLD)
                 lines = detail                        # captured once when opened (no per-frame I/O)
@@ -2940,7 +3031,7 @@ class MonitorState:
     _EMPTY = {"phase": "(waiting for build…)",
               "counts": {"built": 0, "failed": 0, "building": 0, "queued": 0, "skipped": 0},
               "backends": {"fontc": 0, "fontmake": 0}, "building": [], "failures_recent": [],
-              "built_recent": [],
+              "built_recent": [], "fail_categories": [],
               "cohorts": [], "total": 0, "elapsed": 0, "disk_used_delta": 0, "disk_build_total": 0,
               "disk_free": 0,
               "jobs": 0, "paused": False, "phase_total": 0, "phase_done": 0, "phase_label": "",
