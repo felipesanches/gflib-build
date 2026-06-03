@@ -1743,6 +1743,12 @@ class Orchestrator:
                 if new_jobs != self.args.jobs:
                     changed.append(f"jobs={new_jobs}")
                 self.args.jobs = new_jobs
+        retry = settings.get("retry")                 # [R] on the dashboard: re-attempt these now
+        if isinstance(retry, list) and retry:
+            n = self._requeue(retry)
+            if n:
+                self._ensure_workers(self.args.jobs)  # wake the pool if it had drained
+                changed.append(f"retry {n} now ({', '.join(retry[:3])}{'…' if len(retry) > 3 else ''})")
         if changed:
             with self.lock:
                 self.control_log.append(f"[{hms(self.snapshot_elapsed())}] " + ", ".join(changed))
@@ -1765,6 +1771,20 @@ class Orchestrator:
                 t = threading.Thread(target=self.worker, args=(self._wid_counter,), daemon=True)
                 self.workers.append(t)
                 t.start()                             # worker's first action is q.get (no lock)
+
+    def _requeue(self, slugs) -> int:
+        """Re-attempt specific families RIGHT NOW (the dashboard's [R] on a live build): reset each
+        to a fresh 'queued' Result and push it on the work queue. Only families this run knows how
+        to build (in self.families) can be requeued. Queuing makes all_done() False, so the build
+        loop keeps going; the caller ensures workers are running to pick them up."""
+        n = 0
+        with self.lock:
+            for slug in slugs:
+                if slug in self.families:
+                    self.results[slug] = Result(slug=slug, status="queued")
+                    self.q.put(slug)
+                    n += 1
+        return n
 
     def _extend_worklist(self, new_pct: float) -> int:
         """Enqueue families newly included by a higher percent (or all of --only). Queuing makes
@@ -2525,6 +2545,7 @@ class CursesFrontend(Frontend):
         section_idx = 0                              # focused section in a multi-section tab
         cfg_fields = None                            # the editable Configuration fields
         cfg_active = 0                               # selected field, or the action button
+        flash, flash_frames = "", 0                  # transient acknowledgement (e.g. [R] retry)
         while True:
             if self.orch.stop.is_set() and not mon and not setup:
                 break
@@ -2594,6 +2615,17 @@ class CursesFrontend(Frontend):
                     (self.orch.paused.clear if self.orch.paused.is_set() else self.orch.paused.set)()
                 elif ch in (ord("c"), ord("C")) and not setup:
                     return "reconfigure"
+                elif ch in (ord("r"), ord("R")) and secs:   # [R] retry the selected family now
+                    si = min(section_idx, len(secs) - 1)
+                    items = secs[si][1]
+                    it = items[min(sel, len(items) - 1)] if items else None
+                    slug = it.get("slug") if isinstance(it, dict) else None
+                    if slug:
+                        if snap.get("daemon_alive", True) and not snap.get("done"):
+                            write_control(self.orch.build_dir, {"retry": [slug]})   # live re-enqueue
+                            flash, flash_frames = f"⟳ retrying {slug} …", 16
+                        else:                            # finished build → targeted rebuild (re-exec)
+                            return ("retry", slug)
                 elif ch == curses.KEY_RIGHT and len(secs) > 1:   # → next section (Ctrl+Tab is
                     section_idx = (section_idx + 1) % len(secs); sel = 0   # eaten by most terminals)
                 elif ch == curses.KEY_LEFT and len(secs) > 1:    # ← previous section
@@ -2846,10 +2878,15 @@ class CursesFrontend(Frontend):
                         if setup else
                         " [↑↓]field  [←→]edit  [space]toggle  [↵]apply  [C]restart for paths  [Tab]tabs")
             else:
-                foot = " [Tab]tabs  [←→]section  [↑↓]item  [↵]details  [C]onfig  [q]uit"
+                foot = " [Tab]tabs  [←→]section  [↑↓]item  [↵]details  [R]etry  [C]onfig  [q]uit"
             if mon and not snap.get("daemon_alive", True):
-                foot = " [q]uit   ⚠ daemon not running (build finished or stopped)"
-            put(h - 1, 0, foot, curses.A_DIM)
+                foot = " [q]uit   ⚠ daemon stopped — [R] on a family does a targeted rebuild · [C]onfig"
+            foot_attr = curses.A_DIM
+            if flash_frames > 0:                      # transient [R] acknowledgement
+                foot = " " + flash + "   — watch it appear in 'Now building'"
+                foot_attr = CYAN | curses.A_BOLD
+                flash_frames -= 1
+            put(h - 1, 0, foot, foot_attr)
             try:                                      # show the text caret on an active field
                 if cfg_cursor:
                     curses.curs_set(1)
@@ -2883,10 +2920,41 @@ def pick_frontend(name: str) -> str:
 
 def run_monitor(build_dir: Path, ui: str):
     """Attach a read-only live monitor to a (possibly detached) build at build_dir.
-    Returns "reconfigure" if the user pressed C to go back to the setup wizard."""
+    Returns "reconfigure" if the user pressed C to go back to the setup wizard. ("retry", slug)
+    from [R] on a FINISHED build re-execs a one-family targeted rebuild (never returns)."""
     fe = FRONTENDS[ui if ui in FRONTENDS else "plain"](MonitorState(build_dir))
     fe.monitor = True
-    return fe.run()
+    r = fe.run()
+    if isinstance(r, tuple) and len(r) == 2 and r[0] == "retry":
+        reexec_retry(r[1])                            # no live daemon → targeted rebuild; never returns
+    return r
+
+
+def _retry_argv(argv: list, slug: str) -> list:
+    """Build the re-exec argv for a one-family targeted rebuild: keep the existing flags but drop
+    any prior --only / one-shot flags and append `--only <slug> --rebuild --yes`. Pure (testable)."""
+    drop = {"--attach", "--wizard", "-y", "--yes", "--rebuild", "--retry-failed", "--reset", "--stop"}
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False; continue
+        if a == "--only":
+            skip = True; continue                     # drop a prior "--only <value>"
+        if a.startswith("--only="):
+            continue
+        if a in drop:
+            continue
+        out.append(a)
+    return out + ["--only", slug, "--rebuild", "--yes"]
+
+
+def reexec_retry(slug: str):
+    """Re-exec a one-family targeted rebuild (the dashboard's [R] with no live daemon). Mirrors
+    reexec_wizard; reuses the documented `--only <slug> --rebuild` path."""
+    argv = [sys.executable] + _retry_argv(sys.argv, slug)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, argv)
 
 
 def reexec_wizard():
