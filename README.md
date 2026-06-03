@@ -244,6 +244,14 @@ intent so nothing is lost as the tool evolves.
     launched; the progress bar is **colour-coded by outcome** (built/failed/skipped); tables use
     distinct, subtle per-column colours; transient (network/IO) failures **auto-retry in-build**;
     and each failure-cause bucket names *which* families it affected.
+58. **Output collection in any `outputDir`.** Built fonts are found by a recursive, freshly-built-only
+    scan of the work tree (not a fixed shallow list), so a build that writes to a custom `outputDir`
+    (e.g. `fonts/<Family>/variable/`) is no longer a false `produced no expected font files`; a real
+    name mismatch is reported as `output name mismatch` instead.
+59. **Re-trigger a set / priority queue.** `--only` takes a comma list **or `@file`** (one slug per
+    line) and restricts the whole run to those families — they become the entire queue (highest
+    priority). `--retry-category "output name mismatch"` re-attempts only failures of that cause
+    (like `--retry-failed`, but targeted — e.g. after fixing `collect_outputs`).
 
 ---
 

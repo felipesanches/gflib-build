@@ -1387,6 +1387,8 @@ class Orchestrator:
     # ---- scheduling
     def _enqueue(self):
         only = set(self.args.only.split(",")) if self.args.only else None
+        retry_cats = {c.strip() for c in getattr(self.args, "retry_category", "").split(",")
+                      if c.strip()}                  # extra causes to re-attempt (e.g. after a fix)
         todo, retries = [], 0
         for slug, fam in self.families.items():
             if only and slug not in only:
@@ -1398,10 +1400,12 @@ class Orchestrator:
                 if prev.status == "failed":
                     # Self-heal: re-attempt a failure whose cause a fresh try can clear (rebuilt
                     # venv, retried clone, …). Keep genuine build errors / unreachable repos unless
-                    # the user forces it with retry_failed. This is what makes the failure hints
-                    # honest — the family is actually retried, not silently skipped.
+                    # the user forces it with retry_failed, or names the cause via --retry-category
+                    # (e.g. re-trigger 'output name mismatch' after fixing collect_outputs). This is
+                    # what makes the failure hints honest — the family is actually retried.
                     cat, _ = categorize_failure(prev.error or "")
-                    if not (self.args.retry_failed or cat in AUTO_RETRY_CATEGORIES):
+                    if not (self.args.retry_failed or cat in AUTO_RETRY_CATEGORIES
+                            or cat in retry_cats):
                         continue
                     retries += 1
             todo.append(slug)
@@ -3611,7 +3615,12 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="per-build timeout in seconds (default: no timeout — stop manually via the UI)")
     ap.add_argument("--percent", type=float, default=100.0,
                     help="build only this %% of the library (evenly-spaced sample) for validation")
-    ap.add_argument("--only", default="", help="comma-separated slugs (e.g. ofl/dmsans)")
+    ap.add_argument("--only", default="",
+                    help="comma-separated slugs (e.g. ofl/dmsans), or @file with one slug per line; "
+                         "restricts the WHOLE run to those families (they become the entire queue)")
+    ap.add_argument("--retry-category", default="",
+                    help="comma-separated failure categories (e.g. 'output name mismatch') to "
+                         "re-attempt — like --retry-failed but only for those causes")
     ap.add_argument("--compare", dest="compare", action="store_true",
                     help="sha256-compare built fonts to shipped")
     ap.add_argument("--no-compare", dest="compare", action="store_false",
@@ -3778,6 +3787,15 @@ def main():
         br = Path(__file__).resolve().parent / "build_rules.json"
         if br.is_file():
             args.build_rules = str(br)
+
+    # ---- expand `--only @file` to a comma list (one slug per line; '#' comments allowed) ----
+    if args.only and args.only.startswith("@"):
+        try:
+            lines = Path(args.only[1:]).read_text().splitlines()
+            args.only = ",".join(l.strip() for l in lines
+                                 if l.strip() and not l.strip().startswith("#"))
+        except OSError as e:
+            sys.exit(f"--only {args.only}: cannot read file ({e})")
 
     # ---- finalize + validate FIRST — before any expensive clone/build (fail fast) ----
     gf = gf.resolve() if gf else None         # re-resolve (the wizard may have set relatives)
