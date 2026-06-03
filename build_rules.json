@@ -36,6 +36,25 @@
       "pre_build": [
         "python3 scripts/makeplay.py sources/Cairo.glyphs sources/CairoPlay.glyphs"
       ]
+    },
+    "ofl/lilex": {
+      "note": "mishamyrt/Lilex: the Makefile 'generate' target injects OpenType features/classes from sources/opentype_features/ into the .glyphs sources; the plain 'build' target skips it, so gftools-builder must run it first.",
+      "pre_build": [
+        "python3 scripts/generate.py --config sources/lilexgen_config.yaml generate"
+      ]
+    },
+    "ofl/lxgwwenkaimonotc": {
+      "note": "aaronbell/LxgwWenkaiTC (CJK): Makefile 'build: extract merge export' — extract.py decompresses the .ufoz archives and merge.py generates the UFO+designspace under sources/build/ that sources/project.yaml references. Heavy build.",
+      "pre_build": [
+        "python3 sources/scripts/extract.py",
+        "python3 sources/scripts/merge.py"
+      ]
+    },
+    "ofl/moiraione": {
+      "note": "JAMO-TYPEFACE/Moirai: Sources/config.yaml references 'Moirai.glyphs' but the committed file is 'Sources/moirai.glyphs' (lowercase) — works on case-insensitive macOS, fails on Linux. Stage the correctly-cased name.",
+      "pre_build": [
+        "cp Sources/moirai.glyphs Sources/Moirai.glyphs"
+      ]
     }
   }
 }
