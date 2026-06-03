@@ -1171,6 +1171,7 @@ class Orchestrator:
                                        # is cumulative across reopen/resume, not reset to 0)
         self.disk_baseline = self._disk_used()
         self._build_total = 0                        # build-dir total bytes; refreshed off-thread
+        self._cached_cohort_venvs: set = set()       # cohort keys with a venv on disk (off-thread)
         self._enqueued = 0                            # families queued this run; how many are retries
         self._enqueued_retries = 0
         self._linger = False                          # detached daemon: stay alive after completion
@@ -1323,16 +1324,30 @@ class Orchestrator:
             self._rebuild_cohorts()
 
     def _load_failure_history(self):
-        """Load the tail of the persistent failure log into memory for the UI (the file itself is
-        append-only and kept forever)."""
+        """Load the TAIL of the persistent failure log into memory for the UI. Reads only the last
+        few MB (never the whole file — it could be huge after many sessions), and compacts the file
+        to the in-memory tail when it grows large so it stays bounded on disk."""
         try:
-            if self._fail_hist_path.is_file():
-                lines = self._fail_hist_path.read_text(errors="replace").splitlines()[-MAX_FAILURE_HISTORY:]
-                for ln in lines:
-                    try:
-                        self.failure_history.append(json.loads(ln))
-                    except Exception:
-                        pass
+            if not self._fail_hist_path.is_file():
+                return
+            size = self._fail_hist_path.stat().st_size
+            with open(self._fail_hist_path, "rb") as f:
+                if size > (4 << 20):                  # only the last ~4 MB; skip the partial first line
+                    f.seek(-(4 << 20), os.SEEK_END)
+                    f.readline()
+                data = f.read().decode("utf-8", "replace")
+            for ln in data.splitlines()[-MAX_FAILURE_HISTORY:]:
+                try:
+                    self.failure_history.append(json.loads(ln))
+                except Exception:
+                    pass                              # skip a corrupt/partial line, keep the rest
+            if size > (8 << 20):                       # bound disk growth: rewrite to the loaded tail
+                try:
+                    tmp = self._fail_hist_path.with_suffix(".jsonl.tmp")
+                    tmp.write_text("".join(json.dumps(e) + "\n" for e in self.failure_history))
+                    tmp.replace(self._fail_hist_path)
+                except OSError:
+                    pass
         except OSError:
             pass
 
@@ -1539,11 +1554,19 @@ class Orchestrator:
 
     def _size_writer(self):
         """Refresh self._build_total off the UI thread, so snapshot() (called every ~0.25 s on the
-        curses render thread and every ~1 s on the status writer) only ever reads a plain int."""
+        curses render thread and every ~1 s on the status writer) only ever reads a plain int.
+        Also refresh which cohort venvs are cached on disk (a set), so snapshot() never does
+        per-cohort filesystem I/O on the hot render path."""
         while not self.stop.is_set():
             try:
                 self._build_total = self._measure_build_dir()
             except Exception:
+                pass
+            try:
+                vroot = self.build_dir / "venvs"
+                self._cached_cohort_venvs = {d.name for d in vroot.iterdir()
+                                             if (d / ".gflib-installed").is_file()} if vroot.is_dir() else set()
+            except OSError:
                 pass
             self.stop.wait(10)                        # interruptible ~10 s pacing
 
@@ -1627,6 +1650,11 @@ class Orchestrator:
                 "manage_venvs": bool(self.args.manage_venvs), "compare": bool(self.args.compare),
                 "retry_failed": bool(self.args.retry_failed), "only": self.args.only,
             }
+            fail_hist = self.failure_history[-400:][::-1]      # read UNDER the lock (workers append)
+            cached_set = set(self._cached_cohort_venvs)        # off-thread set: no per-render fs I/O
+            cohorts_out = [{"key": k, "count": v["count"], "requirements": v["requirements"],
+                            "families": v.get("families", []), "cached": k in cached_set}
+                           for k, v in cohorts]
         return {
             "elapsed": self._resumed_elapsed + (time.time() - self.start_time),
             "disk_used_delta": disk_delta, "disk_free": disk_free,
@@ -1638,12 +1666,8 @@ class Orchestrator:
             "cohorts_ready": self.venvs.ready_count() if self.venvs else 0,
             "phase": phase, "phase_total": ptot, "phase_done": pdone,
             "phase_label": plabel, "phase_error": perr,
-            "cohorts": [{"key": k, "count": v["count"], "requirements": v["requirements"],
-                         "families": v.get("families", []),
-                         # the venv on disk = the cache; show whether it's ready to reuse
-                         "cached": (self.build_dir / "venvs" / k / ".gflib-installed").is_file()}
-                        for k, v in cohorts],
-            "failure_history": self.failure_history[-400:][::-1],   # persistent; newest first
+            "cohorts": cohorts_out,                  # built under the lock; 'cached' from the off-thread set
+            "failure_history": fail_hist,            # persistent; newest first (read under the lock)
             "op_stats": op_stats, "phase_durations": phase_dur, "migration": migration,
             "tasks": tasks, "archive_recent": archive_recent, "config": config,
             "control_log": control_log,
@@ -2195,6 +2219,8 @@ class Orchestrator:
                     self.families = {f.slug: f for f in fams}
                     self.total_with_source = total
                     self.skipped_no_config = skipped
+                    if self._cohort_members:         # cohorts restored from state.json were built
+                        self._rebuild_cohorts()      # with slugs — now resolve real family names
                 self._enqueue()
                 self._task_done(
                     "discover",

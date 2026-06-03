@@ -57,6 +57,7 @@ print("session 2: failure history + cohort map both restored from disk")
 
 # the snapshot marks the cohort as cached (its venv is on disk) and exposes the persistent history
 o2.families = o1.families
+o2._cached_cohort_venvs = {"c-abc"}   # simulate the off-thread venv scan
 with o2.lock:
     o2._rebuild_cohorts()
 snap = o2.snapshot()
