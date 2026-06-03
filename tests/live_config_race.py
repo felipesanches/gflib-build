@@ -35,6 +35,8 @@ args = types.SimpleNamespace(
     base_requirements=None, build_python="python3", timeout=None, rebuild=False,
     retry_failed=False, compare=False, keep_work=False, keep_fonts=True, mirror_missing=False,
     _want_build_fontc=False, _data_dir="/tmp/_live_race")
+import shutil
+shutil.rmtree("/tmp/_live_race", ignore_errors=True)   # hermetic: never reuse a prior run's state
 os.makedirs(args.build_dir, exist_ok=True)
 
 orch = g.Orchestrator(args)

@@ -178,6 +178,13 @@ intent so nothing is lost as the tool evolves.
 39. **Section navigation** — multi-section tabs (overview, stats) are navigable section by
     section: ←/→ focus a section (the ▼-marked one), ↑/↓ navigate its items, ↵ acts on the
     selected item. (Ctrl+Tab is intercepted by most terminals, so ←/→ is the binding.)
+40. **Always-visible status panel.** A panel just above the footer instantly shows the most
+    useful info about whatever item is focused, anywhere in the program — a single line in most
+    cases (status-bar style), growing to a few lines when there's more worth showing. The
+    motivating case: a red `✗` entry in *Overview → Archive — mirrored* now explains *why* that
+    repo could not be mirrored into the archive.
+41. **Header shows total build-system disk usage**, not a per-session delta. The old
+    `disk +0B`-on-reopen was useless; the header now reports the whole build dir's on-disk size.
 
 ---
 
@@ -339,18 +346,21 @@ banner + progress bar and is **navigable** — four views switchable with the **
 
 ```
  Google Fonts library build                                   elapsed 01:23:45
- disk +12.3GiB  free 290.0GiB  jobs 8  cohorts 28  fontc 980/fontmake 240
+ build dir 142.8GiB  free 290.0GiB  jobs 8  cohorts 28  fontc 980/fontmake 240
  Phase: building   built 412/1503  failed 7  building 8  queued 1076
  [######################------------------------------------]  31%
   config  overview  cohorts  built  failures  stats        [Tab]/[⇧Tab] switch tabs
  ▼ Pipeline (6) -------------------------------------------------------------
   🔄 build fonts        612/1503  40% 03:12  (mirror + cohort + compile, streaming)
  ▷ Archive — mirrored (340) -------------------------------------------------
-  + google/fonts-sources    + notofonts/latin-greek-cyrillic
+  + google/fonts-sources    ✗ owner/dead-repo
  ▷ Now building (8) ---------------------------------------------------------
   w 1 ofl/notosanstc                       02:10  checkout
  ▷ Recent failures (7) ------------------------------------------------------
   ofl/foldit                       gftools.builder exit 1: KeyError 'instances'
+ ───────────────────────────────────────────────────────────────────────────
+  ✗ owner/dead-repo — could NOT be mirrored into the archive
+    remote: Repository not found (HTTP 404)
  [Tab]tabs  [←→]section  [↑↓]item  [↵]details  [C]onfig  [q]uit
 ```
 
@@ -378,6 +388,16 @@ task/op's detail; `Esc`/`↵` returns); `C` opens/returns to the Configuration t
 switching — so `←`/`→` is the reliable binding.) The **elapsed clock is cumulative** across
 reopen/resume. Full per-family logs are at `<build-dir>/logs/<slug>.log`. For non-interactive
 use pick `--ui plain`, `--ui json`, or `--ui none`.
+
+An **always-on status panel** sits just above the footer and explains the **currently focused
+item** wherever you are — a one-liner that grows to 2–3 lines only when there's more worth
+showing. Move focus with `←`/`→` (sections) and `↑`/`↓` (items), or `↑`/`↓` over the
+Configuration fields, and the panel updates instantly: what a config field does, what `▶ Start`
+will launch, why a build is failing, what a cohort needs — and, for a **red `✗` entry in
+Archive — mirrored**, *why* that repo could **not** be mirrored (e.g. `Repository not found
+(HTTP 404)`). The header's **`build dir <size>`** is the *total* on-disk footprint of the whole
+build system (`out/`, `venvs/`, `work/`, logs), recomputed periodically — not a per-session
+delta — so it's meaningful the moment you reopen the dashboard.
 
 ### Quit anytime — the build keeps running, resume straight to live updates
 

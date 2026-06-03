@@ -18,7 +18,8 @@ args = types.SimpleNamespace(
     compare=False, keep_work=False, keep_fonts=True, mirror_missing=False,
     _want_build_fontc=True, _data_dir="/tmp/_smoke_tl",
 )
-import os
+import os, shutil
+shutil.rmtree("/tmp/_smoke_tl", ignore_errors=True)   # hermetic: never reuse a prior run's state
 os.makedirs(args.build_dir, exist_ok=True)
 
 FAMS = [g.Family(f"ofl/fam{i}", f"Fam {i}", f"https://github.com/owner/repo{i}", "abc123",

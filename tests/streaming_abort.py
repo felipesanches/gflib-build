@@ -10,6 +10,8 @@ import types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import gflib_build as g
 
+import shutil
+shutil.rmtree("/tmp/_stream_abort", ignore_errors=True)   # hermetic: never reuse a prior run's state
 ARCHIVE = "/tmp/_stream_abort/archive"
 os.makedirs(ARCHIVE, exist_ok=True)
 

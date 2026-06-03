@@ -501,7 +501,7 @@ def populate_archive(repo_urls, archive: Path, jobs: int,
                 else:
                     present += 1
                 if on_progress:
-                    on_progress(done[0], len(urls), url, status)
+                    on_progress(done[0], len(urls), url, status, msg)
     return added, failed, present
 
 
@@ -909,6 +909,7 @@ class Orchestrator:
         self._resumed_elapsed = 0.0   # active wall-time from prior sessions (so the clock
                                        # is cumulative across reopen/resume, not reset to 0)
         self.disk_baseline = self._disk_used()
+        self._size_cache = [0, 0.0]                  # (build-dir total bytes, last-computed time)
         self.failures: List[str] = []
         self.workers: List[threading.Thread] = []
         self._wid_counter = 0                    # monotonic worker ids (no collisions on respawn)
@@ -1018,15 +1019,16 @@ class Orchestrator:
             if t is not None:
                 t.done, t.detail = done, detail
 
-    def _note_mirrored(self, url: str, status: str):
+    def _note_mirrored(self, url: str, status: str, reason: str = ""):
         """Record a repo the instant it lands in the archive (pre-warmer OR a worker), de-duped,
-        so the live archive list grows gradually as mirroring happens."""
+        so the live archive list grows gradually as mirroring happens. `reason` is the git error
+        for a 'failed' mirror (shown in the status panel so the red entries are explained)."""
         short = _repo_short(url)
         with self.lock:
             if short in self._archive_seen:
                 return
             self._archive_seen.add(short)
-            self.archive_log.append((status, short))
+            self.archive_log.append((status, short, reason))
             if len(self.archive_log) > 400:
                 del self.archive_log[:-400]
 
@@ -1040,11 +1042,11 @@ class Orchestrator:
                             for k, v in sorted(self._cohort_members.items(),
                                                key=lambda kv: -len(kv[1]))}
 
-    def _archive_progress(self, done: int, url: str, status: str):
+    def _archive_progress(self, done: int, url: str, status: str, reason: str = ""):
         """Per-repo callback from the concurrent archive pre-warmer: feed the live list and
         advance the (concurrent) archive task — WITHOUT touching `phase` (the build owns it)."""
         if status in ("added", "failed"):
-            self._note_mirrored(url, status)
+            self._note_mirrored(url, status, reason)
         self._task_update("archive", done, f"{status}: {_repo_short(url)}")
 
     # ---- phase helpers (also accumulate per-phase wall-clock durations)
@@ -1151,6 +1153,33 @@ class Orchestrator:
         except OSError:
             return 0
 
+    def _build_dir_bytes(self) -> int:
+        """Total bytes the build system occupies on disk (the whole build dir: out/, venvs/,
+        work/, caches, logs). Cached ~10 s — it's the cumulative size, not a per-session delta."""
+        now = time.time()
+        if now - self._size_cache[1] < 10:
+            return self._size_cache[0]
+        total = 0
+        try:                                          # `du` is fast (C); falls back to os.walk
+            p = subprocess.run(["du", "-sk", str(self.build_dir)],
+                               capture_output=True, text=True, timeout=30)
+            if p.returncode == 0 and p.stdout.split():
+                total = int(p.stdout.split()[0]) * 1024
+            else:
+                raise RuntimeError
+        except Exception:
+            try:
+                for root, _dirs, files in os.walk(self.build_dir):
+                    for f in files:
+                        try:
+                            total += os.path.getsize(os.path.join(root, f))
+                        except OSError:
+                            pass
+            except Exception:
+                pass
+        self._size_cache = [total, now]
+        return total
+
     def snapshot(self) -> dict:
         with self.lock:
             rs = list(self.results.values())
@@ -1200,7 +1229,8 @@ class Orchestrator:
             tasks = [{"key": t.key, "name": t.name, "status": t.status,
                       "elapsed": round(t.elapsed(), 1), "done": t.done,
                       "total": t.total, "detail": t.detail} for t in self.tasks]
-            archive_recent = [{"status": s, "repo": r} for s, r in self.archive_log[-60:]]
+            archive_recent = [{"status": s, "repo": r, "reason": (rs[0] if rs else "")}
+                              for s, r, *rs in self.archive_log[-60:]]
             control_log = list(self.control_log[-12:])
             config = {                               # built under the lock (apply_live mutates args)
                 "source": self.args.source, "google_fonts": self.args.google_fonts,
@@ -1214,6 +1244,7 @@ class Orchestrator:
         return {
             "elapsed": self._resumed_elapsed + (time.time() - self.start_time),
             "disk_used_delta": disk_delta, "disk_free": disk_free,
+            "disk_build_total": self._build_dir_bytes(),
             "jobs": self.args.jobs, "paused": self.paused.is_set(),
             "total": len(rs), "counts": counts, "backends": backends,
             "building": building, "failures_recent": fails, "built_recent": built,
@@ -1589,7 +1620,7 @@ class Orchestrator:
                 urls = sorted({f.repo_url for f in fresh})
                 threading.Thread(target=lambda: populate_archive(
                     urls, self.archive, self.args.jobs,
-                    on_progress=lambda d, n, u, st: self._archive_progress(d, u, st),
+                    on_progress=lambda d, n, u, st, m='': self._archive_progress(d, u, st, m),
                     stop=self.stop, clone_lock=self.clone_locks), daemon=True).start()
         return len(fresh)
 
@@ -1665,7 +1696,7 @@ class Orchestrator:
                     def _prewarm():
                         added, failed, present = populate_archive(
                             urls, self.archive, self.args.jobs,
-                            on_progress=lambda d, n, u, st: self._archive_progress(d, u, st),
+                            on_progress=lambda d, n, u, st, m='': self._archive_progress(d, u, st, m),
                             stop=self.stop, clone_lock=self.clone_locks)
                         self._task_done(  # "unreachable" ≠ build failures
                             "archive",
@@ -1828,11 +1859,11 @@ class PlainFrontend(Frontend):
                 c = snap["counts"]
                 if ph in ("archive", "cohorts") and snap["phase_total"]:
                     print(f"  -- {hms(snap['elapsed'])}  {ph}: {snap['phase_done']}/"
-                          f"{snap['phase_total']}  disk +{human(snap['disk_used_delta'])}", flush=True)
+                          f"{snap['phase_total']}  build {human(snap.get('disk_build_total',0))}", flush=True)
                 else:
                     print(f"  -- {hms(snap['elapsed'])}  built {c['built']} failed {c['failed']} "
                           f"building {c['building']} queued {c['queued']}  "
-                          f"disk +{human(snap['disk_used_delta'])} "
+                          f"build {human(snap.get('disk_build_total',0))} "
                           f"[fontc {snap['backends']['fontc']}/fontmake {snap['backends']['fontmake']}]",
                           flush=True)
                 last = now
@@ -2021,19 +2052,58 @@ class CursesFrontend(Frontend):
                 f["_caret"] = cur + 1
         return None
 
-    def _nav_items(self, view: str, snap: dict) -> list:
-        """The selectable list for a view (↑/↓ moves the selection; ↵ opens its detail).
-        The config tab manages its own field navigation, so it has no generic nav list."""
-        if view == "overview":
-            return snap.get("tasks", [])
-        if view == "cohorts":
-            return snap.get("cohorts", [])
-        if view == "built":
-            return snap.get("built_recent", [])
-        if view == "failures":
-            return snap.get("failures_recent", [])
-        if view == "stats":
-            return sorted(snap.get("op_stats", {}).items(), key=lambda kv: -kv[1]["total"])
+    FIELD_HELP = {
+        "source": "where the worklist comes from: google/fonts METADATA, or every mirror in the archive",
+        "google_fonts": "path to a google/fonts clone (cloned shallow if absent)",
+        "archive": "the bare-mirror repo archive (append-only; never deleted)",
+        "build_dir": "where all build assets go (out/ venvs/ logs/) — never inside a repo",
+        "backend": "auto = fontc first then fall back to fontmake · fontc/fontmake = that one · both = build & compare",
+        "fontc_bin": "path to the fontc (Rust) binary",
+        "build_fontc": "no fontc binary? build it from source with cargo",
+        "jobs": "how many families build in parallel",
+        "percent": "build only this % of the library (evenly-spaced sample); raise it live to build more",
+        "timeout": "per-build timeout in seconds (0 = never time out)",
+        "populate_archive": "mirror any missing upstream repos into the archive while building",
+        "manage_venvs": "create & share one venv per dependency cohort",
+        "compare": "sha256-compare each built font to the shipped one (metadata source only)",
+    }
+
+    def _focus_info(self, kind, item, title=""):
+        """A short, context-sensitive description of the currently focused item, for the always-on
+        status panel. Returns 1-3 lines (grows only when useful)."""
+        if kind == "field":
+            return [f"{item['label']} — {self.FIELD_HELP.get(item['key'], 'edit with ←/→ or type')}"]
+        if kind == "action":
+            return [{"▶ Start build": "▶ launch the build with these settings",
+                     "Cancel": "discard and exit — nothing is built",
+                     "✓ apply changes": "apply the edited live settings to the running build now",
+                     }.get(item, str(item))]
+        if kind == "overview":                            # a pipeline task
+            return [f"{item['name']}: {item['status']}"
+                    + (f" — {item['detail']}" if item.get("detail") else "")]
+        if kind == "building":
+            return [f"building {item['slug']} — step '{item.get('note') or item.get('backend') or 'starting'}'"
+                    f"  (worker {item['worker']}, {hms(item['dur'])})"]
+        if kind == "failures":
+            return [f"{item['slug']}  FAILED:", "  " + str(item.get("error", ""))]
+        if kind == "built":
+            return [f"{item['slug']} ✓ built with {item.get('backend', '?')} — "
+                    f"{human(item.get('bytes', 0))}, vs shipped: {item.get('compare') or 'not compared'}"]
+        if kind == "cohorts":
+            reqs = (item.get("requirements") or "").splitlines()
+            return [f"cohort {item['key']}: {item['count']} families"
+                    + (f" — needs {reqs[0]}" if reqs else " (base — no extra requirements)")]
+        if kind == "stats":                               # an op: (op, {total,count,mean,max})
+            op, st = item
+            return [f"{op}: total {st['total']}s · n {st['count']} · mean {st['mean']}s · max {st['max']}s"]
+        if kind is None and isinstance(item, dict) and "repo" in item:   # archive entry
+            repo, reason = item.get("repo"), item.get("reason", "")
+            if item.get("status") == "failed":
+                return [f"✗ {repo} — could NOT be mirrored into the archive",
+                        "  " + (reason or "git clone failed: repo unreachable, removed, renamed, or private")]
+            return [f"+ {repo} — newly mirrored into the archive (a fresh bare clone)"]
+        if kind is None and isinstance(item, tuple) and len(item) == 2:  # phase timing
+            return [f"phase {item[0]}: took {hms(item[1])}"]
         return []
 
     def _cfg_apply_live(self, cfg_fields: list, snap: dict) -> None:
@@ -2196,19 +2266,26 @@ class CursesFrontend(Frontend):
             text_active = af_editable and af["type"] in ("path", "text")  # 'q'/'C' type, not quit
 
             ch = stdscr.getch()
-            if ch in (ord("q"), ord("Q")) and not text_active:
+            if ch == 27:                              # Esc: close an open detail, else cancel/quit
+                if detail is not None:                # (app-mode arrow keys decode to KEY_*, so a
+                    detail = None                     #  bare 27 is a real Esc, not a split sequence)
+                else:
+                    if not mon and not setup:
+                        self.orch.stop.set()
+                    return None
+            elif ch in (ord("q"), ord("Q")) and not text_active:
                 if not mon and not setup:
                     self.orch.stop.set()
                 return None
             elif ch == 9 and not setup:               # Tab → next tab (live only; setup = config only)
                 view = self.VIEWS[(self.VIEWS.index(view) + 1) % len(self.VIEWS)]
-                cfg_active = sel = section_idx = 0
+                cfg_active = sel = section_idx = 0; detail = None
             elif ch == curses.KEY_BTAB and not setup:  # Shift-Tab → previous tab
                 view = self.VIEWS[(self.VIEWS.index(view) - 1) % len(self.VIEWS)]
-                cfg_active = sel = section_idx = 0
+                cfg_active = sel = section_idx = 0; detail = None
             elif detail is not None:                  # inside the detail overlay
-                if ch in (10, 13, curses.KEY_BACKSPACE, 127, 8):
-                    detail = None
+                if ch in (10, 13, curses.KEY_BACKSPACE, 127, 8, curses.KEY_LEFT):
+                    detail = None                     # ↵ / ⌫ / ← all return to the list
                 elif ch == curses.KEY_DOWN:
                     dscroll += 1
                 elif ch == curses.KEY_UP:
@@ -2264,6 +2341,28 @@ class CursesFrontend(Frontend):
             stdscr.erase()
             cfg_cursor = None                         # caret to show for an active text field
 
+            # ---- focused item → the always-on status panel (1-3 lines, reserved above the footer) ----
+            fkind, fitem, ftitle = None, None, ""
+            if detail is None:
+                if view == "config":
+                    vals = self._cfg_typed(cfg_fields)
+                    vis = self._cfg_visible(cfg_fields, vals)
+                    actions = ["▶ Start build", "Cancel"] if setup else ["✓ apply changes"]
+                    cfg_active = max(0, min(cfg_active, len(vis) + len(actions) - 1))
+                    if cfg_active < len(vis):
+                        fkind, fitem = "field", vis[cfg_active]
+                    else:
+                        fkind, fitem = "action", actions[cfg_active - len(vis)]
+                else:
+                    fsecs = sections_for(snap, view)
+                    if fsecs:
+                        ftitle, fitems, _ff, _fc, fkind = fsecs[min(section_idx, len(fsecs) - 1)]
+                        if fitems:
+                            fitem = fitems[min(sel, len(fitems) - 1)]
+            info_lines = self._focus_info(fkind, fitem, ftitle)[:3] if fitem is not None else []
+            panel_h = (1 + len(info_lines)) if info_lines else 0
+            body_bottom = h - 1 - panel_h             # body renders in rows < body_bottom; footer h-1
+
             def put(y, x, s, attr=0):
                 if 0 <= y < h and 0 <= x < w and w - x - 1 > 0:
                     try:
@@ -2284,9 +2383,10 @@ class CursesFrontend(Frontend):
                 put(1, 0, " configure your build below, then navigate to ▶ Start build", CYAN)
             else:
                 put(0, max(0, w - 24), f"elapsed {hms(snap['elapsed'])}", curses.A_BOLD)
-                put(1, 0, f" disk +{human(snap['disk_used_delta'])}  free {human(snap['disk_free'])}  "
-                          f"jobs {snap['jobs']}  cohorts {len(snap['cohorts'])}  "
-                          f"fontc {bk['fontc']}/fontmake {bk['fontmake']}", CYAN)
+                put(1, 0, f" build dir {human(snap.get('disk_build_total', 0))}  "
+                          f"free {human(snap['disk_free'])}  jobs {snap['jobs']}  "
+                          f"cohorts {len(snap['cohorts'])}  fontc {bk['fontc']}/fontmake {bk['fontmake']}",
+                    CYAN)
                 # phase banner + progress
                 if ph in ("archive", "cohorts") and snap["phase_total"]:
                     pd, pt = snap["phase_done"], snap["phase_total"]
@@ -2323,7 +2423,7 @@ class CursesFrontend(Frontend):
                     if not items:
                         put(r, 1, "(none)", curses.A_DIM); r += 2
                         continue
-                    budget = max(0, h - r - 1)
+                    budget = max(0, body_bottom - r)
                     cap = max(1, budget - 2 * (n - 1 - si)) if foc else min(2, len(items))
                     cap = min(cap, len(items), max(1, budget))
                     top = 0
@@ -2379,15 +2479,15 @@ class CursesFrontend(Frontend):
                     bx += len(actlbl) + 4
                 row += 3
                 relax = snap.get("dep_relaxations", [])
-                if relax and row < h - 3:
+                if relax and row < body_bottom - 1:
                     put(row, 0, " auto-fixed dependencies (no manual pinning needed) ".ljust(w - 1, "-"),
                         curses.A_BOLD); row += 1
-                    for ln in relax[:max(0, (h - row) // 3)]:
+                    for ln in relax[:max(0, (body_bottom - row) // 3)]:
                         put(row, 1, ln, YEL); row += 1
                 clog = snap.get("control_log", [])
-                if clog and row < h - 3:
+                if clog and row < body_bottom - 1:
                     put(row, 0, " applied live changes ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
-                    for ln in clog[-max(0, h - row - 2):]:
+                    for ln in clog[-max(0, body_bottom - row - 1):]:
                         put(row, 1, ln, GREEN); row += 1
             elif view == "stats":                    # migration summary, then the timing sections
                 m = snap.get("migration", {})
@@ -2401,8 +2501,15 @@ class CursesFrontend(Frontend):
             else:                                    # overview / cohorts / built / failures
                 draw_sections(row, sections_for(snap, view))
 
+            # ---- always-on status panel: what the focused item means (above the footer) ----
+            if info_lines:
+                sy = h - 1 - panel_h
+                put(sy, 0, "─" * (w - 1), curses.A_DIM)
+                for k, ln in enumerate(info_lines):
+                    put(sy + 1 + k, 0, " " + ln, (CYAN | curses.A_BOLD) if k == 0 else CYAN)
+
             if detail is not None:
-                foot = " [esc/↵] back to list   [↑↓] scroll"
+                foot = " [esc/←/↵] back to list   [↑↓] scroll"
             elif view == "config":
                 foot = (" [↑↓]field  [←→]edit/step  [space]toggle  type to edit  [↵]▶ Start  [Esc]cancel"
                         if setup else
@@ -2411,8 +2518,7 @@ class CursesFrontend(Frontend):
                 foot = " [Tab]tabs  [←→]section  [↑↓]item  [↵]details  [C]onfig  [q]uit"
             if mon and not snap.get("daemon_alive", True):
                 foot = " [q]uit   ⚠ daemon not running (build finished or stopped)"
-            put(h - 1, 0, foot + ("" if pre_build else "   logs: " + str(self.orch.build_dir / "logs")),
-                curses.A_DIM)
+            put(h - 1, 0, foot, curses.A_DIM)
             try:                                      # show the text caret on an active field
                 if cfg_cursor:
                     curses.curs_set(1)
@@ -2677,7 +2783,8 @@ class MonitorState:
               "counts": {"built": 0, "failed": 0, "building": 0, "queued": 0, "skipped": 0},
               "backends": {"fontc": 0, "fontmake": 0}, "building": [], "failures_recent": [],
               "built_recent": [],
-              "cohorts": [], "total": 0, "elapsed": 0, "disk_used_delta": 0, "disk_free": 0,
+              "cohorts": [], "total": 0, "elapsed": 0, "disk_used_delta": 0, "disk_build_total": 0,
+              "disk_free": 0,
               "jobs": 0, "paused": False, "phase_total": 0, "phase_done": 0, "phase_label": "",
               "phase_error": "", "op_stats": {}, "phase_durations": {}, "migration": {},
               "tasks": [], "archive_recent": [], "config": {}, "control_log": [],
