@@ -160,6 +160,10 @@ intent so nothing is lost as the tool evolves.
     drops just that pin, lets pip backtrack to a compatible version, retries, and records the
     relaxation in the config tab. Valid pins are kept, so reproducibility holds for everything
     that resolves; the user never has to hand-edit `requirements-build.txt` to unblock a build.
+34. **Config tab is leftmost + the default view**, reflecting the current settings (falls back
+    to the persisted config so it never shows a list of `None`).
+35. **`--reset` completely cleans the system** — deletes all built assets + virtual environments
+    (the whole build dir); the repo archive is NEVER touched (strict append-only policy).
 
 ---
 
@@ -324,7 +328,7 @@ banner + progress bar and is **navigable** — four views switchable with the **
  disk +12.3GiB  free 290.0GiB  jobs 8  cohorts 28  fontc 980/fontmake 240
  Phase: building   built 412/1503  failed 7  building 8  queued 1076
  [######################------------------------------------]  31%
-  1 overview  2 cohorts  3 failures  4 stats  5 config   [←→]tabs [↑↓]select
+  1 config  2 overview  3 cohorts  4 failures  5 stats   [←→]tabs [↑↓]select
  Pipeline  (↑↓ select · ↵ details) -----------------------------------------
   ✅ clone google/fonts          00:00:31   <build-dir>/google-fonts
   ➖ build fontc from source                 (skipped — binary detected)
@@ -339,17 +343,19 @@ banner + progress bar and is **navigable** — four views switchable with the **
  [q]uit — build runs on  [↑↓]select [↵]details [←→]tabs
 ```
 
+- **config** (leftmost, the default landing tab) — the live configuration, reflecting the
+  current settings (it falls back to the persisted config file, so it's never a list of
+  `None`). `↑`/`↓` pick a field, `space` toggles a bool/cycles a choice, `+`/`-` adjusts a
+  number, `↵`/`a` **applies the change to the RUNNING build** — no restart. Raising **percent**
+  immediately fetches+cohorts+builds the newly-included families; raising **jobs** spawns more
+  parallel workers; backend/timeout/compare/populate also apply live. Path/source changes need
+  a restart (`C`). Auto-fixed dependencies + applied changes are listed at the bottom.
 - **overview** — the pipeline task-list, the live archive-population list (repos appear as
   they are mirrored), now-building (each entry shows its step: `checkout` while the source
   is being extracted, then the cohort/backend), and recent failures.
 - **cohorts** — the dependency cohorts, live (largest first).
 - **failures** — all failures, newest first.
 - **stats** — fontc-migration tally + per-phase / per-operation timing.
-- **config** — the live configuration. `↑`/`↓` pick a field, `space` toggles a bool/cycles a
-  choice, `+`/`-` adjusts a number, `↵`/`a` **applies the change to the RUNNING build** — no
-  restart. Raising **percent** immediately fetches+cohorts+builds the newly-included families;
-  raising **jobs** spawns more parallel workers; backend/timeout/compare/populate also apply
-  live. Path/source changes need a restart (`C`). Applied changes are listed at the bottom.
 
 Keys: **`←`/`→`** (or `Tab`) switch views, `1`/`2`/`3`/`4` jump to a view, **`↑`/`↓` select**
 an item in the current tab's list, **`↵` open a detail overlay** for the selected item (a
@@ -424,6 +430,14 @@ Useful flags: `--percent 5` (sample), `--only ofl/dmsans,ofl/roboto` (subset),
 `--ui {curses,plain,json,none}`, `--retry-failed`, `--rebuild` (ignore prior state),
 `--discard-fonts` (keep only the comparison result, not the built binaries),
 `--keep-work` (debug: keep the extraction).
+
+```sh
+# Completely reset — delete ALL built assets + virtual environments (the whole build dir) to
+# start clean. The repo archive is NEVER touched (strict append-only policy); the google/fonts
+# clone is kept too. Refuses if a build is running (--stop first) or if the archive is inside
+# the build dir. Add --yes to skip the confirmation.
+python3 gflib_build.py --reset
+```
 
 ```sh
 # Rebuild ONE family (e.g. after fixing a config) — --only restricts the WHOLE pipeline

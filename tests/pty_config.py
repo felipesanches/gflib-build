@@ -54,10 +54,10 @@ def drain(seconds):
 
 
 drain(1.2)
-# go to config tab; bump percent (the first/selected field) +5 +5 = 20; apply.
+# config is the default (leftmost) tab; bump percent (the first/selected field) +5 +5 = 20; apply.
 # (selection-by-arrow is covered elsewhere; multi-byte arrow keys split unreliably under a
 #  non-blocking pty getch, so this focuses on the edit+apply path on the default field.)
-for seq in (b"5", b"+", b"+", b"a"):
+for seq in (b"1", b"+", b"+", b"a"):
     os.write(fd, seq)
     drain(0.25)
 drain(0.5)

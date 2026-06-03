@@ -1221,6 +1221,7 @@ class Orchestrator:
             "op_stats": op_stats, "phase_durations": phase_dur, "migration": migration,
             "tasks": tasks, "archive_recent": archive_recent, "config": config,
             "control_log": control_log,
+            "config_path": getattr(self.args, "_cfg_path", ""),
             "dep_relaxations": list(self.venvs.relaxations) if self.venvs else [],
             "done": phase == "done",
         }
@@ -1876,7 +1877,7 @@ class CursesFrontend(Frontend):
     # emoji status marks (ASCII fallback chosen at runtime if the terminal can't render them)
     EMOJI = {"pending": "⏳", "running": "🔄", "done": "✅", "failed": "❌", "skipped": "➖"}
     ASCII = {"pending": "..", "running": ">>", "done": "OK", "failed": "XX", "skipped": "--"}
-    VIEWS = ("overview", "cohorts", "failures", "stats", "config")
+    VIEWS = ("config", "overview", "cohorts", "failures", "stats")
 
     # editable-live fields shown in the Configuration tab (applied to the running build)
     CFG_EDITABLE = [
@@ -1892,13 +1893,24 @@ class CursesFrontend(Frontend):
     ]
 
     @staticmethod
+    def _effective_config(snap: dict) -> dict:
+        """The settings to show in the config tab: the live build's config if reported, else the
+        persisted config file (so it reflects real current settings, not a list of None)."""
+        cfg = snap.get("config") or {}
+        if not cfg and snap.get("config_path"):
+            cfg = load_config(Path(snap["config_path"]))
+        return cfg
+
+    @staticmethod
     def _cfg_disp(f: dict, eff) -> str:
+        if f["key"] == "timeout":
+            return "off" if not eff else f"{int(eff)}s"
+        if eff is None:
+            return "—"                                # unset (don't print a bare "None")
         if f["type"] == "bool":
             return "yes" if eff else "no"
         if f["type"] == "choice":
             return str(eff)
-        if f["key"] == "timeout":
-            return "off" if not eff else f"{int(eff)}s"
         if f["key"] == "percent":
             return f"{eff:g}%" if isinstance(eff, (int, float)) else f"{eff}%"
         return str(eff)
@@ -2002,7 +2014,7 @@ class CursesFrontend(Frontend):
         SATTR = {"done": GREEN, "failed": RED, "running": YEL, "skipped": curses.A_DIM,
                  "pending": curses.A_NORMAL}
         mon = getattr(self, "monitor", False)
-        view, sel, detail, dscroll = "overview", 0, None, 0
+        view, sel, detail, dscroll = "config", 0, None, 0   # land on Configuration (leftmost)
         cfg_edit: dict = {}                           # pending live-config edits (config tab)
         while True:
             if self.orch.stop.is_set() and not mon:
@@ -2017,7 +2029,7 @@ class CursesFrontend(Frontend):
                 return "reconfigure"
             elif view == "config" and detail is None and ch in (
                     ord(" "), ord("+"), ord("="), ord("-"), ord("a"), ord("A"), 10, 13):
-                cfg = snap.get("config", {})
+                cfg = self._effective_config(snap)
                 if ch in (ord("a"), ord("A"), 10, 13):    # apply pending edits → write control
                     if cfg_edit:
                         payload = dict(cfg_edit)
@@ -2045,16 +2057,16 @@ class CursesFrontend(Frontend):
                     dscroll = max(0, dscroll - 1)
             elif ch in (ord("p"), ord("P")):
                 (self.orch.paused.clear if self.orch.paused.is_set() else self.orch.paused.set)()
-            elif ch in (ord("1"), ord("o"), ord("O")):
-                view, sel = "overview", 0
-            elif ch in (ord("2"),):
-                view, sel = "cohorts", 0
-            elif ch in (ord("3"),):
-                view, sel = "failures", 0
-            elif ch in (ord("4"),):
-                view, sel = "stats", 0
-            elif ch in (ord("5"),):
+            elif ch in (ord("1"),):
                 view, sel = "config", 0
+            elif ch in (ord("2"), ord("o"), ord("O")):
+                view, sel = "overview", 0
+            elif ch in (ord("3"),):
+                view, sel = "cohorts", 0
+            elif ch in (ord("4"),):
+                view, sel = "failures", 0
+            elif ch in (ord("5"),):
+                view, sel = "stats", 0
             elif ch in (9, curses.KEY_RIGHT):        # Tab / → : next view
                 view = self.VIEWS[(self.VIEWS.index(view) + 1) % len(self.VIEWS)]
                 sel = 0
@@ -2117,9 +2129,9 @@ class CursesFrontend(Frontend):
             put(3, max(2, barw // 2), f" {int(100 * frac)}% ", curses.A_BOLD)
             # tabs
             x = 1
-            for lbl, name in (("1 overview", "overview"), ("2 cohorts", "cohorts"),
-                              ("3 failures", "failures"), ("4 stats", "stats"),
-                              ("5 config", "config")):
+            for lbl, name in (("1 config", "config"), ("2 overview", "overview"),
+                              ("3 cohorts", "cohorts"), ("4 failures", "failures"),
+                              ("5 stats", "stats")):
                 put(4, x, f" {lbl} ", curses.A_REVERSE if view == name else curses.A_DIM)
                 x += len(lbl) + 3
             put(4, max(x + 2, w - 20), "[←→]tabs [↑↓]select", curses.A_DIM)
@@ -2222,7 +2234,7 @@ class CursesFrontend(Frontend):
                 if not ops:
                     put(row, 1, "(timing accrues as builds run)")
             elif view == "config":
-                cfg = snap.get("config", {})
+                cfg = self._effective_config(snap)
                 put(row, 0, " Configuration — applied LIVE to the running build ".ljust(w - 1, "-"),
                     curses.A_BOLD); row += 1
                 for i, f in enumerate(self.CFG_EDITABLE):
@@ -2447,6 +2459,40 @@ def write_control(build_dir: Path, settings: dict) -> bool:
         return True
     except OSError:
         return False
+
+
+def reset_build(build_dir: Path, archive: Path, google_fonts, assume_yes: bool) -> None:
+    """Delete ALL built assets + venvs (the whole build dir) to start clean. The repo archive
+    is NEVER deleted (strict append-only policy) — we refuse if it lives inside the build dir."""
+    bd = Path(build_dir).resolve()
+    ar = Path(archive).resolve()
+    if bd == ar or bd in ar.parents:                  # archive is under (or is) the build dir
+        sys.exit(f"refusing to reset: the archive {ar} is inside the build dir {bd}. The archive "
+                 f"is append-only and must never be deleted — put --archive outside --build-dir.")
+    if read_daemon_pid(bd) is not None:
+        sys.exit(f"a build is running at {bd}; --stop it first, then --reset.")
+    if not bd.exists():
+        print(f"nothing to reset — {bd} does not exist (archive untouched).", file=sys.stderr)
+        return
+    e = sys.stderr
+    print("RESET will DELETE the build dir (built fonts, venvs, work, caches, logs, state):", file=e)
+    print(f"  {bd}", file=e)
+    print("KEPT, never touched:", file=e)
+    print(f"  archive       {ar}", file=e)
+    if google_fonts:
+        print(f"  google/fonts  {Path(google_fonts).resolve()}", file=e)
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            sys.exit("refusing to reset non-interactively — pass --yes to confirm.")
+        try:
+            if input("Delete the build dir? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("aborted — nothing deleted.", file=e)
+                return
+        except (EOFError, KeyboardInterrupt):
+            print("\naborted — nothing deleted.", file=e)
+            return
+    shutil.rmtree(bd, ignore_errors=True)
+    print(f"reset done — deleted {bd}. The archive is intact.", file=e)
 
 
 def read_daemon_pid(build_dir: Path) -> Optional[int]:
@@ -2761,6 +2807,9 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="attach a live, read-only monitor to a build at --build-dir (q leaves it running)")
     ap.add_argument("--stop", action="store_true",
                     help="signal a detached build at --build-dir to stop gracefully")
+    ap.add_argument("--reset", action="store_true",
+                    help="delete ALL built assets and virtual environments (the whole build dir) "
+                         "to start clean. The repo archive is NEVER touched (append-only policy).")
     ap.set_defaults(manage_venvs=False, compare=False)   # pin defaults (overridden by config/CLI)
     return ap
 
@@ -2797,6 +2846,7 @@ def main():
     if cfg:
         ap.set_defaults(**{k: v for k, v in cfg.items() if k != "data_dir"})
     args = ap.parse_args()
+    args._cfg_path = str(cfg_path)                # so the config tab can fall back to it
     if sys.platform == "win32":
         sys.exit("gflib-build targets macOS/Linux (POSIX venv layout, git archive, tar).")
 
@@ -2831,6 +2881,11 @@ def main():
         archive = Path(det) if det else (data_dir / "archive")
     archive = archive.resolve()
     build_dir = (Path(args.build_dir) if args.build_dir else (data_dir / "build")).resolve()
+
+    if args.reset:                            # wipe built assets + venvs; keep the archive
+        reset_build(build_dir, archive, gf, args.yes)
+        return
+
     if not args.fontc_bin:
         args.fontc_bin = detect_fontc()       # auto-detect a fontc binary
     read_only = args.list or args.cohorts_report
