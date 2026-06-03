@@ -151,6 +151,10 @@ intent so nothing is lost as the tool evolves.
     in the archive — the build does not wait for "populate archive" to finish. An archive
     pre-warmer mirrors ahead using idle I/O; a shared per-repo clone lock means no repo is
     cloned twice; clones are abortable so shutdown never blocks. The archive list grows live.
+32. **Configuration tab + LIVE config changes.** A "config" tab shows the live settings and
+    edits them; applying takes effect on the RUNNING build with no restart — raising percent
+    fetches/cohorts/builds the newly-included families, raising jobs starts more parallel
+    workers (via a `control.json` the daemon polls). Drive config from one monitor at a time.
 
 ---
 
@@ -315,7 +319,7 @@ banner + progress bar and is **navigable** — four views switchable with the **
  disk +12.3GiB  free 290.0GiB  jobs 8  cohorts 28  fontc 980/fontmake 240
  Phase: building   built 412/1503  failed 7  building 8  queued 1076
  [######################------------------------------------]  31%
-  1 overview   2 cohorts   3 failures   4 stats     [←→]tabs [↑↓]select [↵]info
+  1 overview  2 cohorts  3 failures  4 stats  5 config   [←→]tabs [↑↓]select
  Pipeline  (↑↓ select · ↵ details) -----------------------------------------
   ✅ clone google/fonts          00:00:31   <build-dir>/google-fonts
   ➖ build fontc from source                 (skipped — binary detected)
@@ -336,6 +340,11 @@ banner + progress bar and is **navigable** — four views switchable with the **
 - **cohorts** — the dependency cohorts, live (largest first).
 - **failures** — all failures, newest first.
 - **stats** — fontc-migration tally + per-phase / per-operation timing.
+- **config** — the live configuration. `↑`/`↓` pick a field, `space` toggles a bool/cycles a
+  choice, `+`/`-` adjusts a number, `↵`/`a` **applies the change to the RUNNING build** — no
+  restart. Raising **percent** immediately fetches+cohorts+builds the newly-included families;
+  raising **jobs** spawns more parallel workers; backend/timeout/compare/populate also apply
+  live. Path/source changes need a restart (`C`). Applied changes are listed at the bottom.
 
 Keys: **`←`/`→`** (or `Tab`) switch views, `1`/`2`/`3`/`4` jump to a view, **`↑`/`↓` select**
 an item in the current tab's list, **`↵` open a detail overlay** for the selected item (a

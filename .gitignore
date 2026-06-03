@@ -14,6 +14,8 @@ state.json
 gflib-data/
 build/
 status.json
+control.json
+control.*.tmp
 status.json.tmp
 timings.json
 cohorts.json

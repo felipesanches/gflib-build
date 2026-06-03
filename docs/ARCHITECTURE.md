@@ -63,6 +63,24 @@ inside the driver so it shows in the task-list. `join()` awaits the driver. Fron
 `phase == "done"` as the completion signal. Read-only paths (`--list`/`--cohorts-report`)
 discover synchronously in `main()` (no driver/UI).
 
+### Live config (control channel)
+
+The monitor's **config tab** edits live-applicable settings and writes them to
+`<build-dir>/control.json` (`write_control`, a `{seq, set}` doc). The daemon runs a
+`_control_watcher` thread that polls it and calls `apply_live(set)` when `seq` increases
+(seeded from the file at start so a stale control isn't re-applied on resume):
+- **percent ↑** → `_extend_worklist` re-samples `self._all_families` and enqueues the
+  newly-included families (so `all_done()` goes False and the build keeps going);
+- **jobs ↑** → `_ensure_workers` spawns more worker threads (atomically; monotonic ids);
+- **backend / timeout / compare / populate_archive** → update `self.args` (each subsequent
+  build reads it).
+
+Completion is decided WITHOUT setting the global `stop` on `all_done()` — the build loop
+re-checks, **under `self.lock`**, whether a live bump queued more work and respawns workers
+if so; `stop` is reserved for real shutdown and is set only once the build is truly done (to
+abort the pre-warmer). The control thread is joined before the final status write. Drive
+config from one monitor at a time (single-file `seq` is last-writer-wins).
+
 ### Detach-by-default & auto-attach
 
 A fresh interactive (curses) build **detaches by default** (`daemonize()`): the build runs

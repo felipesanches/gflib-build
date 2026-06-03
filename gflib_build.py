@@ -835,8 +835,11 @@ class Orchestrator:
         self.archive = Path(args.archive)
         # the worklist is discovered live, inside the driver (a task), so it shows in the UI
         self.families: Dict[str, Family] = {}
+        self._all_families: List[Family] = []   # full discovered list (for live percent changes)
         self.total_with_source = 0
         self.skipped_no_config = 0
+        self.control_log: List[str] = []        # live config changes applied (for the UI)
+        self._control_last = 0                   # last applied control.json seq
 
         self.lock = threading.Lock()
         self.results: Dict[str, Result] = {}
@@ -849,6 +852,7 @@ class Orchestrator:
         self.disk_baseline = self._disk_used()
         self.failures: List[str] = []
         self.workers: List[threading.Thread] = []
+        self._wid_counter = 0                    # monotonic worker ids (no collisions on respawn)
         self._events = open(self.build_dir / "events.jsonl", "a", buffering=1)
         self._events_lock = threading.Lock()
         self._events_closed = False
@@ -878,6 +882,7 @@ class Orchestrator:
         self.phase_durations: Dict[str, float] = {}
         self._phase_t0: Optional[float] = None
         self._status_thread: Optional[threading.Thread] = None
+        self._control_thread: Optional[threading.Thread] = None
         self._status_stop = threading.Event()
         self._status_lock = threading.Lock()
 
@@ -1133,6 +1138,16 @@ class Orchestrator:
                       "elapsed": round(t.elapsed(), 1), "done": t.done,
                       "total": t.total, "detail": t.detail} for t in self.tasks]
             archive_recent = [{"status": s, "repo": r} for s, r in self.archive_log[-60:]]
+            control_log = list(self.control_log[-12:])
+            config = {                               # built under the lock (apply_live mutates args)
+                "source": self.args.source, "google_fonts": self.args.google_fonts,
+                "archive": str(self.archive), "build_dir": str(self.build_dir),
+                "backend": self.args.backend, "fontc_bin": self.args.fontc_bin,
+                "jobs": self.args.jobs, "percent": self.args.percent,
+                "timeout": self.args.timeout, "populate_archive": bool(self.args.populate_archive),
+                "manage_venvs": bool(self.args.manage_venvs), "compare": bool(self.args.compare),
+                "only": self.args.only,
+            }
         return {
             "elapsed": self._resumed_elapsed + (time.time() - self.start_time),
             "disk_used_delta": disk_delta, "disk_free": disk_free,
@@ -1145,7 +1160,8 @@ class Orchestrator:
             "cohorts": [{"key": k, "count": v["count"],
                          "requirements": v["requirements"]} for k, v in cohorts],
             "op_stats": op_stats, "phase_durations": phase_dur, "migration": migration,
-            "tasks": tasks, "archive_recent": archive_recent,
+            "tasks": tasks, "archive_recent": archive_recent, "config": config,
+            "control_log": control_log,
             "done": phase == "done",
         }
 
@@ -1403,8 +1419,114 @@ class Orchestrator:
     def run(self):
         self._status_thread = threading.Thread(target=self._status_writer, daemon=True)
         self._status_thread.start()
+        self._control_thread = threading.Thread(target=self._control_watcher, daemon=True)
+        self._control_thread.start()
         self.driver = threading.Thread(target=self._drive, daemon=True)
         self.driver.start()
+
+    # ---- live config: a monitor writes control.json; the daemon applies it on the fly ----
+    def _control_watcher(self):
+        path = self.build_dir / "control.json"
+        try:                                          # ignore a stale control from a prior run
+            self._control_last = int(json.loads(path.read_text()).get("seq", 0))
+        except Exception:
+            self._control_last = 0
+        while not self._status_stop.is_set():
+            try:
+                ctl = json.loads(path.read_text())
+                seq = int(ctl.get("seq", 0))
+                if seq > self._control_last:
+                    self._control_last = seq
+                    self.apply_live(ctl.get("set", {}) or {})
+            except Exception:
+                pass
+            self._status_stop.wait(0.5)
+
+    def apply_live(self, settings: dict):
+        """Apply a live config change to the RUNNING build (no restart): bump percent → enqueue
+        the newly-included families (fetch + cohort + build them); bump jobs → spawn more
+        workers; backend/timeout/compare/populate_archive update args for subsequent builds."""
+        if self.stop.is_set():                        # build finished/stopping → can't apply live
+            with self.lock:
+                self.control_log.append(
+                    f"[{hms(self.snapshot_elapsed())}] ignored (build finished) — restart (C) to change")
+                del self.control_log[:-50]
+            return
+        changed: List[str] = []
+        with self.lock:
+            for k in ("backend", "timeout", "compare", "populate_archive"):
+                if k in settings and getattr(self.args, k, None) != settings[k]:
+                    setattr(self.args, k, settings[k])
+                    changed.append(f"{k}={settings[k]}")
+        new_pct = settings.get("percent")
+        if isinstance(new_pct, (int, float)) and float(new_pct) != self.args.percent:
+            added = self._extend_worklist(float(new_pct))
+            with self.lock:
+                self.args.percent = float(new_pct)
+            changed.append(f"percent={float(new_pct):g} (+{added} families)")
+        new_jobs = settings.get("jobs")
+        if isinstance(new_jobs, int) and new_jobs >= 1:
+            self._ensure_workers(new_jobs)
+            with self.lock:
+                if new_jobs != self.args.jobs:
+                    changed.append(f"jobs={new_jobs}")
+                self.args.jobs = new_jobs
+        if changed:
+            with self.lock:
+                self.control_log.append(f"[{hms(self.snapshot_elapsed())}] " + ", ".join(changed))
+                del self.control_log[:-50]
+            self._emit("control", "", changes=changed)
+
+    def snapshot_elapsed(self) -> float:
+        return self._resumed_elapsed + (time.time() - self.start_time)
+
+    def _ensure_workers(self, target_jobs: int):
+        """Bring the live worker pool up to `target_jobs` (only grows — decreasing just lets the
+        extra workers drain). Count + spawn happen under ONE lock so two callers (driver respawn
+        + a jobs-bump) can't each see alive=0 and double-spawn. Safe only while not stopping."""
+        if self.stop.is_set():
+            return
+        with self.lock:
+            alive = sum(1 for t in self.workers if t.is_alive())
+            for _ in range(alive, max(1, target_jobs)):
+                self._wid_counter += 1
+                t = threading.Thread(target=self.worker, args=(self._wid_counter,), daemon=True)
+                self.workers.append(t)
+                t.start()                             # worker's first action is q.get (no lock)
+
+    def _extend_worklist(self, new_pct: float) -> int:
+        """Enqueue families newly included by a higher percent (or all of --only). Queuing makes
+        all_done() False, so the running build loop keeps going and the workers pick them up."""
+        if not self._all_families or self.stop.is_set():
+            return 0
+        if self.args.only:
+            keep = set(self.args.only.split(","))
+            sample = [f for f in self._all_families if f.slug in keep]
+        else:
+            sample = sample_evenly(self._all_families, new_pct)
+        fresh = []
+        with self.lock:
+            for f in sample:
+                if f.slug not in self.results:        # not already queued/built/failed
+                    self.families[f.slug] = f
+                    self.results[f.slug] = Result(slug=f.slug, status="queued")
+                    fresh.append(f)
+            bt = self._task("build")
+            if bt is not None:
+                bt.total = len(self.results)
+                if bt.status in ("done", "failed"):   # build had wrapped up — reopen it
+                    bt.status, bt.t1 = "running", 0.0
+        for f in fresh:
+            self.q.put(f.slug)
+        if fresh:
+            self._ensure_workers(self.args.jobs)      # respawn any workers that had exited
+            if self.args.populate_archive:            # pre-fetch the new repos in the background
+                urls = sorted({f.repo_url for f in fresh})
+                threading.Thread(target=lambda: populate_archive(
+                    urls, self.archive, self.args.jobs,
+                    on_progress=lambda d, n, u, st: self._archive_progress(d, u, st),
+                    stop=self.stop, clone_lock=self.clone_locks), daemon=True).start()
+        return len(fresh)
 
     def _drive(self):
         try:
@@ -1442,6 +1564,7 @@ class Orchestrator:
                         self.archive, self.args.archive_rev, self.args.jobs)
                 else:
                     fams, total, skipped = discover(self.google_fonts)
+                self._all_families = fams            # keep the full list for live percent bumps
                 if self.args.only:                   # --only restricts the WHOLE pipeline
                     keep = set(self.args.only.split(","))
                     fams = [f for f in fams if f.slug in keep]   # (so a targeted rebuild only
@@ -1489,19 +1612,29 @@ class Orchestrator:
                 with self.lock:
                     build_total = len(self.results)   # queued now + any already-built (resume)
                 self._task_start("build", build_total)
-                for i in range(max(1, self.args.jobs)):
-                    th = threading.Thread(target=self.worker, args=(i + 1,), daemon=True)
-                    th.start()
-                    self.workers.append(th)
-                # exits only once every worker has stopped (no _emit can follow)
-                while any(th.is_alive() for th in self.workers):
-                    if self.stop.is_set() or self.all_done():
-                        self.stop.set()
+                self._ensure_workers(self.args.jobs)  # spawn the initial pool (atomic)
+                # Completion is decided here, NOT by setting the global `stop` on all_done():
+                # that lets a live percent-bump re-open the build. The workers self-exit when
+                # (all_done and queue empty); when none are alive we re-check, UNDER THE LOCK,
+                # whether a live bump queued more work — if so, respawn and keep going; else the
+                # build is truly done. `stop` stays reserved for shutdown (Ctrl-C / --stop).
+                while True:
+                    if self.stop.is_set():
+                        break
                     with self.lock:
+                        alive = any(th.is_alive() for th in self.workers)
+                        pending = (not self.q.empty()) or any(
+                            r.status == "queued" for r in self.results.values())
                         done_n = sum(1 for r in self.results.values()
                                      if r.status in ("built", "failed", "skipped"))
+                    if not alive:
+                        if pending:
+                            self._ensure_workers(self.args.jobs)   # live bump → resume building
+                            continue
+                        break                          # build truly complete
                     self._task_progress("build", done_n)
                     time.sleep(0.2)
+                self.stop.set()                        # build done → abort the pre-warmer's clones
                 # the build task's OUTCOME, not just "processed 15/15": show built/failed, and
                 # mark it failed (❌, not ✅) when every build failed — so it never looks like a
                 # success when nothing built.
@@ -1534,7 +1667,9 @@ class Orchestrator:
         finally:
             self.save_state()
             self._set_phase("done")  # workers are guaranteed stopped here
-            self._status_stop.set()                       # stop the periodic writer first…
+            self._status_stop.set()                       # stop the periodic writer + control…
+            if self._control_thread is not None:          # join the control watcher so no
+                self._control_thread.join(timeout=3)       # apply_live() runs after final status
             if self._status_thread is not None:
                 self._status_thread.join(timeout=3)
             self.write_timings()
@@ -1681,7 +1816,55 @@ class CursesFrontend(Frontend):
     # emoji status marks (ASCII fallback chosen at runtime if the terminal can't render them)
     EMOJI = {"pending": "⏳", "running": "🔄", "done": "✅", "failed": "❌", "skipped": "➖"}
     ASCII = {"pending": "..", "running": ">>", "done": "OK", "failed": "XX", "skipped": "--"}
-    VIEWS = ("overview", "cohorts", "failures", "stats")
+    VIEWS = ("overview", "cohorts", "failures", "stats", "config")
+
+    # editable-live fields shown in the Configuration tab (applied to the running build)
+    CFG_EDITABLE = [
+        {"key": "percent", "label": "percent of library", "type": "stepnum",
+         "step": 5, "min": 1, "max": 100},
+        {"key": "jobs", "label": "parallel jobs", "type": "int", "step": 1, "min": 1, "max": 256},
+        {"key": "backend", "label": "build backend", "type": "choice",
+         "choices": ["auto", "fontc", "fontmake", "both"]},
+        {"key": "timeout", "label": "per-build timeout (s, 0=off)", "type": "int",
+         "step": 30, "min": 0, "max": 100000},
+        {"key": "populate_archive", "label": "populate archive (fetch repos)", "type": "bool"},
+        {"key": "compare", "label": "compare to shipped", "type": "bool"},
+    ]
+
+    @staticmethod
+    def _cfg_disp(f: dict, eff) -> str:
+        if f["type"] == "bool":
+            return "yes" if eff else "no"
+        if f["type"] == "choice":
+            return str(eff)
+        if f["key"] == "timeout":
+            return "off" if not eff else f"{int(eff)}s"
+        if f["key"] == "percent":
+            return f"{eff:g}%" if isinstance(eff, (int, float)) else f"{eff}%"
+        return str(eff)
+
+    @staticmethod
+    def _cfg_edit_key(f: dict, eff, ch: int):
+        """New value for field `f` from a keypress, or None if the key doesn't edit it."""
+        t = f["type"]
+        if t == "bool":
+            return (not bool(eff)) if ch == ord(" ") else None
+        if t == "choice":
+            if ch == ord(" "):
+                ch_list = f["choices"]
+                i = ch_list.index(eff) if eff in ch_list else 0
+                return ch_list[(i + 1) % len(ch_list)]
+            return None
+        # numeric (stepnum / int): +/- adjust
+        if ch in (ord("+"), ord("=")):
+            d = f.get("step", 1)
+        elif ch == ord("-"):
+            d = -f.get("step", 1)
+        else:
+            return None
+        cur = float(eff) if isinstance(eff, (int, float)) else 0.0
+        cur = max(f.get("min", 0), min(f.get("max", 10 ** 9), cur + d))
+        return int(cur)
 
     def _nav_items(self, view: str, snap: dict) -> list:
         """The selectable list for a view (↑/↓ moves the selection; ↵ opens its detail)."""
@@ -1693,6 +1876,8 @@ class CursesFrontend(Frontend):
             return snap.get("failures_recent", [])
         if view == "stats":
             return sorted(snap.get("op_stats", {}).items(), key=lambda kv: -kv[1]["total"])
+        if view == "config":
+            return self.CFG_EDITABLE
         return []
 
     def _detail_lines(self, view: str, item) -> List[str]:
@@ -1758,6 +1943,7 @@ class CursesFrontend(Frontend):
                  "pending": curses.A_NORMAL}
         mon = getattr(self, "monitor", False)
         view, sel, detail, dscroll = "overview", 0, None, 0
+        cfg_edit: dict = {}                           # pending live-config edits (config tab)
         while True:
             if self.orch.stop.is_set() and not mon:
                 break
@@ -1767,8 +1953,29 @@ class CursesFrontend(Frontend):
                 if not mon:
                     self.orch.stop.set()
                 break
-            elif ch in (ord("C"), ord("c")):         # back to the setup wizard
+            elif ch in (ord("C"), ord("c")):         # back to the setup wizard (full restart)
                 return "reconfigure"
+            elif view == "config" and detail is None and ch in (
+                    ord(" "), ord("+"), ord("="), ord("-"), ord("a"), ord("A"), 10, 13):
+                cfg = snap.get("config", {})
+                if ch in (ord("a"), ord("A"), 10, 13):    # apply pending edits → write control
+                    if cfg_edit:
+                        payload = dict(cfg_edit)
+                        if "timeout" in payload:          # 0 → None (no timeout)
+                            payload["timeout"] = payload["timeout"] or None
+                        if write_control(self.orch.build_dir, payload):
+                            cfg_edit = {}                 # keep edits if the write failed
+                else:                                     # space / +/- edits the selected field
+                    fields = self.CFG_EDITABLE
+                    if fields and sel < len(fields):
+                        f = fields[sel]
+                        eff = cfg_edit.get(f["key"], cfg.get(f["key"]))
+                        nv = self._cfg_edit_key(f, eff, ch)
+                        if nv is not None:
+                            if nv == cfg.get(f["key"]):
+                                cfg_edit.pop(f["key"], None)   # back to original → not pending
+                            else:
+                                cfg_edit[f["key"]] = nv
             elif detail is not None:                 # inside the detail overlay
                 if ch in (27, 10, 13, curses.KEY_BACKSPACE, 127, 8, curses.KEY_LEFT):
                     detail = None
@@ -1786,6 +1993,8 @@ class CursesFrontend(Frontend):
                 view, sel = "failures", 0
             elif ch in (ord("4"),):
                 view, sel = "stats", 0
+            elif ch in (ord("5"),):
+                view, sel = "config", 0
             elif ch in (9, curses.KEY_RIGHT):        # Tab / → : next view
                 view = self.VIEWS[(self.VIEWS.index(view) + 1) % len(self.VIEWS)]
                 sel = 0
@@ -1796,7 +2005,7 @@ class CursesFrontend(Frontend):
                 sel += 1
             elif ch == curses.KEY_UP:                # ↑ : move selection up
                 sel = max(0, sel - 1)
-            elif ch in (10, 13):                     # Enter : open details for the selected item
+            elif ch in (10, 13):                     # Enter : open detail for the selected item
                 items = self._nav_items(view, snap)
                 if items:
                     # snapshot the detail text once (so failure-log tails aren't re-read each frame)
@@ -1849,10 +2058,11 @@ class CursesFrontend(Frontend):
             # tabs
             x = 1
             for lbl, name in (("1 overview", "overview"), ("2 cohorts", "cohorts"),
-                              ("3 failures", "failures"), ("4 stats", "stats")):
+                              ("3 failures", "failures"), ("4 stats", "stats"),
+                              ("5 config", "config")):
                 put(4, x, f" {lbl} ", curses.A_REVERSE if view == name else curses.A_DIM)
                 x += len(lbl) + 3
-            put(4, max(x + 2, w - 26), "[←→]tabs [↑↓]select [↵]info", curses.A_DIM)
+            put(4, max(x + 2, w - 20), "[←→]tabs [↑↓]select", curses.A_DIM)
 
             # ---- selected-row renderer: highlights `sel`, auto-scrolls to keep it visible ----
             def draw_list(row0, lst, fmt, color=None):
@@ -1951,9 +2161,40 @@ class CursesFrontend(Frontend):
                           color=lambda kv: CYAN)
                 if not ops:
                     put(row, 1, "(timing accrues as builds run)")
+            elif view == "config":
+                cfg = snap.get("config", {})
+                put(row, 0, " Configuration — applied LIVE to the running build ".ljust(w - 1, "-"),
+                    curses.A_BOLD); row += 1
+                for i, f in enumerate(self.CFG_EDITABLE):
+                    pending = f["key"] in cfg_edit
+                    eff = cfg_edit.get(f["key"], cfg.get(f["key"]))
+                    val = self._cfg_disp(f, eff)
+                    a = (curses.A_REVERSE if i == sel else 0) | (YEL if pending else CYAN)
+                    put(row, 1, f"{f['label']:<30} {val}{'   *changed' if pending else ''}", a)
+                    row += 1
+                row += 1
+                put(row, 0, " read-only — use C to restart & change ".ljust(w - 1, "-"),
+                    curses.A_DIM); row += 1
+                for label, key in (("worklist source", "source"), ("google/fonts", "google_fonts"),
+                                   ("repo archive", "archive"), ("build dir", "build_dir"),
+                                   ("cohort venvs", "manage_venvs")):
+                    v = cfg.get(key)
+                    v = ("yes" if v else "no") if key == "manage_venvs" else (v or "(none)")
+                    put(row, 1, f"{label:<30} {v}", curses.A_DIM); row += 1
+                clog = snap.get("control_log", [])
+                if clog:
+                    row += 1
+                    put(row, 0, " applied live changes ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
+                    for ln in clog[-max(0, h - row - 2):]:
+                        put(row, 1, ln, GREEN); row += 1
+                if cfg_edit:
+                    put(h - 2, 1, f"pending: {', '.join(cfg_edit)}  —  [↵/a] apply live "
+                                  f"(builds pick it up immediately)", YEL | curses.A_BOLD)
 
             if detail is not None:
                 foot = " [esc/←/↵] back to list   [↑↓] scroll"
+            elif view == "config":
+                foot = " [↑↓]field [space]toggle [+/-]adjust [↵/a]apply-live [C]restart [←→]tabs"
             else:
                 foot = (" [q]uit — build runs on  [C]onfigure  [↑↓]select [↵]info [←→]tabs"
                         if mon else " [q]uit [p]ause  [C]onfigure  [↑↓]select [↵]info")
@@ -2126,6 +2367,21 @@ def _proc_cmdline(pid: int) -> str:
             return ""
 
 
+def write_control(build_dir: Path, settings: dict) -> bool:
+    """Bump the control.json the running daemon polls, to apply a live config change. Returns
+    True on success. Uses a unique temp name so two monitors writing at once can't collide on
+    the temp file (the seq is still last-writer-wins — drive config from one monitor at a time)."""
+    path = Path(build_dir) / "control.json"
+    try:
+        seq = int(json.loads(path.read_text()).get("seq", 0)) if path.is_file() else 0
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"seq": seq + 1, "set": settings}))
+        tmp.replace(path)
+        return True
+    except OSError:
+        return False
+
+
 def read_daemon_pid(build_dir: Path) -> Optional[int]:
     try:
         pid = int((Path(build_dir) / "daemon.pid").read_text().strip())
@@ -2169,7 +2425,7 @@ class MonitorState:
               "cohorts": [], "total": 0, "elapsed": 0, "disk_used_delta": 0, "disk_free": 0,
               "jobs": 0, "paused": False, "phase_total": 0, "phase_done": 0, "phase_label": "",
               "phase_error": "", "op_stats": {}, "phase_durations": {}, "migration": {},
-              "tasks": [], "archive_recent": [], "done": False}
+              "tasks": [], "archive_recent": [], "config": {}, "control_log": [], "done": False}
 
     def __init__(self, build_dir: Path):
         self.build_dir = Path(build_dir)
