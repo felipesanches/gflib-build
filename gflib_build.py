@@ -265,8 +265,8 @@ def categorize_failure(error: str):
     low = e.lower()
     if ("no module named 'gftools'" in low or "no module named gftools" in low
             or "could not launch builder" in low or "module specification" in low):
-        return ("broken dependency venv", "the cohort venv is missing its packages — it is rebuilt "
-                "automatically on the next run")
+        return ("broken dependency venv", "the cohort venv had a failed install — it's rebuilt from "
+                "scratch and re-attempted automatically each time you start the build")
     if "missing system library" in low:
         return ("missing system library", "a package built from source needs a native -dev library "
                 "(e.g. apt install libcairo2-dev pkg-config) — self-heal can't install system pkgs")
@@ -291,6 +291,16 @@ def categorize_failure(error: str):
     if "builder" in low or "fontmake" in low or "fontc" in low or "gftools" in low:
         return ("build error", "the source or build tooling failed — open the family log")
     return ("other", "open the family log for details")
+
+
+# Failure causes that a fresh attempt can plausibly clear (a rebuilt venv, a retried clone, an
+# updated mirror, …) — these are RE-ATTEMPTED automatically on the next build, so the system heals
+# itself instead of treating "failed" as terminal. Genuine build errors and unreachable repos are
+# NOT here (they'd just re-fail slowly); the explicit `retry_failed` option re-attempts those too.
+AUTO_RETRY_CATEGORIES = {
+    "broken dependency venv", "dependency install failed", "transient fetch error",
+    "stale archive mirror", "repo not mirrored", "internal/transient I/O", "missing system library",
+}
 
 
 def _clone_mirror_once(url: str, dest: str, timeout: int,
@@ -1020,6 +1030,8 @@ class Orchestrator:
                                        # is cumulative across reopen/resume, not reset to 0)
         self.disk_baseline = self._disk_used()
         self._build_total = 0                        # build-dir total bytes; refreshed off-thread
+        self._enqueued = 0                            # families queued this run; how many are retries
+        self._enqueued_retries = 0
         self.failures: List[str] = []
         self.workers: List[threading.Thread] = []
         self._wid_counter = 0                    # monotonic worker ids (no collisions on respawn)
@@ -1233,7 +1245,7 @@ class Orchestrator:
     # ---- scheduling
     def _enqueue(self):
         only = set(self.args.only.split(",")) if self.args.only else None
-        todo = []
+        todo, retries = [], 0
         for slug, fam in self.families.items():
             if only and slug not in only:
                 continue
@@ -1241,9 +1253,18 @@ class Orchestrator:
             if prev and not self.args.rebuild:
                 if prev.status == "built":
                     continue
-                if prev.status == "failed" and not self.args.retry_failed:
-                    continue
+                if prev.status == "failed":
+                    # Self-heal: re-attempt a failure whose cause a fresh try can clear (rebuilt
+                    # venv, retried clone, …). Keep genuine build errors / unreachable repos unless
+                    # the user forces it with retry_failed. This is what makes the failure hints
+                    # honest — the family is actually retried, not silently skipped.
+                    cat, _ = categorize_failure(prev.error or "")
+                    if not (self.args.retry_failed or cat in AUTO_RETRY_CATEGORIES):
+                        continue
+                    retries += 1
             todo.append(slug)
+        self._enqueued = len(todo)
+        self._enqueued_retries = retries
 
         def weight(slug):
             prev = self.results.get(slug)
@@ -1378,7 +1399,7 @@ class Orchestrator:
                 "jobs": self.args.jobs, "percent": self.args.percent,
                 "timeout": self.args.timeout, "populate_archive": bool(self.args.populate_archive),
                 "manage_venvs": bool(self.args.manage_venvs), "compare": bool(self.args.compare),
-                "only": self.args.only,
+                "retry_failed": bool(self.args.retry_failed), "only": self.args.only,
             }
         return {
             "elapsed": self._resumed_elapsed + (time.time() - self.start_time),
@@ -1816,7 +1837,8 @@ class Orchestrator:
                 self._task_done(
                     "discover",
                     f"{self.q.qsize()} queued of {len(fams)} selected "
-                    f"({self.args.percent:g}%; {total} with source, {skipped} skipped)")
+                    + (f"(incl. {self._enqueued_retries} retries) " if self._enqueued_retries else "")
+                    + f"({self.args.percent:g}%; {total} with source, {skipped} skipped)")
 
             # ---- DYNAMIC PIPELINE: archive pre-warm + builds run CONCURRENTLY (no barriers) ----
             # The workers are self-sufficient: each one mirrors-on-demand, assigns its cohort, and
@@ -1893,8 +1915,20 @@ class Orchestrator:
                     if at is not None and at.status == "running":
                         self._task_done("archive", "stopped (build finished)")
             elif self._task("build") is not None and self._task("build").status == "pending":
-                done_note = ("nothing to build" if not self.families
-                             else "nothing new to build (already built / filtered out)")
+                if not self.families:
+                    done_note = "nothing to build (no families discovered)"
+                else:
+                    with self.lock:
+                        built = sum(1 for s in self.families if s in self.results
+                                    and self.results[s].status == "built")
+                        failed = sum(1 for s in self.families if s in self.results
+                                     and self.results[s].status == "failed")
+                    if failed:                       # all failures here were non-retryable causes
+                        done_note = (f"nothing queued: {built} already built, {failed} failed with "
+                                     f"non-retryable causes — turn on 'retry failed' to force them, "
+                                     f"or raise % to add more families")
+                    else:
+                        done_note = f"nothing to build: all {built} selected families already built"
                 self._task_done("build", done_note)
         except Exception as e:
             with self.lock:
@@ -2084,6 +2118,8 @@ class CursesFrontend(Frontend):
         {"key": "populate_archive", "label": "populate archive (fetch repos)", "type": "bool",
          "live": True},
         {"key": "manage_venvs", "label": "cohort venvs", "type": "bool", "live": False},
+        {"key": "retry_failed", "label": "retry ALL failed (incl. genuine errors)", "type": "bool",
+         "live": False},
         {"key": "compare", "label": "compare to shipped", "type": "bool", "live": True,
          "show_if": lambda v: v.get("source") == "metadata"},
     ]
@@ -2207,6 +2243,8 @@ class CursesFrontend(Frontend):
         "timeout": "per-build timeout in seconds (0 = never time out)",
         "populate_archive": "mirror any missing upstream repos into the archive while building",
         "manage_venvs": "create & share one venv per dependency cohort",
+        "retry_failed": "also re-attempt families that failed with genuine build errors (fixable "
+                        "causes — broken venvs, transient fetches — are always retried)",
         "compare": "sha256-compare each built font to the shipped one (metadata source only)",
     }
 
@@ -3306,7 +3344,8 @@ def main():
                     "archive": str(archive), "build_dir": str(build_dir), "backend": args.backend,
                     "fontc_bin": args.fontc_bin or "", "jobs": args.jobs, "percent": args.percent,
                     "timeout": args.timeout, "populate_archive": bool(args.populate_archive),
-                    "manage_venvs": bool(args.manage_venvs), "compare": bool(args.compare)}
+                    "manage_venvs": bool(args.manage_venvs), "compare": bool(args.compare),
+                    "retry_failed": bool(args.retry_failed)}
         fe = CursesFrontend(SetupState(init_cfg, build_dir, cfg_path))
         fe.setup = True
         try:
@@ -3328,6 +3367,7 @@ def main():
             args.timeout = edited.get("timeout")        # already None when 0
             args.populate_archive = edited["populate_archive"]
             args.manage_venvs = edited["manage_venvs"]
+            args.retry_failed = bool(edited.get("retry_failed", args.retry_failed))
             args.compare = edited.get("compare", False) and args.source == "metadata"
             need_gf_clone = args.source == "metadata" and not (gf and (gf / "ofl").is_dir())
 

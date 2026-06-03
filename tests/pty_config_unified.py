@@ -65,15 +65,15 @@ fe = g.CursesFrontend(g.SetupState(cfg, "/b", "/cfg")); fe.setup = True
 r = fe.run()
 print("RESULT=" + repr(r), file=sys.stderr); sys.stderr.flush()
 '''
-DOWN = b"\x1bOB"        # application-keypad down-arrow (what curses keypad expects); \x1b[B is raw
-# render shows the full editable form (fields + ▶ Start build), and ↓ x13 + Enter reaches Start
-txt = run_pty(SETUP, [DOWN] * 13 + [b"\r"], settle=3)
+UP = b"\x1bOA"          # application-keypad up-arrow; "▶ Start build" is always 2nd-from-last
+# (before "Cancel"), so UP x2 from the first field reaches it regardless of how many fields show
+txt = run_pty(SETUP, [UP, UP, b"\r"], settle=3)
 assert "Configuration" in txt, txt[-400:]
 assert "Start build" in txt and "google/fonts" in txt and "percent of library" in txt, txt[-600:]
 print("setup renders the full editable Configuration form")
 assert "RESULT={" in txt, "arrow navigation to ▶ Start failed:\n" + txt[-500:]
 assert "'source': 'metadata'" in txt and "'jobs': 8" in txt, txt[-400:]
-print("↓-navigation reaches ▶ Start, which returns the typed config")
+print("↑-navigation reaches ▶ Start, which returns the typed config")
 
 # ---- q cancels setup -> None ----
 txt2 = run_pty(SETUP, [b"q"], settle=2)

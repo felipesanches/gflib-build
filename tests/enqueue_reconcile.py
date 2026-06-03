@@ -20,40 +20,66 @@ args = types.SimpleNamespace(
     keep_work=False, keep_fonts=True, mirror_missing=False, _want_build_fontc=False, _data_dir=d)
 o = g.Orchestrator(args)
 
-# this run's worklist: 2 families (one of which carries a stale 'queued' from before)
-fams = [g.Family("ofl/a", "A", "u", "c", None, False, []),
-        g.Family("ofl/b", "B", "u", "c", None, False, [])]
+# this run's worklist (in self.families): includes failures with both fixable and genuine causes
+fams = [g.Family(s, s, "u", "c", None, False, []) for s in
+        ("ofl/a", "ofl/venvfail", "ofl/transient", "ofl/builderr", "ofl/unreachable")]
 o.families = {f.slug: f for f in fams}
 o.results = {
-    "ofl/a": g.Result(slug="ofl/a", status="queued"),       # in worklist → re-queued
-    "ofl/old1": g.Result(slug="ofl/old1", status="queued"),    # stale, not in worklist → skipped
-    "ofl/old2": g.Result(slug="ofl/old2", status="building"),  # stale in-flight → skipped
-    "ofl/done": g.Result(slug="ofl/done", status="built"),     # keep
-    "ofl/bad": g.Result(slug="ofl/bad", status="failed"),      # keep
+    "ofl/a": g.Result(slug="ofl/a", status="queued"),            # in worklist → re-queued
+    # failed families IN the worklist, with different causes:
+    "ofl/venvfail": g.Result(slug="ofl/venvfail", status="failed",
+                             error="fontmake: ... No module named 'gftools'"),    # fixable → retry
+    "ofl/transient": g.Result(slug="ofl/transient", status="failed",
+                              error="mirror clone failed: fatal: fetch-pack: invalid index-pack output"),
+    "ofl/builderr": g.Result(slug="ofl/builderr", status="failed",
+                             error="gftools.builder exit 1: KeyError 'instances'"),  # genuine → keep
+    "ofl/unreachable": g.Result(slug="ofl/unreachable", status="failed",
+                                error="mirror clone failed: remote: Repository not found"),  # keep
+    # stale in-flight from a prior run, NOT in this worklist:
+    "ofl/old1": g.Result(slug="ofl/old1", status="queued"),
+    "ofl/old2": g.Result(slug="ofl/old2", status="building"),
+    "ofl/done": g.Result(slug="ofl/done", status="built"),       # not in worklist → untouched
 }
 
 o._enqueue()
 
+# auto-retry: fixable failures (broken venv, transient fetch) are re-queued; genuine build errors
+# and unreachable repos are kept failed (no retry_failed flag set)
 assert o.results["ofl/a"].status == "queued", o.results["ofl/a"].status
-assert o.results["ofl/b"].status == "queued", o.results["ofl/b"].status
-assert o.results["ofl/old1"].status == "skipped", o.results["ofl/old1"].status
-assert o.results["ofl/old1"].note == "not selected this run", o.results["ofl/old1"].note
-assert o.results["ofl/old2"].status == "skipped", o.results["ofl/old2"].status
-assert o.results["ofl/done"].status == "built", "built must be preserved"
-assert o.results["ofl/bad"].status == "failed", "failed must be preserved"
-print("stale queued/building reconciled to skipped; built/failed preserved")
+assert o.results["ofl/venvfail"].status == "queued", "broken-venv failure must be retried"
+assert o.results["ofl/transient"].status == "queued", "transient fetch failure must be retried"
+assert o.results["ofl/builderr"].status == "failed", "genuine build error must NOT auto-retry"
+assert o.results["ofl/unreachable"].status == "failed", "unreachable repo must NOT auto-retry"
+print("auto-retry: fixable failures re-queued; genuine/unreachable kept failed")
+assert o._enqueued_retries == 2, o._enqueued_retries
+print(f"retry count exposed for the UI: {o._enqueued_retries}")
+
+# stale in-flight (not in worklist) reconciled to skipped; out-of-worklist built untouched
+assert o.results["ofl/old1"].status == "skipped" and o.results["ofl/old1"].note == "not selected this run"
+assert o.results["ofl/old2"].status == "skipped"
+assert o.results["ofl/done"].status == "built"
+print("stale queued/building reconciled to skipped; out-of-worklist built preserved")
 
 qitems = []
 while not o.q.empty():
     qitems.append(o.q.get())
-assert set(qitems) == {"ofl/a", "ofl/b"}, qitems
-print("work queue holds exactly this run's worklist:", sorted(qitems))
+assert set(qitems) == {"ofl/a", "ofl/venvfail", "ofl/transient"}, qitems
+print("work queue holds the worklist + retried failures:", sorted(qitems))
 
-# the snapshot's queued count now reflects only real pending work (2), with no stale ghosts
 snap = o.snapshot()
-assert snap["counts"]["queued"] == 2, snap["counts"]
-assert snap["counts"]["skipped"] == 2, snap["counts"]
-assert snap["counts"]["built"] == 1 and snap["counts"]["failed"] == 1, snap["counts"]
+assert snap["counts"]["queued"] == 3, snap["counts"]
+assert snap["counts"]["failed"] == 2, snap["counts"]          # only the genuine ones remain failed
+assert snap["counts"]["skipped"] == 2 and snap["counts"]["built"] == 1, snap["counts"]
 print("snapshot counts coherent:", snap["counts"])
 
-print("\nENQUEUE-RECONCILE OK")
+# --- with retry_failed, even genuine build errors are re-attempted ---
+o2 = g.Orchestrator(args)
+o2.args.retry_failed = True
+o2.families = {f.slug: f for f in fams}
+o2.results = {"ofl/builderr": g.Result(slug="ofl/builderr", status="failed",
+                                       error="gftools.builder exit 1: KeyError")}
+o2._enqueue()
+assert o2.results["ofl/builderr"].status == "queued", "retry_failed must re-attempt genuine errors too"
+print("retry_failed forces genuine build errors to retry as well")
+
+print("\nENQUEUE-RECONCILE + AUTO-RETRY OK")
