@@ -1857,6 +1857,8 @@ class CursesFrontend(Frontend):
         try:
             import curses
         except Exception as e:
+            if getattr(self, "setup", False):
+                raise                                 # main falls back to the plain setup confirm
             print(f"curses unavailable ({e}); using --ui plain.", file=sys.stderr)
             return PlainFrontend(self.orch).run()
         try:
@@ -1864,8 +1866,10 @@ class CursesFrontend(Frontend):
         except locale.Error:
             pass
         try:
-            return curses.wrapper(self._draw)        # "reconfigure" if the user pressed C, else None
+            return curses.wrapper(self._draw)        # config dict (▶ Start) / "reconfigure" (C) / None
         except Exception as e:
+            if getattr(self, "setup", False):
+                raise                                 # the plain setup path can't run via Plain UI
             print(f"curses error ({e}); switching to plain output.", file=sys.stderr)
             return PlainFrontend(self.orch).run()
 
@@ -1879,17 +1883,32 @@ class CursesFrontend(Frontend):
     ASCII = {"pending": "..", "running": ">>", "done": "OK", "failed": "XX", "skipped": "--"}
     VIEWS = ("config", "overview", "cohorts", "failures", "stats")
 
-    # editable-live fields shown in the Configuration tab (applied to the running build)
-    CFG_EDITABLE = [
-        {"key": "percent", "label": "percent of library", "type": "stepnum",
-         "step": 5, "min": 1, "max": 100},
-        {"key": "jobs", "label": "parallel jobs", "type": "int", "step": 1, "min": 1, "max": 256},
+    # Full config schema for the ONE Configuration tab (first-run setup AND live editing).
+    # `live`=True fields can change on a running build; the rest need a restart.
+    CONFIG_SCHEMA = [
+        {"key": "source", "label": "worklist source", "type": "choice",
+         "choices": ["metadata", "archive"], "live": False},
+        {"key": "google_fonts", "label": "google/fonts clone", "type": "path", "live": False,
+         "show_if": lambda v: v.get("source") == "metadata"},
+        {"key": "archive", "label": "repo archive", "type": "path", "live": False},
+        {"key": "build_dir", "label": "build output dir", "type": "path", "live": False},
         {"key": "backend", "label": "build backend", "type": "choice",
-         "choices": ["auto", "fontc", "fontmake", "both"]},
-        {"key": "timeout", "label": "per-build timeout (s, 0=off)", "type": "int",
-         "step": 30, "min": 0, "max": 100000},
-        {"key": "populate_archive", "label": "populate archive (fetch repos)", "type": "bool"},
-        {"key": "compare", "label": "compare to shipped", "type": "bool"},
+         "choices": ["auto", "fontc", "fontmake", "both"], "live": True},
+        {"key": "fontc_bin", "label": "fontc binary", "type": "path", "live": False,
+         "show_if": lambda v: v.get("backend") != "fontmake"},
+        {"key": "build_fontc", "label": "build fontc from source (if none)", "type": "bool",
+         "live": False, "show_if": lambda v: v.get("backend") != "fontmake" and not v.get("fontc_bin")},
+        {"key": "jobs", "label": "parallel jobs", "type": "stepnum", "step": 1, "min": 1,
+         "max": 256, "live": True},
+        {"key": "percent", "label": "percent of library", "type": "stepnum", "step": 5,
+         "min": 1, "max": 100, "live": True},
+        {"key": "timeout", "label": "per-build timeout (0=off)", "type": "stepnum", "step": 30,
+         "min": 0, "max": 100000, "live": True},
+        {"key": "populate_archive", "label": "populate archive (fetch repos)", "type": "bool",
+         "live": True},
+        {"key": "manage_venvs", "label": "cohort venvs", "type": "bool", "live": False},
+        {"key": "compare", "label": "compare to shipped", "type": "bool", "live": True,
+         "show_if": lambda v: v.get("source") == "metadata"},
     ]
 
     @staticmethod
@@ -1901,45 +1920,106 @@ class CursesFrontend(Frontend):
             cfg = load_config(Path(snap["config_path"]))
         return cfg
 
-    @staticmethod
-    def _cfg_disp(f: dict, eff) -> str:
-        if f["key"] == "timeout":
-            return "off" if not eff else f"{int(eff)}s"
-        if eff is None:
-            return "—"                                # unset (don't print a bare "None")
-        if f["type"] == "bool":
-            return "yes" if eff else "no"
-        if f["type"] == "choice":
-            return str(eff)
-        if f["key"] == "percent":
-            return f"{eff:g}%" if isinstance(eff, (int, float)) else f"{eff}%"
-        return str(eff)
+    @classmethod
+    def _cfg_init_fields(cls, cfg: dict) -> list:
+        """Build editable field descriptors (value string + caret) from a config dict."""
+        fields = []
+        for sc in cls.CONFIG_SCHEMA:
+            f = dict(sc)
+            v = cfg.get(f["key"])
+            if f["type"] == "bool":
+                f["value"] = bool(v)
+            elif f["type"] == "choice":
+                f["value"] = v if v in f["choices"] else f["choices"][0]
+            else:                                     # path / stepnum (edited as text)
+                if f["key"] == "timeout":
+                    v = 0 if not v else int(v)
+                f["value"] = "" if v is None else (f"{v:g}" if isinstance(v, float) else str(v))
+                f["_caret"] = len(f["value"])
+            fields.append(f)
+        return fields
 
     @staticmethod
-    def _cfg_edit_key(f: dict, eff, ch: int):
-        """New value for field `f` from a keypress, or None if the key doesn't edit it."""
+    def _cfg_typed(fields: list) -> dict:
+        out = {}
+        for f in fields:
+            t, v = f["type"], f["value"]
+            if t == "bool":
+                out[f["key"]] = bool(v)
+            elif t == "choice":
+                out[f["key"]] = v
+            elif t == "stepnum":
+                try:
+                    x = float(v)
+                except (TypeError, ValueError):
+                    x = 0.0
+                out[f["key"]] = int(x) if x == int(x) else x
+            else:
+                out[f["key"]] = v
+        if out.get("timeout") in (0, 0.0):
+            out["timeout"] = None                     # 0 → no timeout
+        return out
+
+    @staticmethod
+    def _cfg_visible(fields: list, vals: dict) -> list:
+        return [f for f in fields if "show_if" not in f or f["show_if"](vals)]
+
+    @staticmethod
+    def _cfg_field_key(f: dict, ch: int):
+        """Edit field `f` from a keypress (wizard-style: ←/→ caret/step/cycle, type, space).
+        Returns 'advance' on Enter (move to next field), else None."""
+        import curses
         t = f["type"]
         if t == "bool":
-            return (not bool(eff)) if ch == ord(" ") else None
+            if ch in (ord(" "), 10, 13):
+                f["value"] = not f["value"]
+            return None
         if t == "choice":
-            if ch == ord(" "):
-                ch_list = f["choices"]
-                i = ch_list.index(eff) if eff in ch_list else 0
-                return ch_list[(i + 1) % len(ch_list)]
+            ci = f["choices"].index(f["value"]) if f["value"] in f["choices"] else 0
+            if ch in (ord(" "), curses.KEY_RIGHT):
+                f["value"] = f["choices"][(ci + 1) % len(f["choices"])]
+            elif ch == curses.KEY_LEFT:
+                f["value"] = f["choices"][(ci - 1) % len(f["choices"])]
+            elif ch in (10, 13):
+                return "advance"
             return None
-        # numeric (stepnum / int): +/- adjust
-        if ch in (ord("+"), ord("=")):
-            d = f.get("step", 1)
-        elif ch == ord("-"):
-            d = -f.get("step", 1)
-        else:
-            return None
-        cur = float(eff) if isinstance(eff, (int, float)) else 0.0
-        cur = max(f.get("min", 0), min(f.get("max", 10 ** 9), cur + d))
-        return int(cur)
+        cur = f.get("_caret", len(f["value"]))        # path / stepnum text
+        if t == "stepnum" and ch in (curses.KEY_LEFT, curses.KEY_RIGHT):
+            step = f.get("step", 5) * (1 if ch == curses.KEY_RIGHT else -1)
+            try:
+                x = float(f["value"] or 0)
+            except ValueError:
+                x = 0.0
+            x = max(f.get("min", 0), min(f.get("max", 10 ** 9), x + step))
+            f["value"] = f"{x:g}"
+            f["_caret"] = len(f["value"])
+        elif ch == curses.KEY_LEFT:
+            f["_caret"] = max(0, cur - 1)
+        elif ch == curses.KEY_RIGHT:
+            f["_caret"] = min(len(f["value"]), cur + 1)
+        elif ch == curses.KEY_HOME:
+            f["_caret"] = 0
+        elif ch == curses.KEY_END:
+            f["_caret"] = len(f["value"])
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            if cur > 0:
+                f["value"] = f["value"][:cur - 1] + f["value"][cur:]
+                f["_caret"] = cur - 1
+        elif ch == curses.KEY_DC:
+            if cur < len(f["value"]):
+                f["value"] = f["value"][:cur] + f["value"][cur + 1:]
+        elif ch in (10, 13):
+            return "advance"
+        elif 32 <= ch < 127:
+            c = chr(ch)
+            if t in ("text", "path") or (t == "stepnum" and (c.isdigit() or c == ".")):
+                f["value"] = f["value"][:cur] + c + f["value"][cur:]
+                f["_caret"] = cur + 1
+        return None
 
     def _nav_items(self, view: str, snap: dict) -> list:
-        """The selectable list for a view (↑/↓ moves the selection; ↵ opens its detail)."""
+        """The selectable list for a view (↑/↓ moves the selection; ↵ opens its detail).
+        The config tab manages its own field navigation, so it has no generic nav list."""
         if view == "overview":
             return snap.get("tasks", [])
         if view == "cohorts":
@@ -1948,9 +2028,16 @@ class CursesFrontend(Frontend):
             return snap.get("failures_recent", [])
         if view == "stats":
             return sorted(snap.get("op_stats", {}).items(), key=lambda kv: -kv[1]["total"])
-        if view == "config":
-            return self.CFG_EDITABLE
         return []
+
+    def _cfg_apply_live(self, cfg_fields: list, snap: dict) -> None:
+        """Live 'apply': write the changed live-editable fields to control.json for the daemon."""
+        new = self._cfg_typed(cfg_fields)
+        live_cfg = self._effective_config(snap)
+        live_keys = {f["key"] for f in self.CONFIG_SCHEMA if f.get("live")}
+        changed = {k: v for k, v in new.items() if k in live_keys and v != live_cfg.get(k)}
+        if changed:
+            write_control(self.orch.build_dir, changed)
 
     def _detail_lines(self, view: str, item) -> List[str]:
         """Full detail for the selected list item, shown in the overlay."""
@@ -2014,88 +2101,90 @@ class CursesFrontend(Frontend):
         SATTR = {"done": GREEN, "failed": RED, "running": YEL, "skipped": curses.A_DIM,
                  "pending": curses.A_NORMAL}
         mon = getattr(self, "monitor", False)
-        view, sel, detail, dscroll = "config", 0, None, 0   # land on Configuration (leftmost)
-        cfg_edit: dict = {}                           # pending live-config edits (config tab)
+        setup = getattr(self, "setup", False)        # pre-build first-run Configuration screen
+        view = "config"                              # land on the Configuration tab (leftmost)
+        sel, detail, dscroll = 0, None, 0
+        cfg_fields = None                            # the editable Configuration fields
+        cfg_active = 0                               # selected field, or the action button
         while True:
-            if self.orch.stop.is_set() and not mon:
+            if self.orch.stop.is_set() and not mon and not setup:
                 break
             snap = self.orch.snapshot()
+            if cfg_fields is None:                   # build the editable fields once, from config
+                cfg_fields = self._cfg_init_fields(self._effective_config(snap))
+            vals = self._cfg_typed(cfg_fields)
+            vis = self._cfg_visible(cfg_fields, vals)
+            actions = ["▶ Start build", "Cancel"] if setup else ["✓ apply changes"]
+            nav_n = len(vis) + len(actions)           # visible fields + action button(s)
+            cfg_active = max(0, min(cfg_active, nav_n - 1))
+            af = vis[cfg_active] if cfg_active < len(vis) else None   # active field (None=action)
+            af_editable = af is not None and (setup or af.get("live"))
+            text_active = af_editable and af["type"] in ("path", "text")  # 'q'/'C' type, not quit
+
             ch = stdscr.getch()
-            if ch in (ord("q"), ord("Q")):
-                if not mon:
+            if ch in (ord("q"), ord("Q")) and not text_active:
+                if not mon and not setup:
                     self.orch.stop.set()
-                break
-            elif ch in (ord("C"), ord("c")):         # back to the setup wizard (full restart)
-                return "reconfigure"
-            elif view == "config" and detail is None and ch in (
-                    ord(" "), ord("+"), ord("="), ord("-"), ord("a"), ord("A"), 10, 13):
-                cfg = self._effective_config(snap)
-                if ch in (ord("a"), ord("A"), 10, 13):    # apply pending edits → write control
-                    if cfg_edit:
-                        payload = dict(cfg_edit)
-                        if "timeout" in payload:          # 0 → None (no timeout)
-                            payload["timeout"] = payload["timeout"] or None
-                        if write_control(self.orch.build_dir, payload):
-                            cfg_edit = {}                 # keep edits if the write failed
-                else:                                     # space / +/- edits the selected field
-                    fields = self.CFG_EDITABLE
-                    if fields and sel < len(fields):
-                        f = fields[sel]
-                        eff = cfg_edit.get(f["key"], cfg.get(f["key"]))
-                        nv = self._cfg_edit_key(f, eff, ch)
-                        if nv is not None:
-                            if nv == cfg.get(f["key"]):
-                                cfg_edit.pop(f["key"], None)   # back to original → not pending
-                            else:
-                                cfg_edit[f["key"]] = nv
-            elif detail is not None:                 # inside the detail overlay
-                if ch in (27, 10, 13, curses.KEY_BACKSPACE, 127, 8, curses.KEY_LEFT):
+                return None
+            elif ch == 9 and not setup:               # Tab → next tab (live only; setup = config only)
+                view = self.VIEWS[(self.VIEWS.index(view) + 1) % len(self.VIEWS)]
+                cfg_active = sel = 0
+            elif ch == curses.KEY_BTAB and not setup:  # Shift-Tab → previous tab
+                view = self.VIEWS[(self.VIEWS.index(view) - 1) % len(self.VIEWS)]
+                cfg_active = sel = 0
+            elif detail is not None:                  # inside the detail overlay
+                if ch in (10, 13, curses.KEY_BACKSPACE, 127, 8):
                     detail = None
                 elif ch == curses.KEY_DOWN:
                     dscroll += 1
                 elif ch == curses.KEY_UP:
                     dscroll = max(0, dscroll - 1)
-            elif ch in (ord("p"), ord("P")):
-                (self.orch.paused.clear if self.orch.paused.is_set() else self.orch.paused.set)()
-            elif ch in (ord("1"),):
-                view, sel = "config", 0
-            elif ch in (ord("2"), ord("o"), ord("O")):
-                view, sel = "overview", 0
-            elif ch in (ord("3"),):
-                view, sel = "cohorts", 0
-            elif ch in (ord("4"),):
-                view, sel = "failures", 0
-            elif ch in (ord("5"),):
-                view, sel = "stats", 0
-            elif ch in (9, curses.KEY_RIGHT):        # Tab / → : next view
-                view = self.VIEWS[(self.VIEWS.index(view) + 1) % len(self.VIEWS)]
-                sel = 0
-            elif ch == curses.KEY_LEFT:              # ← : previous view
-                view = self.VIEWS[(self.VIEWS.index(view) - 1) % len(self.VIEWS)]
-                sel = 0
-            elif ch == curses.KEY_DOWN:              # ↓ : move selection down the list
-                sel += 1
-            elif ch == curses.KEY_UP:                # ↑ : move selection up
-                sel = max(0, sel - 1)
-            elif ch in (10, 13):                     # Enter : open detail for the selected item
-                items = self._nav_items(view, snap)
-                if items:
-                    # snapshot the detail text once (so failure-log tails aren't re-read each frame)
-                    detail = self._detail_lines(view, items[min(sel, len(items) - 1)])
-                    dscroll = 0
+            elif view == "config":                    # --- the unified Configuration editor ---
+                if ch in (ord("c"), ord("C")) and not setup and not text_active:
+                    return "reconfigure"              # live: restart into setup to change paths
+                elif ch == curses.KEY_UP:
+                    cfg_active = (cfg_active - 1) % nav_n
+                elif ch == curses.KEY_DOWN:
+                    cfg_active = (cfg_active + 1) % nav_n
+                elif cfg_active >= len(vis):          # an action button
+                    if ch in (10, 13, ord(" ")):
+                        which = actions[cfg_active - len(vis)]
+                        if which == "Cancel":
+                            return None
+                        if setup:
+                            return self._cfg_typed(cfg_fields)     # main applies + launches
+                        self._cfg_apply_live(cfg_fields, snap)     # write control.json
+                elif af_editable:                     # edit the selected field (wizard-style)
+                    if self._cfg_field_key(af, ch) == "advance":
+                        cfg_active = (cfg_active + 1) % nav_n
+            else:                                     # --- other tabs (read-only list views) ---
+                if ch in (ord("p"), ord("P")):
+                    (self.orch.paused.clear if self.orch.paused.is_set() else self.orch.paused.set)()
+                elif ch in (ord("c"), ord("C")) and not setup:
+                    return "reconfigure"
+                elif ch == curses.KEY_DOWN:
+                    sel += 1
+                elif ch == curses.KEY_UP:
+                    sel = max(0, sel - 1)
+                elif ch in (10, 13):
+                    items = self._nav_items(view, snap)
+                    if items:
+                        detail = self._detail_lines(view, items[min(sel, len(items) - 1)])
+                        dscroll = 0
 
-            # re-snapshot after the keypress so the view reflects the latest state + clamp sel
             snap = self.orch.snapshot()
-            items = self._nav_items(view, snap)
-            sel = max(0, min(sel, len(items) - 1)) if items else 0
+            if view != "config":
+                items = self._nav_items(view, snap)
+                sel = max(0, min(sel, len(items) - 1)) if items else 0
             c, bk = snap["counts"], snap["backends"]
             h, w = stdscr.getmaxyx()
             stdscr.erase()
+            cfg_cursor = None                         # caret to show for an active text field
 
             def put(y, x, s, attr=0):
-                if 0 <= y < h and 0 <= x < w:
+                if 0 <= y < h and 0 <= x < w and w - x - 1 > 0:
                     try:
-                        stdscr.addnstr(y, x, str(s), max(0, w - x - 1), attr)
+                        stdscr.addnstr(y, x, str(s), w - x - 1, attr)
                     except curses.error:
                         pass
 
@@ -2103,38 +2192,40 @@ class CursesFrontend(Frontend):
             done = c["built"] + c["failed"]
             ph = snap["phase"]
             plabel = self.PHASE_LABEL.get(ph, ph)
+            pre_build = bool(snap.get("pre_build")) or setup
             # header
             put(0, 0, " Google Fonts library build" + (" [PAUSED]" if snap["paused"] else ""),
                 curses.A_BOLD)
-            put(0, max(0, w - 24), f"elapsed {hms(snap['elapsed'])}", curses.A_BOLD)
-            put(1, 0, f" disk +{human(snap['disk_used_delta'])}  free {human(snap['disk_free'])}  "
-                      f"jobs {snap['jobs']}  cohorts {len(snap['cohorts'])}  "
-                      f"fontc {bk['fontc']}/fontmake {bk['fontmake']}", CYAN)
-            # phase banner + progress
-            phasey = ph in ("archive", "cohorts") and snap["phase_total"]
-            if phasey:
-                pd, pt = snap["phase_done"], snap["phase_total"]
-                put(2, 0, f" Phase: {plabel}  {pd}/{pt}  {snap['phase_label'][:30]}",
-                    YEL | curses.A_BOLD)
-                frac = pd / max(1, pt)
+            if pre_build:
+                put(0, max(0, w - 18), "first-time setup", curses.A_DIM)
+                put(1, 0, " configure your build below, then navigate to ▶ Start build", CYAN)
             else:
-                put(2, 0, f" Phase: {plabel}   built {c['built']}/{grand}  failed {c['failed']}  "
-                          f"building {c['building']}  queued {c['queued']}", curses.A_BOLD)
-                frac = done / grand
-            if snap["phase_error"]:
-                put(2, max(0, w - 30), f"ERR {snap['phase_error'][:24]}", RED)
-            barw = max(10, w - 4)
-            fill = int(barw * frac)
-            put(3, 1, "[" + "#" * fill + "-" * (barw - fill) + "]")
-            put(3, max(2, barw // 2), f" {int(100 * frac)}% ", curses.A_BOLD)
-            # tabs
+                put(0, max(0, w - 24), f"elapsed {hms(snap['elapsed'])}", curses.A_BOLD)
+                put(1, 0, f" disk +{human(snap['disk_used_delta'])}  free {human(snap['disk_free'])}  "
+                          f"jobs {snap['jobs']}  cohorts {len(snap['cohorts'])}  "
+                          f"fontc {bk['fontc']}/fontmake {bk['fontmake']}", CYAN)
+                # phase banner + progress
+                if ph in ("archive", "cohorts") and snap["phase_total"]:
+                    pd, pt = snap["phase_done"], snap["phase_total"]
+                    put(2, 0, f" Phase: {plabel}  {pd}/{pt}  {snap['phase_label'][:30]}",
+                        YEL | curses.A_BOLD)
+                    frac = pd / max(1, pt)
+                else:
+                    put(2, 0, f" Phase: {plabel}   built {c['built']}/{grand}  failed {c['failed']}  "
+                              f"building {c['building']}  queued {c['queued']}", curses.A_BOLD)
+                    frac = done / grand
+                if snap["phase_error"]:
+                    put(2, max(0, w - 30), f"ERR {snap['phase_error'][:24]}", RED)
+                barw = max(10, w - 4)
+                fill = int(barw * frac)
+                put(3, 1, "[" + "#" * fill + "-" * (barw - fill) + "]")
+                put(3, max(2, barw // 2), f" {int(100 * frac)}% ", curses.A_BOLD)
+            # tabs — Tab / Shift-Tab are the ONLY way to switch (←→ and numbers edit fields)
             x = 1
-            for lbl, name in (("1 config", "config"), ("2 overview", "overview"),
-                              ("3 cohorts", "cohorts"), ("4 failures", "failures"),
-                              ("5 stats", "stats")):
-                put(4, x, f" {lbl} ", curses.A_REVERSE if view == name else curses.A_DIM)
-                x += len(lbl) + 3
-            put(4, max(x + 2, w - 20), "[←→]tabs [↑↓]select", curses.A_DIM)
+            for name in self.VIEWS:
+                put(4, x, f" {name} ", curses.A_REVERSE if view == name else curses.A_DIM)
+                x += len(name) + 3
+            put(4, max(x + 2, w - 24), "[Tab]/[⇧Tab] switch tabs", curses.A_DIM)
 
             # ---- selected-row renderer: highlights `sel`, auto-scrolls to keep it visible ----
             def draw_list(row0, lst, fmt, color=None):
@@ -2234,54 +2325,75 @@ class CursesFrontend(Frontend):
                 if not ops:
                     put(row, 1, "(timing accrues as builds run)")
             elif view == "config":
-                cfg = self._effective_config(snap)
-                put(row, 0, " Configuration — applied LIVE to the running build ".ljust(w - 1, "-"),
-                    curses.A_BOLD); row += 1
-                for i, f in enumerate(self.CFG_EDITABLE):
-                    pending = f["key"] in cfg_edit
-                    eff = cfg_edit.get(f["key"], cfg.get(f["key"]))
-                    val = self._cfg_disp(f, eff)
-                    a = (curses.A_REVERSE if i == sel else 0) | (YEL if pending else CYAN)
-                    put(row, 1, f"{f['label']:<30} {val}{'   *changed' if pending else ''}", a)
+                live_cfg = self._effective_config(snap)
+                VC = 36                               # value column
+                title = (" Configuration — set up your build "
+                         if pre_build else " Configuration — edit settings (live where possible) ")
+                put(row, 0, title.ljust(w - 1, "-"), curses.A_BOLD); row += 1
+                for i, f in enumerate(vis):
+                    active = (cfg_active == i)
+                    editable = setup or f.get("live")
+                    if f["type"] == "bool":
+                        valstr = "[x] yes" if f["value"] else "[ ] no"
+                    elif f["type"] == "choice":
+                        valstr = f"‹ {f['value']} ›"
+                    else:
+                        valstr = f["value"] or ""
+                    tag = ""
+                    if not pre_build:
+                        if f.get("live") and vals.get(f["key"]) != live_cfg.get(f["key"]):
+                            tag = "  *changed"
+                        elif not f.get("live"):
+                            tag = "  (restart: C)"
+                    lab_attr = curses.A_BOLD if active else (0 if editable else curses.A_DIM)
+                    put(row, 1, ("▸ " if active else "  ") + f["label"], lab_attr)
+                    put(row, VC, valstr + tag,
+                        (curses.A_REVERSE if active else 0) | (0 if editable else curses.A_DIM))
+                    if active and editable and f["type"] not in ("bool", "choice"):
+                        cfg_cursor = (row, VC + min(f.get("_caret", len(f["value"])), len(f["value"])))
                     row += 1
-                row += 1
-                put(row, 0, " read-only — use C to restart & change ".ljust(w - 1, "-"),
-                    curses.A_DIM); row += 1
-                for label, key in (("worklist source", "source"), ("google/fonts", "google_fonts"),
-                                   ("repo archive", "archive"), ("build dir", "build_dir"),
-                                   ("cohort venvs", "manage_venvs")):
-                    v = cfg.get(key)
-                    v = ("yes" if v else "no") if key == "manage_venvs" else (v or "(none)")
-                    put(row, 1, f"{label:<30} {v}", curses.A_DIM); row += 1
+                # action button(s): ▶ Start build / Cancel (setup) or ✓ apply changes (live)
+                bx = 2
+                for ai, actlbl in enumerate(actions):
+                    put(row + 1, bx, f" {actlbl} ",
+                        curses.A_REVERSE if cfg_active == len(vis) + ai else curses.A_BOLD)
+                    bx += len(actlbl) + 4
+                row += 3
                 relax = snap.get("dep_relaxations", [])
-                if relax:
-                    row += 1
+                if relax and row < h - 3:
                     put(row, 0, " auto-fixed dependencies (no manual pinning needed) ".ljust(w - 1, "-"),
                         curses.A_BOLD); row += 1
-                    for ln in relax[:max(0, (h - row) // 2)]:
+                    for ln in relax[:max(0, (h - row) // 3)]:
                         put(row, 1, ln, YEL); row += 1
                 clog = snap.get("control_log", [])
-                if clog:
-                    row += 1
+                if clog and row < h - 3:
                     put(row, 0, " applied live changes ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
                     for ln in clog[-max(0, h - row - 2):]:
                         put(row, 1, ln, GREEN); row += 1
-                if cfg_edit:
-                    put(h - 2, 1, f"pending: {', '.join(cfg_edit)}  —  [↵/a] apply live "
-                                  f"(builds pick it up immediately)", YEL | curses.A_BOLD)
 
             if detail is not None:
-                foot = " [esc/←/↵] back to list   [↑↓] scroll"
+                foot = " [esc/↵] back to list   [↑↓] scroll"
             elif view == "config":
-                foot = " [↑↓]field [space]toggle [+/-]adjust [↵/a]apply-live [C]restart [←→]tabs"
+                foot = (" [↑↓]field  [←→]edit/step  [space]toggle  type to edit  [↵]▶ Start  [Esc]cancel"
+                        if setup else
+                        " [↑↓]field  [←→]edit  [space]toggle  [↵]apply  [C]restart for paths  [Tab]tabs")
             else:
-                foot = (" [q]uit — build runs on  [C]onfigure  [↑↓]select [↵]info [←→]tabs"
-                        if mon else " [q]uit [p]ause  [C]onfigure  [↑↓]select [↵]info")
+                foot = (" [q]uit — build runs on  [C]onfig  [↑↓]select [↵]info [Tab]tabs"
+                        if mon else " [q]uit [p]ause  [C]onfig  [↑↓]select [↵]info")
             if mon and not snap.get("daemon_alive", True):
                 foot = " [q]uit   ⚠ daemon not running (build finished or stopped)"
-            put(h - 1, 0, foot + "   logs: " + str(self.orch.build_dir / "logs"), curses.A_DIM)
+            put(h - 1, 0, foot + ("" if pre_build else "   logs: " + str(self.orch.build_dir / "logs")),
+                curses.A_DIM)
+            try:                                      # show the text caret on an active field
+                if cfg_cursor:
+                    curses.curs_set(1)
+                    stdscr.move(min(cfg_cursor[0], h - 1), min(cfg_cursor[1], w - 1))
+                else:
+                    curses.curs_set(0)
+            except curses.error:
+                pass
             stdscr.refresh()
-            if snap["done"] and not mon:
+            if snap["done"] and not mon and not setup:
                 time.sleep(1.0)
                 break
             time.sleep(0.25)
@@ -2561,171 +2673,30 @@ class MonitorState:
         return self.snapshot().get("done", False)
 
 
-def config_screen(spec, plan_fn):
-    """The first-run **Configuration tab**: an interactive ncurses settings form (there is no
-    separate "wizard"). `spec` is a list of field dicts:
-       {key, label, type: text|path|int|stepnum|bool|choice, value, choices?, step?, min?,
-        max?, show_if?(values)->bool}.
-    Fields are pre-populated with the resolved current settings; the user edits them (editable
-    fields have a movable text cursor; `stepnum` also reacts to ←/→ with ±step; `choice`
-    cycles with ←/→/space; `bool` toggles with space; conditional fields appear/disappear via
-    `show_if`) while a live 'Plan' (plan_fn(values)->[str]) updates. Returns the edited
-    {key: typed value} dict to ▶ Start, or None to cancel. Raises if curses is unusable."""
-    import curses
-    EDIT = ("text", "path", "int", "stepnum")
-    fields = []
-    for f in spec:
-        f = dict(f)
-        if f["type"] in EDIT:
-            f["value"] = str(f["value"])
-            f["_caret"] = len(f["value"])
-        fields.append(f)
-    by_key = {f["key"]: f for f in fields}
-    buttons = ["▶ Start build", "Cancel"]
-    VALCOL = 38
+class SetupState:
+    """Pre-build state: the dashboard runs on the Configuration tab to set up a NEW build (the
+    first-run / reconfigure entry). It just holds the initial config; the config tab edits it
+    and returns the chosen settings to main() on ▶ Start."""
+    def __init__(self, config: dict, build_dir, cfg_path):
+        self.build_dir = Path(build_dir)
+        self.stop = threading.Event()
+        self.paused = threading.Event()
+        self.lock = threading.Lock()
+        self.workers: List = []
+        self.results: Dict = {}
+        self._config = dict(config)
+        self._cfg_path = str(cfg_path or "")
 
-    def typed():
-        out = {}
-        for f in fields:
-            t, v = f["type"], f["value"]
-            if t == "int":
-                out[f["key"]] = int(v) if str(v).strip().lstrip("-").isdigit() else 0
-            elif t == "stepnum":
-                try:
-                    out[f["key"]] = float(v)
-                except (TypeError, ValueError):
-                    out[f["key"]] = 0.0
-            elif t == "bool":
-                out[f["key"]] = bool(v)
-            else:
-                out[f["key"]] = v
-        return out
+    def snapshot(self) -> dict:
+        s = dict(MonitorState._EMPTY)
+        s.update({"config": dict(self._config), "config_path": self._cfg_path,
+                  "pre_build": True, "phase": "config", "daemon_alive": True})
+        return s
 
-    def visible(vals):
-        return [f for f in fields if "show_if" not in f or f["show_if"](vals)]
+    def all_done(self) -> bool:
+        return False
 
-    def form(stdscr):
-        stdscr.keypad(True)
-        active = fields[0]["key"]
-        while True:
-            vals = typed()
-            vis = visible(vals)
-            nav = [f["key"] for f in vis] + buttons
-            if active not in nav:
-                active = nav[0]
-            stdscr.erase()
-            h, w = stdscr.getmaxyx()
-            cursor = None
 
-            def put(y, x, s, a=0):
-                n = w - x - 1
-                if 0 <= y < h and 0 <= x < w and n > 0:      # n=0 at the last column makes
-                    try:                                     # curses raise ERR — guard + catch
-                        stdscr.addnstr(y, x, str(s), n, a)
-                    except curses.error:
-                        pass
-
-            put(0, 0, " Google Fonts library build — Configuration", curses.A_BOLD)
-            put(0, max(0, w - 18), "first-time setup", curses.A_DIM)
-            tx = 1                                     # the dashboard tab bar (config active now)
-            for i, lbl in enumerate(("1 config", "2 overview", "3 cohorts", "4 failures", "5 stats")):
-                put(2, tx, f" {lbl} ", curses.A_REVERSE if i == 0 else curses.A_DIM)
-                tx += len(lbl) + 3
-            put(2, max(tx + 2, w - 26), "(others appear after ▶ Start)", curses.A_DIM)
-            put(3, 0, " set up your build, then ▶ Start   [↑↓/Tab]move  [space]toggle  "
-                      "[←→]cursor/step/cycle  type to edit  [Esc]cancel", curses.A_DIM)
-            row = 5
-            for f in vis:
-                act = active == f["key"]
-                if f["type"] == "bool":
-                    val = "[x] yes" if f["value"] else "[ ] no"
-                    put(row, VALCOL, val, curses.A_REVERSE if act else 0)
-                elif f["type"] == "choice":
-                    put(row, VALCOL, f"‹ {f['value']} ›", curses.A_REVERSE if act else 0)
-                else:
-                    put(row, VALCOL, f["value"] if f["value"] else "")
-                    if act:
-                        cursor = (row, VALCOL + min(f.get("_caret", len(f["value"])), len(f["value"])))
-                put(row, 1, ("▸ " if act else "  ") + f["label"], curses.A_BOLD if act else 0)
-                row += 1
-            row += 1
-            put(row, 0, " Plan ".ljust(max(1, w - 1), "-"), curses.A_BOLD); row += 1
-            for line in plan_fn(vals)[:max(0, h - row - 3)]:
-                put(row, 2, line); row += 1
-            x = 2
-            for b in buttons:
-                put(h - 2, x, f" {b} ", curses.A_REVERSE if active == b else curses.A_BOLD)
-                x += len(b) + 4
-            try:
-                if cursor:
-                    curses.curs_set(1)
-                    stdscr.move(min(cursor[0], h - 1), min(cursor[1], w - 1))
-                else:
-                    curses.curs_set(0)
-            except curses.error:
-                pass
-            stdscr.refresh()
-
-            ch = stdscr.getch()
-            ai = nav.index(active)
-            if ch == 27:
-                return None
-            elif ch == curses.KEY_UP:
-                active = nav[(ai - 1) % len(nav)]
-            elif ch in (curses.KEY_DOWN, 9):
-                active = nav[(ai + 1) % len(nav)]
-            elif active in buttons:
-                if ch in (10, 13, ord(" ")):
-                    return typed() if active == buttons[0] else None
-            else:
-                f = by_key[active]
-                t = f["type"]
-                if t == "bool":
-                    if ch in (ord(" "), 10, 13):
-                        f["value"] = not f["value"]
-                elif t == "choice":
-                    ci = f["choices"].index(f["value"])
-                    if ch in (ord(" "), curses.KEY_RIGHT):
-                        f["value"] = f["choices"][(ci + 1) % len(f["choices"])]
-                    elif ch == curses.KEY_LEFT:
-                        f["value"] = f["choices"][(ci - 1) % len(f["choices"])]
-                    elif ch in (10, 13):
-                        active = nav[(ai + 1) % len(nav)]
-                else:                                     # editable text / int / stepnum
-                    cur = f.get("_caret", len(f["value"]))
-                    if t == "stepnum" and ch in (curses.KEY_LEFT, curses.KEY_RIGHT):
-                        step = f.get("step", 5) * (1 if ch == curses.KEY_RIGHT else -1)
-                        try:
-                            x = float(f["value"] or 0)
-                        except ValueError:
-                            x = 0.0
-                        x = max(f.get("min", 0), min(f.get("max", 100), x + step))
-                        f["value"] = f"{x:g}"; f["_caret"] = len(f["value"])
-                    elif ch == curses.KEY_LEFT:
-                        f["_caret"] = max(0, cur - 1)
-                    elif ch == curses.KEY_RIGHT:
-                        f["_caret"] = min(len(f["value"]), cur + 1)
-                    elif ch == curses.KEY_HOME:
-                        f["_caret"] = 0
-                    elif ch == curses.KEY_END:
-                        f["_caret"] = len(f["value"])
-                    elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                        if cur > 0:
-                            f["value"] = f["value"][:cur - 1] + f["value"][cur:]; f["_caret"] = cur - 1
-                    elif ch == curses.KEY_DC:
-                        if cur < len(f["value"]):
-                            f["value"] = f["value"][:cur] + f["value"][cur + 1:]
-                    elif ch in (10, 13):
-                        active = nav[(ai + 1) % len(nav)]
-                    elif 32 <= ch < 127:
-                        c = chr(ch)
-                        ok = (t == "text" or t == "path"
-                              or (t == "int" and c.isdigit())
-                              or (t == "stepnum" and (c.isdigit() or c == ".")))
-                        if ok:
-                            f["value"] = f["value"][:cur] + c + f["value"][cur:]; f["_caret"] = cur + 1
-
-    return curses.wrapper(form)
 
 
 def config_screen_plain(steps, gf_path, archive, build_dir, args) -> bool:
@@ -2825,23 +2796,6 @@ def build_argparser() -> argparse.ArgumentParser:
     return ap
 
 
-def _plan_lines(gf, archive, src, populate, percent, backend, jobs, manage_venvs, compare):
-    lines = []
-    if src == "metadata":
-        if gf and (gf / "ofl").is_dir():
-            lines.append(f"google/fonts : use existing clone ({gf})")
-        else:
-            lines.append(f"google/fonts : CLONE {GOOGLE_FONTS_URL} → {gf or '(unset!)'}")
-    else:
-        lines.append("worklist     : every mirror in the archive (google/fonts optional)")
-    if populate:
-        lines.append(f"archive      : POPULATE — mirror any missing upstream repos → {archive}")
-    else:
-        lines.append(f"archive      : use as-is ({archive})" + ("" if archive.is_dir() else "  [ABSENT]"))
-    scope = "full library" if percent >= 100 else f"{percent:g}% sample"
-    extra = ("  +venvs" if manage_venvs else "") + ("  +compare" if compare and src == "metadata" else "")
-    lines.append(f"build        : backend={backend}  jobs={jobs}  scope={scope}{extra}")
-    return lines
 
 
 def main():
@@ -2925,75 +2879,36 @@ def main():
     if args.populate_archive:
         steps.append(("populate archive", f"mirror missing upstream repos into {archive}"))
 
-    # ---- first-run Configuration tab (editable ncurses form; no separate "wizard") ----
+    # ---- first-run setup IS the Configuration tab: open the dashboard pre-build, fully
+    #      editable, and launch on ▶ Start (no separate "wizard") ----
     if (steps or args.wizard) and not args.yes and not read_only:
         if not sys.stdin.isatty():
             sys.exit("missing prerequisites (google/fonts clone and/or archive). Re-run with "
                      "--yes to bootstrap non-interactively, or pass --google-fonts/--archive.")
-        spec = [
-            {"key": "source", "label": "worklist source", "type": "choice",
-             "value": args.source, "choices": ["metadata", "archive"]},
-            {"key": "google_fonts", "label": "google/fonts clone", "type": "path",
-             "value": str(gf) if gf else "", "show_if": lambda v: v["source"] == "metadata"},
-            {"key": "archive", "label": "repo archive", "type": "path", "value": str(archive)},
-            {"key": "build_dir", "label": "build output dir", "type": "path", "value": str(build_dir)},
-            {"key": "backend", "label": "build backend", "type": "choice",
-             "value": args.backend, "choices": ["auto", "fontc", "fontmake", "both"]},
-            {"key": "fontc_bin", "label": "fontc binary (auto-detected)", "type": "path",
-             "value": args.fontc_bin or "", "show_if": lambda v: v["backend"] != "fontmake"},
-            {"key": "build_fontc", "label": "build fontc from source (if none)", "type": "bool",
-             "value": False,
-             "show_if": lambda v: v["backend"] != "fontmake" and not v["fontc_bin"]},
-            {"key": "jobs", "label": "parallel jobs", "type": "int", "value": str(args.jobs)},
-            {"key": "percent", "label": "percent of library (←/→ ±5)", "type": "stepnum",
-             "value": f"{args.percent:g}", "step": 5, "min": 1, "max": 100},
-            {"key": "use_timeout", "label": "use per-build timeout", "type": "bool",
-             "value": args.timeout is not None},
-            {"key": "timeout_seconds", "label": "  timeout seconds", "type": "int",
-             "value": str(args.timeout if args.timeout is not None else 1800),
-             "show_if": lambda v: v["use_timeout"]},
-            {"key": "populate_archive", "label": "populate archive (mirror missing)", "type": "bool",
-             "value": bool(args.populate_archive)},
-            {"key": "manage_venvs", "label": "cohort venvs (--manage-venvs)", "type": "bool",
-             "value": bool(args.manage_venvs)},
-            {"key": "compare", "label": "compare to shipped (metadata only)", "type": "bool",
-             "value": bool(args.compare), "show_if": lambda v: v["source"] == "metadata"},
-        ]
-
-        def plan_fn(v):
-            g = Path(v["google_fonts"]) if v.get("google_fonts") else None
-            lines = _plan_lines(g, Path(v["archive"]), v["source"], v["populate_archive"],
-                                v["percent"], v["backend"], v["jobs"], v["manage_venvs"],
-                                v.get("compare", False))
-            if v["backend"] != "fontmake":
-                if v.get("fontc_bin"):
-                    lines.append(f"fontc        : {v['fontc_bin']}")
-                elif v.get("build_fontc"):
-                    lines.append("fontc        : BUILD from source (cargo build --release)")
-                    if not detect_cargo():
-                        lines.append("  ⚠ cargo not found — " + RUST_INSTALL_HINT)
-                else:
-                    lines.append("fontc        : none — 'auto' falls back to fontmake")
-            lines.append("timeout      : " + (f"{v['timeout_seconds']}s"
-                                              if v.get("use_timeout") else "none (stop manually)"))
-            return lines
+        init_cfg = {"source": args.source, "google_fonts": str(gf) if gf else "",
+                    "archive": str(archive), "build_dir": str(build_dir), "backend": args.backend,
+                    "fontc_bin": args.fontc_bin or "", "jobs": args.jobs, "percent": args.percent,
+                    "timeout": args.timeout, "populate_archive": bool(args.populate_archive),
+                    "manage_venvs": bool(args.manage_venvs), "compare": bool(args.compare)}
+        fe = CursesFrontend(SetupState(init_cfg, build_dir, cfg_path))
+        fe.setup = True
         try:
-            edited = config_screen(spec, plan_fn)
+            edited = fe.run()                           # typed config dict (▶ Start) or None
         except Exception:                               # curses unusable → plain confirm
             edited = {} if config_screen_plain(steps, gf, archive, build_dir, args) else None
         if edited is None:
             sys.exit("aborted.")
-        if edited:                                      # apply the user's edits
+        if isinstance(edited, dict) and edited:         # apply the chosen settings
             args.source = edited["source"]
             gf = Path(edited["google_fonts"]) if edited.get("google_fonts") else None
-            archive = Path(edited["archive"])
-            build_dir = Path(edited["build_dir"])
+            archive = Path(edited["archive"]) if edited.get("archive") else archive
+            build_dir = Path(edited["build_dir"]) if edited.get("build_dir") else build_dir
             args.backend = edited["backend"]
             args.fontc_bin = edited.get("fontc_bin") or None
             want_build_fontc = bool(edited.get("build_fontc")) and args.backend != "fontmake"
-            args.jobs = max(1, edited["jobs"])
+            args.jobs = max(1, int(edited["jobs"]))
             args.percent = edited["percent"]
-            args.timeout = int(edited["timeout_seconds"]) if edited.get("use_timeout") else None
+            args.timeout = edited.get("timeout")        # already None when 0
             args.populate_archive = edited["populate_archive"]
             args.manage_venvs = edited["manage_venvs"]
             args.compare = edited.get("compare", False) and args.source == "metadata"

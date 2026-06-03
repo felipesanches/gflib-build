@@ -46,11 +46,11 @@ json.dump({"percent": 25.0, "jobs": 8, "backend": "fontc", "timeout": None,
           open(cfgf, "w"))
 eff = g.CursesFrontend._effective_config({"config": {}, "config_path": cfgf})
 assert eff["percent"] == 25.0 and eff["jobs"] == 8 and eff["backend"] == "fontc", eff
-# and the display never prints a bare "None"
-for f in g.CursesFrontend.CFG_EDITABLE:
-    s = g.CursesFrontend._cfg_disp(f, None)
-    assert s != "None" and "None" not in s, (f["key"], s)
+# the editable fields initialise from the config (no bare "None" values)
+fields = g.CursesFrontend._cfg_init_fields(eff)
+for f in fields:
+    assert "None" not in str(f["value"]), (f["key"], f["value"])
 os.unlink(cfgf)
-print("config: falls back to persisted settings; no bare 'None' in display")
+print("config: falls back to persisted settings; fields initialise without bare 'None'")
 
 print("\nRESET+CONFIG OK")
