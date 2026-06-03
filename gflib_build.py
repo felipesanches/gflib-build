@@ -306,6 +306,10 @@ def categorize_failure(error: str):
         return ("internal/transient I/O", "a transient filesystem error — usually clears on re-run")
     if "timed out" in low or "timeout" in low:
         return ("build timed out", "raise or disable the per-build timeout")
+    if "names don't match shipped" in low or "produced no expected font files" in low:
+        return ("output name mismatch", "the build ran but produced none of the shipped filenames — "
+                "the upstream source builds different names/axes than google/fonts ships (compare "
+                "the built names against METADATA.pb)")
     if "builder" in low or "fontmake" in low or "fontc" in low or "gftools" in low:
         return ("build error", "the source or build tooling failed — open the family log")
     return ("other", "open the family log for details")
@@ -1019,30 +1023,50 @@ def _last_error_line(log_path: Path) -> str:
     return lines[-1].strip()[:200] if lines else ""
 
 
-def collect_outputs(work: Path, out_dir: Path, shipped: List[str]):
-    found: Dict[str, Path] = {}
+def collect_outputs(work: Path, out_dir: Path, shipped: List[str], since: float = 0.0):
+    """Copy the freshly-built fonts whose filename matches a shipped binary into out_dir.
+
+    Searches the work tree RECURSIVELY — gftools-builder writes to whatever `outputDir` the config
+    sets (often a family-specific subdir like fonts/<Family>/variable/, NOT one of a fixed shallow
+    list), so a shallow scan missed successfully-built fonts and reported 'produced no expected font
+    files'. To avoid picking up binaries the repo SHIPS in its tree, only fonts modified during this
+    build are considered (mtime >= since; `git archive` stamps extracted files with the old commit
+    date, so committed fonts are far older). `since=0` disables the time filter (recursive only).
+
+    Returns (total_bytes, {name: path}, extras) where `extras` are freshly-built fonts whose name
+    matches NO shipped name — a naming mismatch (e.g. different axis set), distinct from a real
+    no-output failure."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    found: Dict[str, Path] = {}
+    extras: List[str] = []
     total = 0
     want = set(shipped)
-    for sub in FONT_SUBDIRS:
-        d = work / sub
-        if not d.is_dir():
+    cutoff = (since - 30) if since else 0.0       # generous slack; committed fonts are months older
+    seen = set()
+    for f in sorted(set(work.rglob("*.ttf")) | set(work.rglob("*.otf"))
+                    | set(work.rglob("*.TTF")) | set(work.rglob("*.OTF"))):
+        try:
+            if not f.is_file():
+                continue
+            if cutoff and f.stat().st_mtime < cutoff:
+                continue                           # a committed/extracted binary, not a fresh build
+        except OSError:
             continue
-        for f in sorted(d.iterdir()):
-            if not f.is_file() or f.suffix.lower() not in (".ttf", ".otf"):
-                continue
-            if want and f.name not in want:
-                continue
-            if f.name in found:
-                continue
-            dst = out_dir / f.name
-            try:
-                shutil.copyfile(f, dst)
-                total += dst.stat().st_size
-                found[f.name] = dst
-            except OSError:
-                pass
-    return total, found
+        name = f.name
+        if want and name not in want:
+            if name not in seen:
+                extras.append(name); seen.add(name)
+            continue
+        if name in found:
+            continue
+        dst = out_dir / name
+        try:
+            shutil.copyfile(f, dst)
+            total += dst.stat().st_size
+            found[name] = dst
+        except OSError:
+            pass
+    return total, found, extras
 
 
 def sha256(path: Path) -> str:
@@ -1669,11 +1693,11 @@ class Orchestrator:
                 python = self.args.build_python
 
             def attempt(b: str, dest: Path, fresh: bool):
-                """Build with one backend into `dest`; returns (ok, err, built_dict, bytes)."""
+                """Build with one backend into `dest`; returns (ok, err, built, bytes, extras)."""
                 if fresh:
                     e = timed("extract", lambda: extract_tree(mirror, fam.commit, work, EXTRACT_TIMEOUT))
                     if e:
-                        return False, e, {}, 0
+                        return False, e, {}, 0, []
                 # registered pre-build commands (generate/pre-compile sources) — run here so they
                 # survive the re-extract above (e.g. 'both' mode re-extracts for fontmake)
                 if self.build_rules.get(slug):
@@ -1683,12 +1707,12 @@ class Orchestrator:
                         slug, work, python, self.build_rules, log_path, self.args.timeout))
                     flog("pre-build: " + ("ok" if not pe else f"FAIL {pe}"))
                     if pe:
-                        return False, pe, {}, 0
+                        return False, pe, {}, 0, []
                     self._set(slug, note="")
                 preclean_outputs(work)
                 cfg, label, cerr = timed("config", lambda: resolve_config(self.google_fonts, fam, work))
                 if cerr:
-                    return False, cerr, {}, 0
+                    return False, cerr, {}, 0, []
                 self._set(slug, backend=b, config_used=label)
                 flog(f"build[{b}]: config={label} — running gftools.builder…")
                 t0 = time.time()
@@ -1696,14 +1720,16 @@ class Orchestrator:
                 self._record_op(slug, "build", time.time() - t0)
                 flog(f"build[{b}]: " + ("OK" if bok else f"FAIL {berr}") + f"  ({time.time() - t0:.0f}s)")
                 if not bok:
-                    return False, berr, {}, 0
-                nb, bd = collect_outputs(work, dest, fam.shipped_fonts)
-                return True, "", bd, nb
+                    return False, berr, {}, 0, []
+                # `since=t0`: only fonts written DURING this build are collected (recursively),
+                # never binaries the repo ships in its tree (older mtime).
+                nb, bd, extras = collect_outputs(work, dest, fam.shipped_fonts, since=t0)
+                return True, "", bd, nb, extras
 
             if self.args.backend == "both":
                 # fontc_crater-style: build with BOTH compilers and compare their outputs
-                fok, ferr, fbuilt, fbytes = attempt("fontc", out_dir / "fontc", fresh=False)
-                mok, merr, mbuilt, mbytes = attempt("fontmake", out_dir / "fontmake", fresh=True)
+                fok, ferr, fbuilt, fbytes, _fx = attempt("fontc", out_dir / "fontc", fresh=False)
+                mok, merr, mbuilt, mbytes, _mx = attempt("fontmake", out_dir / "fontmake", fresh=True)
                 if not (fok or mok):
                     self._set(slug, fontc_error=ferr)
                     # keep BOTH errors (the categoriser keys on substrings like 'No module named
@@ -1722,12 +1748,20 @@ class Orchestrator:
                            dur=round(self.results[slug].dur(), 1))
             else:
                 order = self._backend_order()
-                ok, berr, used, fontc_err = False, "", "", ""
+                ok, berr, used, fontc_err, extras = False, "", "", "", []
                 for i, b in enumerate(order):
-                    ok, berr, built, nbytes = attempt(b, out_dir, fresh=(i > 0))
-                    if ok:
+                    ok, berr, built, nbytes, extras = attempt(b, out_dir, fresh=(i > 0))
+                    # the builder succeeded but produced none of the SHIPPED fonts: if it built
+                    # OTHER fonts (names differ), keep trying the next backend before giving up —
+                    # a different compiler may name/place them as expected.
+                    if ok and (built or not fam.shipped_fonts):
                         used = b
                         break
+                    if ok and not built:
+                        ok = False               # treat "built nothing expected" as a non-success
+                        berr = (f"{b}: built fonts but names don't match shipped — got "
+                                f"{extras[:3]}, expected {fam.shipped_fonts[:3]}" if extras
+                                else f"{b}: produced no expected font files")
                     if b == "fontc":
                         fontc_err = berr            # fontc couldn't build this — a migration blocker
                 if not ok:
@@ -1736,7 +1770,7 @@ class Orchestrator:
                 if fam.shipped_fonts and not built:
                     flog("collect: FAIL produced no expected font files")
                     self._set(slug, fontc_error=fontc_err)
-                    return self._fail(slug, f"{used}: produced no expected font files")
+                    return self._fail(slug, berr or f"{used}: produced no expected font files")
                 missing = [f for f in fam.shipped_fonts if f not in built]
                 cmp_label = ""
                 if self.args.compare:
