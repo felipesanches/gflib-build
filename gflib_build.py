@@ -2061,6 +2061,14 @@ class CursesFrontend(Frontend):
                     "requirements:"]
             reqs = (item.get("requirements") or "").splitlines()
             out += ["  " + r for r in reqs] or ["  (none — the 'base' cohort has no requirements file)"]
+        elif view == "building":                     # {slug, worker, dur, backend, note}
+            slug = item.get("slug", "")
+            logp = self.orch.build_dir / "logs" / (slug.replace("/", "__") + ".log")
+            out += [f"Building: {slug}", f"worker: {item.get('worker', '')}",
+                    f"elapsed: {hms(item.get('dur', 0))}",
+                    f"step: {item.get('note') or item.get('backend') or '(starting)'}",
+                    f"log: {logp}", "", "log tail:"]
+            out += ["  " + ln for ln in _read_log_tail(logp, 60)]
         elif view == "built":                        # {slug, backend, bytes, compare, log}
             slug = item.get("slug", "")
             out += [f"Built: {slug}",
@@ -2118,10 +2126,58 @@ class CursesFrontend(Frontend):
         MARK = self.EMOJI if use_emoji else self.ASCII
         SATTR = {"done": GREEN, "failed": RED, "running": YEL, "skipped": curses.A_DIM,
                  "pending": curses.A_NORMAL}
+
+        # Each non-config tab is a list of SECTIONS: (title, items, fmt, color, detail-view).
+        # ←/→ move focus between sections, ↑/↓ navigate items in the focused one, ↵ acts on the
+        # selected item. (title, items, fmt(item)->str, color(item)->attr, detail-view or None)
+        def sections_for(snap, v):
+            if v == "overview":
+                secs = [("Pipeline", snap.get("tasks", []),
+                         lambda t: f"{MARK.get(t['status'], '?')} {t['name']:<26} "
+                         f"{((str(t['done'])+'/'+str(t['total'])) if t['total'] else ''):<11}"
+                         f"{(hms(t['elapsed']) if t['elapsed'] else ''):>8}  {t['detail']}",
+                         lambda t: SATTR.get(t["status"], 0), "overview")]
+                arch = snap.get("archive_recent", [])
+                if arch:
+                    secs.append(("Archive — mirrored", arch,
+                                 lambda a: ("+ " if a["status"] == "added" else "✗ ") + a["repo"],
+                                 lambda a: RED if a["status"] == "failed" else GREEN, None))
+                secs.append(("Now building", snap.get("building", []),
+                             lambda b: f"w{b['worker']:>2} {b['slug']:<34} {hms(b['dur']):>8}  "
+                             f"{b['note'] or b['backend'] or ''}", lambda b: YEL, "building"))
+                secs.append(("Recent failures", snap.get("failures_recent", []),
+                             lambda f: f"{f['slug']:<34} {f['error']}", lambda f: RED, "failures"))
+                return secs
+            if v == "cohorts":
+                return [("Dependency cohorts", snap.get("cohorts", []),
+                         lambda co: "%4d  %-16s %s" % (co["count"], co["key"],
+                         (co["requirements"].splitlines()[0][:48]
+                          if co["requirements"].splitlines() else "(no requirements)")),
+                         lambda co: 0 if co["key"] == "base" else CYAN, "cohorts")]
+            if v == "built":
+                return [("Built — successes", snap.get("built_recent", []),
+                         lambda b: "%-36s %-9s %9s  %s" % (b["slug"], b.get("backend", ""),
+                         human(b.get("bytes", 0)), b.get("compare", "")),
+                         lambda b: GREEN, "built")]
+            if v == "failures":
+                return [("Failures — newest first", snap.get("failures_recent", []),
+                         lambda f: f"{f['slug']:<34} {f['error']}", lambda f: RED, "failures")]
+            if v == "stats":
+                phases = sorted(snap.get("phase_durations", {}).items(), key=lambda kv: -kv[1])
+                ops = sorted(snap.get("op_stats", {}).items(), key=lambda kv: -kv[1]["total"])
+                return [("Phase timing", phases, lambda kv: f"{kv[0]:<12} {hms(kv[1])}",
+                         lambda kv: 0, None),
+                        ("Operation timing", ops,
+                         lambda kv: f"{kv[0]:<10} total {kv[1]['total']:>9.1f}  n {kv[1]['count']:>5}"
+                         f"  mean {kv[1]['mean']:>7.2f}  max {kv[1]['max']:>7.1f}",
+                         lambda kv: CYAN, "stats")]
+            return []
+
         mon = getattr(self, "monitor", False)
         setup = getattr(self, "setup", False)        # pre-build first-run Configuration screen
         view = "config"                              # land on the Configuration tab (leftmost)
         sel, detail, dscroll = 0, None, 0
+        section_idx = 0                              # focused section in a multi-section tab
         cfg_fields = None                            # the editable Configuration fields
         cfg_active = 0                               # selected field, or the action button
         while True:
@@ -2146,10 +2202,10 @@ class CursesFrontend(Frontend):
                 return None
             elif ch == 9 and not setup:               # Tab → next tab (live only; setup = config only)
                 view = self.VIEWS[(self.VIEWS.index(view) + 1) % len(self.VIEWS)]
-                cfg_active = sel = 0
+                cfg_active = sel = section_idx = 0
             elif ch == curses.KEY_BTAB and not setup:  # Shift-Tab → previous tab
                 view = self.VIEWS[(self.VIEWS.index(view) - 1) % len(self.VIEWS)]
-                cfg_active = sel = 0
+                cfg_active = sel = section_idx = 0
             elif detail is not None:                  # inside the detail overlay
                 if ch in (10, 13, curses.KEY_BACKSPACE, 127, 8):
                     detail = None
@@ -2175,25 +2231,34 @@ class CursesFrontend(Frontend):
                 elif af_editable:                     # edit the selected field (wizard-style)
                     if self._cfg_field_key(af, ch) == "advance":
                         cfg_active = (cfg_active + 1) % nav_n
-            else:                                     # --- other tabs (read-only list views) ---
+            else:                                     # --- other tabs: sections + items ---
+                secs = sections_for(snap, view)
                 if ch in (ord("p"), ord("P")):
                     (self.orch.paused.clear if self.orch.paused.is_set() else self.orch.paused.set)()
                 elif ch in (ord("c"), ord("C")) and not setup:
                     return "reconfigure"
+                elif ch == curses.KEY_RIGHT and len(secs) > 1:   # → next section (Ctrl+Tab is
+                    section_idx = (section_idx + 1) % len(secs); sel = 0   # eaten by most terminals)
+                elif ch == curses.KEY_LEFT and len(secs) > 1:    # ← previous section
+                    section_idx = (section_idx - 1) % len(secs); sel = 0
                 elif ch == curses.KEY_DOWN:
                     sel += 1
                 elif ch == curses.KEY_UP:
                     sel = max(0, sel - 1)
-                elif ch in (10, 13):
-                    items = self._nav_items(view, snap)
-                    if items:
-                        detail = self._detail_lines(view, items[min(sel, len(items) - 1)])
-                        dscroll = 0
+                elif ch in (10, 13):                  # ↵ act on the focused section's selection
+                    si = min(section_idx, len(secs) - 1) if secs else 0
+                    if secs:
+                        _, items, _, _, dview = secs[si]
+                        if items and dview:
+                            detail = self._detail_lines(dview, items[min(sel, len(items) - 1)])
+                            dscroll = 0
 
             snap = self.orch.snapshot()
-            if view != "config":
-                items = self._nav_items(view, snap)
-                sel = max(0, min(sel, len(items) - 1)) if items else 0
+            if view != "config":                      # clamp the focused section + its selection
+                secs = sections_for(snap, view)
+                section_idx = max(0, min(section_idx, len(secs) - 1)) if secs else 0
+                foc_items = secs[section_idx][1] if secs else []
+                sel = max(0, min(sel, len(foc_items) - 1)) if foc_items else 0
             c, bk = snap["counts"], snap["backends"]
             h, w = stdscr.getmaxyx()
             stdscr.erase()
@@ -2245,15 +2310,31 @@ class CursesFrontend(Frontend):
                 x += len(name) + 3
             put(4, max(x + 2, w - 24), "[Tab]/[⇧Tab] switch tabs", curses.A_DIM)
 
-            # ---- selected-row renderer: highlights `sel`, auto-scrolls to keep it visible ----
-            def draw_list(row0, lst, fmt, color=None):
-                vis = max(1, h - row0 - 1)
-                top = 0 if sel < vis else min(sel - vis + 1, max(0, len(lst) - vis))
-                for idx in range(top, min(len(lst), top + vis)):
-                    a = (color(lst[idx]) if color else 0)
-                    if idx == sel:
-                        a |= curses.A_REVERSE
-                    put(row0 + idx - top, 1, fmt(lst[idx]), a)
+            # ---- section renderer: all sections stacked; the FOCUSED one is highlighted and its
+            # selected item reversed (↑↓ scroll it). Non-focused sections show a short peek. ----
+            def draw_sections(row0, secs):
+                r = row0
+                n = len(secs)
+                for si, (title, items, fmt, color, _dv) in enumerate(secs):
+                    foc = (si == section_idx)
+                    mark = "▼ " if foc else "▷ "
+                    put(r, 0, (" " + mark + f"{title} ({len(items)}) ").ljust(w - 1, "-"),
+                        curses.A_BOLD | (curses.A_REVERSE if foc else 0)); r += 1
+                    if not items:
+                        put(r, 1, "(none)", curses.A_DIM); r += 2
+                        continue
+                    budget = max(0, h - r - 1)
+                    cap = max(1, budget - 2 * (n - 1 - si)) if foc else min(2, len(items))
+                    cap = min(cap, len(items), max(1, budget))
+                    top = 0
+                    if foc and sel >= cap:
+                        top = min(sel - cap + 1, max(0, len(items) - cap))
+                    for idx in range(top, min(len(items), top + cap)):
+                        a = (color(items[idx]) or 0) | (curses.A_REVERSE if foc and idx == sel else 0)
+                        put(r, 1, fmt(items[idx]), a); r += 1
+                    if len(items) > top + cap:
+                        put(r, 1, f"  … (+{len(items) - top - cap} more)", curses.A_DIM); r += 1
+                    r += 1
 
             row = 6
             if detail is not None:                   # ---- detail overlay for the selected item ----
@@ -2262,95 +2343,6 @@ class CursesFrontend(Frontend):
                 dscroll = min(dscroll, max(0, len(lines) - 1))
                 for i, ln in enumerate(lines[dscroll:dscroll + max(1, h - row - 1)]):
                     put(row + i, 2, ln, curses.A_BOLD if ln and not ln.startswith(" ") and ln.endswith(":") else 0)
-            elif view == "overview":
-                # end-to-end pipeline task-list (clone → fontc → discover → archive → cohorts → build)
-                put(row, 0, " Pipeline  (↑↓ select · ↵ details) ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
-                tasks = snap.get("tasks", [])
-                for i, t in enumerate(tasks):
-                    mark = MARK.get(t["status"], "?")
-                    prog = ""
-                    if t["total"]:
-                        prog = f"{t['done']}/{t['total']} {int(100 * t['done'] / max(1, t['total'])):>3}%"
-                    el = hms(t["elapsed"]) if t["elapsed"] else ""
-                    line = f"{mark} {t['name']:<30} {prog:<13} {el:>8}  {t['detail']}"
-                    a = SATTR.get(t["status"], 0) | (curses.A_REVERSE if i == sel else 0)
-                    put(row, 1, line, a); row += 1
-                # live, growing list of repos as they are mirrored into the archive (the archive
-                # pre-warmer + the workers feed this concurrently with the builds, so show it
-                # whenever it has content and the run is still going)
-                arch = snap.get("archive_recent", [])
-                if arch and not snap["done"]:
-                    row += 1
-                    put(row, 0, " Archive — repos mirrored, newest last (live) ".ljust(w - 1, "-"),
-                        curses.A_BOLD); row += 1
-                    for a in arch[-max(0, (h - row) // 3):]:
-                        col = RED if a["status"] == "failed" else GREEN
-                        put(row, 1, f"{'+ ' if a['status'] == 'added' else '✗ '}{a['repo']}", col)
-                        row += 1
-                row += 1
-                put(row, 0, " Now building ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
-                cap = max(0, (h - row) // 2 - 1)
-                for bld in snap["building"][:cap]:
-                    tag = bld["note"] or bld["backend"] or ""
-                    put(row, 1, f"w{bld['worker']:>2} {bld['slug']:<36} {hms(bld['dur']):>8}  {tag}", YEL)
-                    row += 1
-                if not snap["building"]:
-                    put(row, 1, "(idle)" if ph in ("build", "done") else f"… {plabel}"); row += 1
-                row += 1
-                put(row, 0, f" Recent failures ({c['failed']}) — open the Failures tab to inspect "
-                            .ljust(w - 1, "-"), curses.A_BOLD); row += 1
-                for f in snap["failures_recent"][:max(0, h - row - 2)]:
-                    put(row, 1, f"{f['slug']:<36} {f['error']}", RED); row += 1
-            elif view == "cohorts":
-                cohorts = snap["cohorts"]
-                put(row, 0, f" Dependency cohorts ({len(cohorts)}) — ↑↓ select · ↵ requirements "
-                            .ljust(w - 1, "-"), curses.A_BOLD); row += 1
-                draw_list(row, cohorts,
-                          lambda co: "%4d  %-16s %s" % (
-                              co["count"], co["key"],
-                              (co["requirements"].splitlines()[0][:48]
-                               if co["requirements"].splitlines() else "(no requirements)")),
-                          color=lambda co: 0 if co["key"] == "base" else CYAN)
-                if not cohorts:
-                    put(row, 1, "(cohorts are assigned live as families build — needs --manage-venvs)")
-            elif view == "built":
-                bl = snap.get("built_recent", [])
-                put(row, 0, f" Built — successes ({c['built']}) · newest first · ↑↓ select · ↵ details "
-                            .ljust(w - 1, "-"), curses.A_BOLD); row += 1
-                draw_list(row, bl, lambda b: "%-36s %-9s %9s  %s" % (
-                    b["slug"], b.get("backend", ""), human(b.get("bytes", 0)),
-                    b.get("compare", "")), color=lambda b: GREEN)
-                if not bl:
-                    put(row, 1, "(no fonts built yet)")
-            elif view == "failures":
-                fails = snap["failures_recent"]
-                put(row, 0, f" Failures ({c['failed']}) — newest first · ↑↓ select · ↵ log "
-                            .ljust(w - 1, "-"), curses.A_BOLD); row += 1
-                draw_list(row, fails, lambda f: f"{f['slug']:<34} {f['error']}", color=lambda f: RED)
-                if not fails:
-                    put(row, 1, "(no failures)", GREEN)
-            elif view == "stats":
-                m = snap.get("migration", {})
-                put(row, 0, " fontc migration ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
-                put(row, 1, f"fontc {m.get('fontc', 0)}   fontmake-fallback(blockers) "
-                            f"{m.get('fontmake_fallback', 0)}   fontmake-only {m.get('fontmake_only', 0)}"
-                            + (f"   both id {m.get('both_identical', 0)}/diff {m.get('both_differ', 0)}"
-                               if (m.get('both_identical') or m.get('both_differ')) else ""),
-                    GREEN); row += 2
-                put(row, 0, " Timing — phases ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
-                for phn, sec in sorted(snap.get("phase_durations", {}).items(),
-                                       key=lambda kv: -kv[1]):
-                    put(row, 1, f"{phn:<12} {hms(sec)}"); row += 1
-                row += 1
-                put(row, 0, " Timing — operations (↑↓ select · ↵ details) ".ljust(w - 1, "-"),
-                    curses.A_BOLD); row += 1
-                ops = self._nav_items("stats", snap)
-                draw_list(row, ops,
-                          lambda kv: f"{kv[0]:<10} total {kv[1]['total']:>9.1f}   n {kv[1]['count']:>5}   "
-                                     f"mean {kv[1]['mean']:>7.2f}   max {kv[1]['max']:>7.1f}",
-                          color=lambda kv: CYAN)
-                if not ops:
-                    put(row, 1, "(timing accrues as builds run)")
             elif view == "config":
                 live_cfg = self._effective_config(snap)
                 VC = 36                               # value column
@@ -2397,6 +2389,17 @@ class CursesFrontend(Frontend):
                     put(row, 0, " applied live changes ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
                     for ln in clog[-max(0, h - row - 2):]:
                         put(row, 1, ln, GREEN); row += 1
+            elif view == "stats":                    # migration summary, then the timing sections
+                m = snap.get("migration", {})
+                put(row, 0, " fontc migration ".ljust(w - 1, "-"), curses.A_BOLD); row += 1
+                put(row, 1, f"fontc {m.get('fontc', 0)}   fontmake-fallback(blockers) "
+                            f"{m.get('fontmake_fallback', 0)}   fontmake-only {m.get('fontmake_only', 0)}"
+                            + (f"   both id {m.get('both_identical', 0)}/diff {m.get('both_differ', 0)}"
+                               if (m.get('both_identical') or m.get('both_differ')) else ""),
+                    GREEN); row += 2
+                draw_sections(row, sections_for(snap, "stats"))
+            else:                                    # overview / cohorts / built / failures
+                draw_sections(row, sections_for(snap, view))
 
             if detail is not None:
                 foot = " [esc/↵] back to list   [↑↓] scroll"
@@ -2405,8 +2408,7 @@ class CursesFrontend(Frontend):
                         if setup else
                         " [↑↓]field  [←→]edit  [space]toggle  [↵]apply  [C]restart for paths  [Tab]tabs")
             else:
-                foot = (" [q]uit — build runs on  [C]onfig  [↑↓]select [↵]info [Tab]tabs"
-                        if mon else " [q]uit [p]ause  [C]onfig  [↑↓]select [↵]info")
+                foot = " [Tab]tabs  [←→]section  [↑↓]item  [↵]details  [C]onfig  [q]uit"
             if mon and not snap.get("daemon_alive", True):
                 foot = " [q]uit   ⚠ daemon not running (build finished or stopped)"
             put(h - 1, 0, foot + ("" if pre_build else "   logs: " + str(self.orch.build_dir / "logs")),
