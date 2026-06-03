@@ -185,6 +185,9 @@ intent so nothing is lost as the tool evolves.
     repo could not be mirrored into the archive.
 41. **Header shows total build-system disk usage**, not a per-session delta. The old
     `disk +0B`-on-reopen was useless; the header now reports the whole build dir's on-disk size.
+42. **Sections fill the available space + live resize.** Multi-section tabs no longer collapse
+    items while the screen is half-empty: the visible height is shared fairly across sections
+    (water-fill), and the layout re-flows the instant the terminal is resized.
 
 ---
 
@@ -373,7 +376,7 @@ Tabs (switch with **`Tab` / `Shift-Tab` only**):
   **jobs** spawns more workers; path/source fields show `(restart: C)`. First run shows the same
   tab with **▶ Start build / Cancel**.
 - **overview** — the pipeline task-list + the live archive list + now-building + recent failures,
-  as navigable **sections**.
+  as navigable **sections** that **fill the available height** (see below).
 - **cohorts** — the dependency cohorts, live (largest first); each row lists the comma-separated
   **family names** in that cohort (↵ shows the full family list + requirements).
 - **built** — the list of **successfully built** families (newest first; ↵ shows output path,
@@ -389,6 +392,12 @@ task/op's detail; `Esc`/`↵` returns); `C` opens/returns to the Configuration t
 switching — so `←`/`→` is the reliable binding.) The **elapsed clock is cumulative** across
 reopen/resume. Full per-family logs are at `<build-dir>/logs/<slug>.log`. For non-interactive
 use pick `--ui plain`, `--ui json`, or `--ui none`.
+
+Multi-section tabs **fill the available vertical space**: instead of capping each section at a
+couple of rows, the visible height is shared fairly across sections (water-fill — a section that
+needs fewer rows releases the surplus to the others), so a small section is shown in full while a
+large one (e.g. hundreds of failures) expands to take the rest. The layout **re-flows live when
+you resize the terminal** — grow the window and more rows appear immediately, no restart.
 
 An **always-on status panel** sits just above the footer and explains the **currently focused
 item** wherever you are — a one-liner that grows to 2–3 lines only when there's more worth

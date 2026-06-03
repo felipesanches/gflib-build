@@ -2283,7 +2283,12 @@ class CursesFrontend(Frontend):
             text_active = af_editable and af["type"] in ("path", "text")  # 'q'/'C' type, not quit
 
             ch = stdscr.getch()
-            if ch == 27:                              # Esc: close an open detail, else cancel/quit
+            if ch == curses.KEY_RESIZE:               # terminal resized: refresh LINES/COLS so the
+                try:                                  # next draw re-flows to the new size, then idle
+                    curses.update_lines_cols()
+                except (curses.error, AttributeError):
+                    pass
+            elif ch == 27:                            # Esc: close an open detail, else cancel/quit
                 if detail is not None:                # (app-mode arrow keys decode to KEY_*, so a
                     detail = None                     #  bare 27 is a real Esc, not a split sequence)
                 else:
@@ -2430,9 +2435,35 @@ class CursesFrontend(Frontend):
             # ---- section renderer: all sections stacked; the FOCUSED one is highlighted and its
             # selected item reversed (↑↓ scroll it). Non-focused sections show a short peek. ----
             def draw_sections(row0, secs):
-                r = row0
+                # Fill the available height instead of hard-capping each section: water-fill the
+                # item rows so every section gets a fair share, and sections wanting fewer rows
+                # release their surplus to the others. Recomputed every frame from body_bottom, so
+                # it re-flows automatically when the terminal is resized.
                 n = len(secs)
+                avail = max(0, body_bottom - row0)
+                wants = [len(items) for (_t, items, *_r) in secs]
+                item_budget = max(0, avail - 2 * n)        # 1 header + 1 trailing blank per section
+                alloc = [0] * n
+                rem = item_budget
+                active = [i for i in range(n) if wants[i] > 0]
+                while active and rem > 0:
+                    share = rem // len(active)
+                    if share == 0:                         # <1 row each left — hand out singly,
+                        for i in sorted(active, key=lambda j: (j != section_idx, -wants[j])):
+                            if rem <= 0:
+                                break
+                            if alloc[i] < wants[i]:
+                                alloc[i] += 1; rem -= 1
+                        break
+                    for i in list(active):
+                        give = min(share, wants[i] - alloc[i])
+                        alloc[i] += give; rem -= give
+                        if alloc[i] >= wants[i]:
+                            active.remove(i)
+                r = row0
                 for si, (title, items, fmt, color, _dv) in enumerate(secs):
+                    if r >= body_bottom:                   # out of room (tiny screen)
+                        break
                     foc = (si == section_idx)
                     mark = "▼ " if foc else "▷ "
                     put(r, 0, (" " + mark + f"{title} ({len(items)}) ").ljust(w - 1, "-"),
@@ -2440,19 +2471,20 @@ class CursesFrontend(Frontend):
                     if not items:
                         put(r, 1, "(none)", curses.A_DIM); r += 2
                         continue
-                    budget = max(0, body_bottom - r)
-                    cap = max(1, budget - 2 * (n - 1 - si)) if foc else min(2, len(items))
-                    cap = min(cap, len(items), max(1, budget))
-                    if cap < len(items) and cap >= budget and budget >= 2:
-                        cap -= 1                       # reserve the last body row for "(+N more)"
+                    cap = max(1, min(alloc[si], len(items)))
+                    if cap < len(items) and cap >= 2:      # reserve the last row for "(+N more)"
+                        cap -= 1
                     top = 0
                     if foc and sel >= cap:
                         top = min(sel - cap + 1, max(0, len(items) - cap))
+                    drawn = 0
                     for idx in range(top, min(len(items), top + cap)):
+                        if r >= body_bottom:
+                            break
                         a = (color(items[idx]) or 0) | (curses.A_REVERSE if foc and idx == sel else 0)
-                        put(r, 1, fmt(items[idx]), a); r += 1
-                    if len(items) > top + cap:
-                        put(r, 1, f"  … (+{len(items) - top - cap} more)", curses.A_DIM); r += 1
+                        put(r, 1, fmt(items[idx]), a); r += 1; drawn += 1
+                    if len(items) > top + drawn and r < body_bottom:
+                        put(r, 1, f"  … (+{len(items) - top - drawn} more)", curses.A_DIM); r += 1
                     r += 1
 
             row = 6
