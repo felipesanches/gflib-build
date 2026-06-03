@@ -79,4 +79,49 @@ except urllib.error.HTTPError as e:
 assert "dashboard" in get("/")
 print("unknown path -> 404, server stays up")
 
+# --- security hardening (adversarial-review fixes) ---
+# 1) the page carries NO inline onclick — clicks go through delegated data-* handlers, so a slug
+#    can never break out into executable code (and E() escapes ' as well).
+assert "onclick=" not in base, "no inline onclick (event delegation only)"
+assert "data-slug" in base and "data-act" in base
+print("no inline onclick; clicks via data-* delegation (no JS injection via slugs)")
+
+# 2) apply_live CLAMPS jobs to MAX_JOBS and percent to [0,100] — control.json is untrusted, a bad
+#    value must never spawn a thread-bomb or an absurd worklist.
+import types
+oa = types.SimpleNamespace(
+    only="", rebuild=False, retry_failed=False, retry_category="", build_dir=str(build_dir),
+    google_fonts=None, archive=str(build_dir / "a"), source="archive", backend="fontmake", fontc_bin=None,
+    jobs=4, percent=10.0, populate_archive=False, manage_venvs=False, base_python="python3",
+    base_requirements=None, build_python="python3", timeout=None, compare=False, keep_work=False,
+    keep_fonts=True, mirror_missing=False, _want_build_fontc=False, _data_dir=str(build_dir),
+    archive_rev="HEAD")
+os.makedirs(str(build_dir / "a"), exist_ok=True)
+orch = g.Orchestrator(oa)
+orch._all_families = []
+seen = []
+orch._ensure_workers = lambda n: seen.append(n)
+orch.apply_live({"jobs": 99999})
+assert seen and seen[-1] == g.MAX_JOBS, ("jobs must clamp to MAX_JOBS", seen)
+orch.apply_live({"percent": 99999})
+assert orch.args.percent == 100.0, ("percent must clamp to 100", orch.args.percent)
+print("apply_live clamps jobs->MAX_JOBS(%d) and percent->[0,100]" % g.MAX_JOBS)
+
+# 3) a negative Content-Length must not hang a handler thread (bounded body read).
+c = socket.create_connection(("127.0.0.1", port), timeout=5)
+c.sendall(b"POST /api/control HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\nConnection: close\r\n\r\n{}")
+c.settimeout(6)
+resp = b""
+try:
+    while True:
+        d = c.recv(4096)
+        if not d:
+            break
+        resp += d
+except socket.timeout:
+    pass
+c.close()
+assert b"200" in resp and b"ok" in resp, ("server must respond to negative Content-Length, not hang", resp[:80])
+print("negative Content-Length -> quick response, no hung thread")
+
 print("\nWEB-FRONTEND OK")

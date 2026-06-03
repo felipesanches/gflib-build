@@ -58,6 +58,8 @@ OUTPUT_DIRS_TO_CLEAN = (
 )
 CONFIG_CANDIDATES = ("sources/config.yaml", "sources/config.yml", "config.yaml", "config.yml")
 FONT_SUBDIRS = ("fonts/ttf", "fonts/variable", "fonts/otf", "fonts", ".")
+MAX_JOBS = 256                                       # hard cap on parallel jobs (matches the config
+#                                                      schema max; bounds untrusted control.json input)
 REQ_FILES = ("requirements.txt", "requirements.in")
 
 RE_REPO = re.compile(r'repository_url:\s*"([^"]+)"')
@@ -1923,14 +1925,17 @@ class Orchestrator:
                     setattr(self.args, k, settings[k])
                     changed.append(f"{k}={settings[k]}")
         new_pct = settings.get("percent")
-        if isinstance(new_pct, (int, float)) and float(new_pct) != self.args.percent:
-            added = self._extend_worklist(float(new_pct))
-            with self.lock:
-                self.args.percent = float(new_pct)
-            changed.append(f"percent={float(new_pct):g} (+{added} families)")
+        if isinstance(new_pct, (int, float)):
+            new_pct = max(0.0, min(100.0, float(new_pct)))   # clamp — control.json is untrusted input
+            if new_pct != self.args.percent:
+                added = self._extend_worklist(new_pct)
+                with self.lock:
+                    self.args.percent = new_pct
+                changed.append(f"percent={new_pct:g} (+{added} families)")
         new_jobs = settings.get("jobs")
         if isinstance(new_jobs, int) and new_jobs >= 1:
-            self._ensure_workers(new_jobs)
+            new_jobs = min(new_jobs, MAX_JOBS)               # cap — a bad value must not spawn a
+            self._ensure_workers(new_jobs)                  #   thread-bomb (DoS via the web control)
             with self.lock:
                 if new_jobs != self.args.jobs:
                     changed.append(f"jobs={new_jobs}")
@@ -3335,14 +3340,14 @@ table.kv td{padding:2px 10px}table.kv td:first-child{color:var(--dim)}
 <script>
 let snap=null,tab='overview',selKey=null;
 const TABS=['overview','queue','cohorts','built','failures','stats','config'];
-const E=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const E=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function human(n){n=+n||0;const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(Math.abs(n)>=1024&&i<4){n/=1024;i++}return(i?n.toFixed(1):n.toFixed(0))+u[i]}
 function hms(s){s=Math.max(0,Math.floor(+s||0));const h=(s/3600|0),m=(s%3600/60|0),x=s%60;return(h?h+':':'')+String(m).padStart(2,'0')+':'+String(x).padStart(2,'0')}
 async function poll(){try{const r=await fetch('/api/status');snap=await r.json();render()}catch(e){}}
 async function ctl(set){try{await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({set:set})});setTimeout(poll,250)}catch(e){}}
 function pick(slug){selKey=(selKey===slug?null:slug);render()}
 function rows(items,fn){return items&&items.length?items.map(fn).join(''):'<div class="row d">(none)</div>'}
-function frow(slug,inner){const sel=selKey===slug?' sel':'';return '<div class="row'+sel+'" onclick="pick(\''+E(slug)+'\')">'+inner+'</div>'}
+function frow(slug,inner){const sel=selKey===slug?' sel':'';return '<div class="row'+sel+'" data-slug="'+E(slug)+'">'+inner+'</div>'}
 
 function render(){
  if(!snap||snap.error){document.getElementById('hdr').innerHTML='<span class="r">waiting for build status… '+E(snap&&snap.error||'')+'</span>';return}
@@ -3362,7 +3367,7 @@ function render(){
    '<span class="lbl">'+proc+'/'+grand+' processed ('+pct+'%)</span></div>';
  // tabs
  const tc={overview:'',queue:c.queued,cohorts:(snap.cohorts||[]).length,built:c.built,failures:c.failed,stats:'',config:''};
- document.getElementById('tabs').innerHTML=TABS.map(t=>'<div class="tab'+(t===tab?' on':'')+'" onclick="tab=\''+t+'\';render()">'+
+ document.getElementById('tabs').innerHTML=TABS.map(t=>'<div class="tab'+(t===tab?' on':'')+'" data-tab="'+t+'">'+
    t+(tc[t]?'<span class="b">'+tc[t]+'</span>':'')+'</div>').join('');
  // main
  let h='';const b=snap.building||[];
@@ -3413,16 +3418,29 @@ function panel(){
  else if(bu)body='<div class="row"><b class="g">'+E(selKey)+'</b></div><div class="row d">backend '+E(bu.backend)+' · '+human(bu.bytes)+' · vs shipped: '+E(bu.compare||'n/a')+'</div>';
  else body='<div class="row"><b>'+E(selKey)+'</b></div>';
  const canRetry=f||bu||q;
- if(canRetry&&!q)body+='<div class="row"><button onclick="ctl({retry:[\''+E(selKey)+'\']})">⟳ Retry this family</button></div>';
+ if(canRetry&&!q)body+='<div class="row"><button data-act="retry">⟳ Retry this family</button></div>';
  return card('Details',body)+card('Control log',(snap.control_log||[]).slice(-12).reverse().map(x=>'<div class="row d">'+E(x)+'</div>').join('')||'<div class="row d">(none)</div>')}
 function controls(){
  const cf=snap.config||{},jobs=snap.jobs||1,pc=(cf.percent!=null?cf.percent:100);
  document.getElementById('ctl').innerHTML=
-  'jobs <button onclick="ctl({jobs:'+(jobs-1)+'})" '+(jobs<=1?'disabled':'')+'>−</button> <span class="stat">'+jobs+'</span> <button onclick="ctl({jobs:'+(jobs+1)+'})">+</button>'+
-  ' &nbsp; % <button onclick="ctl({percent:'+Math.max(1,pc-5)+'})">−5</button> <span class="stat">'+(+pc).toFixed(0)+'</span> <button onclick="ctl({percent:'+Math.min(100,pc+5)+'})">+5</button>'+
-  ' &nbsp; <button onclick="ctl({pause:'+(!snap.paused)+'})">'+(snap.paused?'▶ Resume':'⏸ Pause')+'</button>'+
+  'jobs <button data-act="jobs" data-val="'+(jobs-1)+'" '+(jobs<=1?'disabled':'')+'>−</button> <span class="stat">'+jobs+'</span> <button data-act="jobs" data-val="'+(jobs+1)+'">+</button>'+
+  ' &nbsp; % <button data-act="percent" data-val="'+Math.max(1,pc-5)+'">−5</button> <span class="stat">'+(+pc).toFixed(0)+'</span> <button data-act="percent" data-val="'+Math.min(100,pc+5)+'">+5</button>'+
+  ' &nbsp; <button data-act="pause">'+(snap.paused?'▶ Resume':'⏸ Pause')+'</button>'+
   ' &nbsp; <span class="muted">live polling every 1.5s · controls go to the running build via control.json</span>';
  document.getElementById('log').textContent='';
+}
+// one delegated click handler — data-* attributes carry no executable code, so a slug/value can
+// never break out into the page (no inline onclick string-interpolation).
+document.addEventListener('click',e=>{
+ const a=e.target.closest('[data-act]');if(a){doAct(a.dataset.act,a.dataset.val);return}
+ const t=e.target.closest('[data-tab]');if(t){tab=t.dataset.tab;render();return}
+ const r=e.target.closest('[data-slug]');if(r){pick(r.dataset.slug);return}
+});
+function doAct(act,val){
+ if(act==='retry'){if(selKey)ctl({retry:[selKey]})}
+ else if(act==='jobs')ctl({jobs:+val});
+ else if(act==='percent')ctl({percent:+val});
+ else if(act==='pause')ctl({pause:!snap.paused});
 }
 setInterval(poll,1500);poll();
 </script></body></html>"""
@@ -3446,6 +3464,8 @@ class WebFrontend(Frontend):
         build_dir = Path(bd) if bd is not None else Path(".")
 
         class H(http.server.BaseHTTPRequestHandler):
+            timeout = 15                              # close a slow/partial connection (no hung threads)
+
             def log_message(self, *a):
                 pass
 
@@ -3464,21 +3484,24 @@ class WebFrontend(Frontend):
                 if self.path == "/" or self.path.startswith("/index"):
                     self._send(200, WEB_HTML, "text/html; charset=utf-8")
                 elif self.path.startswith("/api/status"):
-                    try:
-                        snap = fe.state.snapshot()
-                    except Exception as e:                # never let a render error kill the server
-                        snap = {"error": str(e)}
-                    self._send(200, json.dumps(snap), "application/json")
+                    try:                                  # never let a render/serialize error kill it
+                        body = json.dumps(fe.state.snapshot())
+                    except Exception as e:
+                        body = json.dumps({"error": str(e)[:200]})
+                    self._send(200, body, "application/json")
                 else:
                     self._send(404, "not found", "text/plain")
 
             def do_POST(self):
                 if self.path.startswith("/api/control"):
+                    ok = False
                     try:
                         n = int(self.headers.get("Content-Length") or 0)
-                        data = json.loads((self.rfile.read(n) if n else b"{}").decode("utf-8") or "{}")
-                        settings = data.get("set") if isinstance(data, dict) else None
-                        ok = write_control(build_dir, settings) if isinstance(settings, dict) else False
+                        if 0 <= n <= (1 << 20):           # bound the body (reject negative/huge)
+                            data = json.loads((self.rfile.read(n) if n else b"{}").decode("utf-8") or "{}")
+                            settings = data.get("set") if isinstance(data, dict) else None
+                            if isinstance(settings, dict):
+                                ok = write_control(build_dir, settings)
                     except Exception:
                         ok = False
                     self._send(200, json.dumps({"ok": bool(ok)}), "application/json")
