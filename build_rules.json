@@ -1,0 +1,29 @@
+{
+  "_format": "gflib-build build_rules v1",
+  "_doc": [
+    "Per-family commands run BEFORE gftools-builder / fontc / fontmake, for families whose",
+    "sources must be generated or pre-compiled first.",
+    "",
+    "Each command runs through the shell with:",
+    "  - cwd  = the extracted upstream source tree (at the pinned commit)",
+    "  - PATH = the family's build venv bin first (so fontmake / fonttools / gftools / python",
+    "           resolve to the pinned build toolchain)",
+    "Commands run in order; a non-zero exit fails the family with a clear 'pre-build' error.",
+    "",
+    "Only the 'rules' object is read. Keys are family slugs (e.g. 'ofl/cairoplay'). '_example'",
+    "below shows the shape and is ignored by the tool.",
+    "",
+    "This file is version-controlled; edit it to register new pre-compile steps."
+  ],
+  "_example": {
+    "ofl/cairoplay": {
+      "note": "Cairo Play ships generated sources under sources/generated/ via a build script",
+      "pre_build": [
+        "python3 -m pip install -q -r requirements.txt",
+        "python3 scripts/build-sources.py"
+      ]
+    }
+  },
+  "rules": {
+  }
+}

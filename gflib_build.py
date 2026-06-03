@@ -929,6 +929,50 @@ class VenvManager:
 
 # ============================================================================= building
 
+def load_build_rules(path) -> dict:
+    """Load the version-controlled build_rules.json (per-family pre-build commands). Returns the
+    `rules` mapping {slug: {"pre_build": [...], "note": ...}}; {} if the file is absent/empty."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except Exception:
+        return {}
+    rules = data.get("rules") if isinstance(data, dict) else None
+    return rules if isinstance(rules, dict) else {}
+
+
+def run_pre_build(slug: str, work: Path, python: str, rules: dict, log_path: Path,
+                  timeout: Optional[int]) -> str:
+    """Run the family's registered pre-build commands (from build_rules.json) BEFORE the builder:
+    shell commands, cwd = the extracted source, the build venv's bin first on PATH so the pinned
+    fontmake/fonttools/gftools/python are used. Returns "" on success, else an error string. A
+    family with no rule is a no-op."""
+    cmds = (rules.get(slug) or {}).get("pre_build") or []
+    if not cmds:
+        return ""
+    env = dict(os.environ)
+    env["SOURCE_DATE_EPOCH"] = "0"
+    try:
+        bindir = str(Path(python).resolve().parent)
+        env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    except Exception:
+        pass
+    for cmd in cmds:
+        try:
+            with open(log_path, "a") as lf:
+                lf.write(f"\n===== pre-build: {cmd} =====\n# cwd={work}\n")
+                lf.flush()
+                p = subprocess.run(cmd, shell=True, cwd=str(work), env=env,
+                                   stdout=lf, stderr=subprocess.STDOUT,
+                                   timeout=timeout if timeout else 3600)
+        except subprocess.TimeoutExpired:
+            return f"pre-build timed out: {cmd}"
+        except Exception as e:
+            return f"pre-build could not run: {cmd} ({e})"
+        if p.returncode != 0:
+            return f"pre-build failed (rc={p.returncode}): {cmd} (see {log_path.name})"
+    return ""
+
+
 def run_builder(python: str, config_path: Path, work: Path, log_path: Path,
                 timeout: Optional[int], backend: str, fontc_bin: Optional[str]):
     """`timeout=None` means the build never times out (the user can stop it via the UI)."""
@@ -1115,6 +1159,8 @@ class Orchestrator:
         if args.manage_venvs:
             self.venvs = VenvManager(self.build_dir, args.base_python,
                                      Path(args.base_requirements) if args.base_requirements else None)
+        # per-family pre-build commands (build_rules.json) — run before the builder
+        self.build_rules = load_build_rules(args.build_rules) if getattr(args, "build_rules", None) else {}
 
         # phase pipeline state (clone_gf → build_fontc → discover → archive → cohorts → build → done)
         self.phase = "init"
@@ -1628,6 +1674,17 @@ class Orchestrator:
                     e = timed("extract", lambda: extract_tree(mirror, fam.commit, work, EXTRACT_TIMEOUT))
                     if e:
                         return False, e, {}, 0
+                # registered pre-build commands (generate/pre-compile sources) — run here so they
+                # survive the re-extract above (e.g. 'both' mode re-extracts for fontmake)
+                if self.build_rules.get(slug):
+                    self._set(slug, note="pre-build")
+                    flog(f"pre-build: running {len(self.build_rules[slug].get('pre_build', []))} command(s)…")
+                    pe = timed("pre_build", lambda: run_pre_build(
+                        slug, work, python, self.build_rules, log_path, self.args.timeout))
+                    flog("pre-build: " + ("ok" if not pe else f"FAIL {pe}"))
+                    if pe:
+                        return False, pe, {}, 0
+                    self._set(slug, note="")
                 preclean_outputs(work)
                 cfg, label, cerr = timed("config", lambda: resolve_config(self.google_fonts, fam, work))
                 if cerr:
@@ -3502,6 +3559,8 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="disable cohort venvs (override a persisted setting)")
     ap.add_argument("--base-python", default=sys.executable, help="python used to create cohort venvs")
     ap.add_argument("--base-requirements", default=None, help="pinned base toolchain requirements file")
+    ap.add_argument("--build-rules", default=None,
+                    help="per-family pre-build commands (defaults to build_rules.json next to the script)")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--timeout", type=int, default=None,
                     help="per-build timeout in seconds (default: no timeout — stop manually via the UI)")
@@ -3669,6 +3728,11 @@ def main():
         bundled = Path(__file__).resolve().parent / "requirements-build.txt"
         if bundled.is_file():
             args.base_requirements = str(bundled)
+    # ---- auto-detect the version-controlled build_rules.json next to the script ----
+    if not args.build_rules:
+        br = Path(__file__).resolve().parent / "build_rules.json"
+        if br.is_file():
+            args.build_rules = str(br)
 
     # ---- finalize + validate FIRST — before any expensive clone/build (fail fast) ----
     gf = gf.resolve() if gf else None         # re-resolve (the wizard may have set relatives)
