@@ -206,6 +206,12 @@ intent so nothing is lost as the tool evolves.
 47. **Coherent counts.** Families left `queued`/`building` by a prior run that aren't in the current
     worklist (e.g. queued at a higher `--percent`, now outside the sample) are reconciled to
     `skipped (not selected this run)`, so the counters reflect real pending work.
+48. **Proactive self-healing — re-attempt fixable failures.** Starting a build automatically
+    *retries* families that failed with a cause a fresh try can clear (broken venv, dependency
+    install, transient fetch, stale mirror, missing system library, …), so pressing `[C]` → Start
+    actually moves things forward instead of instantly declaring the build complete. Genuine build
+    errors / unreachable repos are kept (they'd just re-fail) unless you tick **retry ALL failed**
+    in the config tab. A retried family rebuilds its broken venv from scratch.
 
 ---
 
