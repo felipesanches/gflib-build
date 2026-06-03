@@ -2194,6 +2194,71 @@ class CursesFrontend(Frontend):
                     f"mean: {s['mean']} s", f"max: {s['max']} s"]
         return out
 
+    @staticmethod
+    def _layout_sections(avail, sizes, fi, sel):
+        """Plan how to stack multiple sections into `avail` body rows. Returns a list of entries
+        {idx, top, count, hint, none} for the sections to draw (header always = 1 row each).
+
+        Guarantees (verified by the section_layout sweep test):
+          * total rows used (headers + items + hints + the '(none)' line) never exceeds `avail`
+            — the focused section can NEVER push later sections off-screen (the old bug);
+          * the focused section is always included, and its selected item `sel` is always within
+            the rendered window, whenever it has items and avail >= 2.
+        Trailing blank separators are NOT planned here; the caller draws them only from leftover
+        slack, so they can never cause an overflow."""
+        n = len(sizes)
+        if n == 0 or avail < 2:                      # need >= header + 1 content row to show anything
+            return []
+        fi = fi if 0 <= fi < n else 0
+        cap_sections = max(1, avail // 2)            # each shown section needs >= header + 1 row
+        if n <= cap_sections:
+            show = list(range(n))
+        else:                                        # too tight for all: keep focused + neighbours
+            show = [fi]
+            for i in list(range(fi + 1, n)) + list(range(fi - 1, -1, -1)):
+                if len(show) >= cap_sections:
+                    break
+                show.append(i)
+            show = sorted(show)
+        m = len(show)
+        alloc = {i: 1 for i in show}                 # content rows per section (>=1: an item / "(none)")
+        extra = max(0, avail - 2 * m)                # rows beyond header + 1 content each
+        if extra > 0 and sizes[fi] > 1:              # grow the focused section first (selection visible)
+            g = min(sizes[fi] - 1, extra); alloc[fi] += g; extra -= g
+        active = [i for i in show if i != fi and sizes[i] > alloc[i]]
+        while active and extra > 0:                  # water-fill the rest fairly
+            share = extra // len(active)
+            if share == 0:
+                for i in sorted(active, key=lambda j: -sizes[j]):
+                    if extra <= 0:
+                        break
+                    if alloc[i] < sizes[i]:
+                        alloc[i] += 1; extra -= 1
+                break
+            for i in list(active):
+                g = min(share, sizes[i] - alloc[i]); alloc[i] += g; extra -= g
+                if alloc[i] >= sizes[i]:
+                    active.remove(i)
+        if extra > 0 and alloc[fi] < sizes[fi]:      # focused soaks any remainder
+            g = min(sizes[fi] - alloc[fi], extra); alloc[fi] += g
+        out = []
+        for i in show:
+            size, a = sizes[i], alloc[i]
+            if size == 0:
+                out.append({"idx": i, "top": 0, "count": 0, "hint": False, "none": True})
+                continue
+            if a >= size:
+                count, hint = size, False
+            elif a == 1:
+                count, hint = 1, False               # one row: show an item, no room for a hint
+            else:
+                count, hint = a - 1, True            # items + a "(+N more)" row
+            top = 0
+            if i == fi and sel >= count:             # scroll so the selected item stays visible
+                top = min(sel - count + 1, size - count)
+            out.append({"idx": i, "top": top, "count": count, "hint": hint, "none": False})
+        return out
+
     def _draw(self, stdscr):
         import curses
         stdscr.nodelay(True)
@@ -2445,57 +2510,37 @@ class CursesFrontend(Frontend):
             # ---- section renderer: all sections stacked; the FOCUSED one is highlighted and its
             # selected item reversed (↑↓ scroll it). Non-focused sections show a short peek. ----
             def draw_sections(row0, secs):
-                # Fill the available height instead of hard-capping each section: water-fill the
-                # item rows so every section gets a fair share, and sections wanting fewer rows
-                # release their surplus to the others. Recomputed every frame from body_bottom, so
-                # it re-flows automatically when the terminal is resized.
-                n = len(secs)
+                # Plan the layout (provably fits in `avail`, focused selection always visible),
+                # then render. Recomputed every frame from body_bottom, so it re-flows on resize.
                 avail = max(0, body_bottom - row0)
-                wants = [len(items) for (_t, items, *_r) in secs]
-                item_budget = max(0, avail - 2 * n)        # 1 header + 1 trailing blank per section
-                alloc = [0] * n
-                rem = item_budget
-                active = [i for i in range(n) if wants[i] > 0]
-                while active and rem > 0:
-                    share = rem // len(active)
-                    if share == 0:                         # <1 row each left — hand out singly,
-                        for i in sorted(active, key=lambda j: (j != section_idx, -wants[j])):
-                            if rem <= 0:
-                                break
-                            if alloc[i] < wants[i]:
-                                alloc[i] += 1; rem -= 1
-                        break
-                    for i in list(active):
-                        give = min(share, wants[i] - alloc[i])
-                        alloc[i] += give; rem -= give
-                        if alloc[i] >= wants[i]:
-                            active.remove(i)
+                plan = self._layout_sections(avail, [len(s[1]) for s in secs], section_idx, sel)
+                used = sum(1 + e["count"] + (1 if e["hint"] else 0) + (1 if e["none"] else 0)
+                           for e in plan)
+                slack = max(0, avail - used)               # spare rows → opportunistic blank gaps
                 r = row0
-                for si, (title, items, fmt, color, _dv) in enumerate(secs):
-                    if r >= body_bottom:                   # out of room (tiny screen)
-                        break
+                for e in plan:
+                    si = e["idx"]
+                    title, items, fmt, color, _dv = secs[si]
                     foc = (si == section_idx)
                     mark = "▼ " if foc else "▷ "
-                    put(r, 0, (" " + mark + f"{title} ({len(items)}) ").ljust(w - 1, "-"),
-                        curses.A_BOLD | (curses.A_REVERSE if foc else 0)); r += 1
-                    if not items:
-                        put(r, 1, "(none)", curses.A_DIM); r += 2
-                        continue
-                    cap = max(1, min(alloc[si], len(items)))
-                    if cap < len(items) and cap >= 2:      # reserve the last row for "(+N more)"
-                        cap -= 1
-                    top = 0
-                    if foc and sel >= cap:
-                        top = min(sel - cap + 1, max(0, len(items) - cap))
-                    drawn = 0
-                    for idx in range(top, min(len(items), top + cap)):
-                        if r >= body_bottom:
-                            break
-                        a = (color(items[idx]) or 0) | (curses.A_REVERSE if foc and idx == sel else 0)
-                        put(r, 1, fmt(items[idx]), a); r += 1; drawn += 1
-                    if len(items) > top + drawn and r < body_bottom:
-                        put(r, 1, f"  … (+{len(items) - top - drawn} more)", curses.A_DIM); r += 1
-                    r += 1
+                    if r < body_bottom:
+                        put(r, 0, (" " + mark + f"{title} ({len(items)}) ").ljust(w - 1, "-"),
+                            curses.A_BOLD | (curses.A_REVERSE if foc else 0)); r += 1
+                    if e["none"]:
+                        if r < body_bottom:
+                            put(r, 1, "(none)", curses.A_DIM); r += 1
+                    else:
+                        top = e["top"]
+                        for idx in range(top, top + e["count"]):
+                            if r >= body_bottom:
+                                break
+                            a = (color(items[idx]) or 0) | (curses.A_REVERSE if foc and idx == sel else 0)
+                            put(r, 1, fmt(items[idx]), a); r += 1
+                        if e["hint"] and r < body_bottom:
+                            put(r, 1, f"  … (+{len(items) - e['count']} more)", curses.A_DIM)
+                            r += 1
+                    if slack > 0 and r < body_bottom:       # opportunistic blank separator
+                        r += 1; slack -= 1
 
             row = 6
             if detail is not None:                   # ---- detail overlay for the selected item ----
