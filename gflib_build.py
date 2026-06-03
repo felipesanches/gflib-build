@@ -2746,7 +2746,7 @@ class CursesFrontend(Frontend):
                                  lambda a: RED if a["status"] == "failed" else GREEN, None))
                 # "Now building" is pinned above (shown on every tab), so it's not a section here
                 secs.append(("Recent failures", snap.get("failures_recent", []),
-                             lambda f: [(f"{f['slug']:<34} ", 0), (f['error'], curses.A_DIM)],
+                             lambda f: [(f"{f['slug']:<34} ", RED), (f['error'], RED | curses.A_DIM)],
                              lambda f: RED, "failures"))
                 return secs
             if v == "cohorts":
@@ -2775,7 +2775,7 @@ class CursesFrontend(Frontend):
                                  lambda c: CYAN, "failcat"))
                 secs.append(("Failures — newest first", snap.get("failures_recent", []),
                              # family slug (default) + error (dim) so the slug reads clearly
-                             lambda f: [(f"{f['slug']:<34} ", 0), (f['error'], curses.A_DIM)],
+                             lambda f: [(f"{f['slug']:<34} ", RED), (f['error'], RED | curses.A_DIM)],
                              lambda f: RED, "failures"))
                 return secs
             if v == "stats":
