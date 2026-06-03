@@ -232,6 +232,18 @@ intent so nothing is lost as the tool evolves.
 53. **Cohort rows list family names** separated by ` | ` in a distinct colour from the count/key.
 54. **Stable selection.** As a list grows / shrinks / reorders (families moving failed → building
     → built live), the cursor stays on the *same item*, not the same row index.
+55. **Per-family pre-build commands** (`build_rules.json`, version-controlled next to the script).
+    Map a family slug to ordered shell commands that run — with `cwd` = the extracted upstream
+    source and the build venv's bin first on `PATH` — *before* gftools-builder / fontc / fontmake,
+    for families whose sources must be generated/pre-compiled first. Auto-detected, or
+    `--build-rules PATH`. A non-zero exit fails the family with a clear `pre-build` error.
+56. **Pinned "Now building".** While families are compiling, the live list of what's building is
+    shown on *every* tab (not just overview), so you never lose sight of it.
+57. **Defaults & readability.** Lands on the **overview** tab; the **Failures** list shows *all*
+    currently-failed families (matching the count); config paths render relative to where you
+    launched; the progress bar is **colour-coded by outcome** (built/failed/skipped); tables use
+    distinct, subtle per-column colours; transient (network/IO) failures **auto-retry in-build**;
+    and each failure-cause bucket names *which* families it affected.
 
 ---
 
