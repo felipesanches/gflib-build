@@ -214,9 +214,24 @@ intent so nothing is lost as the tool evolves.
     in the config tab. A retried family rebuilds its broken venv from scratch. (A cause that needs
     a human — a missing system `-dev` library — is *not* auto-retried; fix it then use retry-all.)
 49. **`[R]` — retry the selected family now.** Select a family (e.g. in the *failures* tab) and
-    press `R` to re-attempt just that one. On a live build it's re-queued instantly (the worker
-    picks it back up); on a finished build it launches a one-family targeted rebuild
-    (`--only <slug> --rebuild`).
+    press `R` to re-attempt just that one — a single, non-disruptive in-process action. The
+    detached daemon **lingers after the build completes** (status writer + control watcher stay
+    alive), so `[R]` re-queues the family live with the lists and the whole UI unchanged — no
+    program reload. The daemon idle-exits after 30 min of no new work.
+50. **Hermetic, self-correcting venvs.** A venv's readiness is keyed to a hash of its requirements,
+    so an empty/stale/wrong install is rebuilt (never reused). `base_requirements` is re-derived
+    from the bundled file each run (never persisted as an absolute path that breaks across
+    machines). setuptools+wheel are seeded (Py3.12+ omit them). Dependency *conflicts* (a cohort
+    needing a different version of a base pin) are auto-relaxed cohort-locally.
+51. **Meaningful failure causes.** No more bare `pip install rc=1`: failures are classified as
+    dependency conflict, pip-resolution-too-deep, build-needs-setuptools, missing-system-library
+    (with the `apt install` hint), misconfigured-requirements, transient fetch, stale mirror, etc.
+52. **Progress = processed / selected.** The bar counts built + failed + skipped (everything that
+    won't be retried this pass), so it reaches 100% when nothing is queued/building — labelled
+    `N/M processed (P%)`.
+53. **Cohort rows list family names** separated by ` | ` in a distinct colour from the count/key.
+54. **Stable selection.** As a list grows / shrinks / reorders (families moving failed → building
+    → built live), the cursor stays on the *same item*, not the same row index.
 
 ---
 
