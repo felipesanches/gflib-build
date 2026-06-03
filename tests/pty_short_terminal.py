@@ -57,11 +57,12 @@ def drain(sec):
             out += c
 
 
-RIGHT, TAB = b"\x1bOC", b"\t"
+RIGHT, TAB, BTAB = b"\x1bOC", b"\t", b"\x1b[Z"
 drain(0.9)
+os.write(fd, BTAB); drain(0.5)                        # ⇧Tab to Configuration (overview is default)
 cfg = out.decode("utf-8", "replace")                  # Configuration tab on a short screen
 out = b""
-os.write(fd, TAB); drain(0.4)                          # -> overview
+os.write(fd, TAB); drain(0.4)                          # back to overview
 os.write(fd, RIGHT); os.write(fd, RIGHT); os.write(fd, RIGHT); drain(0.6)  # focus Recent failures (sel=0)
 ov = out.decode("utf-8", "replace")
 os.write(fd, b"q"); drain(1.2)

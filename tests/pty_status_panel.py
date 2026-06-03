@@ -65,14 +65,15 @@ def snap():
     return out.decode("utf-8", "replace")
 
 
-TAB, RIGHT, ESC = b"\t", b"\x1bOC", b"\x1b"
+TAB, BTAB, RIGHT, ESC = b"\t", b"\x1b[Z", b"\x1bOC", b"\x1b"
 drain(1.0)
-# land on Configuration tab: the panel should describe the focused config field (first = source)
+# the dashboard lands on Overview now; ⇧Tab over to Configuration to check the config-field panel
+os.write(fd, BTAB); drain(0.6)
 cfg_txt = snap()
 assert "where the worklist comes from" in cfg_txt, "config-field panel missing:\n" + cfg_txt[-700:]
 print("panel describes the focused configuration field")
 
-os.write(fd, TAB); drain(0.5)             # Configuration -> Overview
+os.write(fd, TAB); drain(0.5)             # back to Overview (the default tab)
 out = b""                                  # clear so we read the post-focus screen
 os.write(fd, RIGHT); drain(0.6)           # focus 'Archive — mirrored', first item = the failure
 panel_txt = snap()

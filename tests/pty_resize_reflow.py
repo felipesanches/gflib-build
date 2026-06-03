@@ -68,7 +68,7 @@ def shown(text):
 
 TAB = b"\t"
 setsize(20, 140); drain(0.7)
-os.write(fd, TAB); drain(0.7)                          # overview, SMALL (20 rows)
+drain(0.7)                          # overview (default), SMALL (20 rows)
 out = b""; drain(0.6)
 small = out.decode("utf-8", "replace")
 small_n = shown(small)

@@ -65,7 +65,7 @@ def drain(sec):
 
 TAB = b"\t"
 drain(0.9)
-for _ in range(4):                                        # config -> overview -> cohorts -> built -> failures
+for _ in range(3):                                        # overview -> cohorts -> built -> failures
     os.write(fd, TAB); drain(0.25)
 drain(0.3)
 os.write(fd, b"R"); drain(0.6)                            # retry the selected (first) failure

@@ -55,7 +55,7 @@ def drain(sec):
 
 TAB, RIGHT, DOWN, ENTER, ESC = b"\t", b"\x1bOC", b"\x1bOB", b"\r", b"\x1b"
 drain(1.0)
-os.write(fd, TAB); drain(0.4)             # config -> overview
+drain(0.4)             # default tab is now overview
 os.write(fd, RIGHT); drain(0.4)           # focus section 1 (Archive or Now building)
 os.write(fd, RIGHT); drain(0.4)           # focus next section
 os.write(fd, RIGHT); drain(0.4)           # focus Recent failures

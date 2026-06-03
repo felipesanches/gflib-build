@@ -94,6 +94,7 @@ class Result:
     backend: str = ""                # fontc|fontmake
     cohort: str = ""                 # venv cohort key
     note: str = ""                   # transient ("installing deps", ...)
+    retries: int = 0                 # in-build auto-retries spent on a transient failure
     error: str = ""
     log: str = ""
     out_bytes: int = 0
@@ -324,6 +325,10 @@ AUTO_RETRY_CATEGORIES = {
     "stale archive mirror", "repo not mirrored", "internal/transient I/O",
     "dependency conflict", "build needs setuptools", "misconfigured requirements",
 }
+
+# Causes an IMMEDIATE in-build retry can clear (the transient ones); re-queued automatically a few
+# times before being recorded as failed — the user shouldn't have to retry a network/IO blip.
+IN_BUILD_RETRY_CATEGORIES = {"transient fetch error", "internal/transient I/O"}
 
 
 def _clone_mirror_once(url: str, dest: str, timeout: int,
@@ -1098,6 +1103,7 @@ class Orchestrator:
         self._enqueued_retries = 0
         self._linger = False                          # detached daemon: stay alive after completion
         self.LINGER_SECONDS = 1800                    #   so [R]/% bumps apply live (no re-exec)
+        self.IN_BUILD_RETRIES = 2                     # auto-retries for a transient failure per build
         self.failures: List[str] = []
         self.workers: List[threading.Thread] = []
         self._wid_counter = 0                    # monotonic worker ids (no collisions on respawn)
@@ -1406,13 +1412,14 @@ class Orchestrator:
             backends = {"fontc": 0, "fontmake": 0}
             migration = {"fontc": 0, "fontmake_fallback": 0, "fontmake_only": 0,
                          "both_identical": 0, "both_differ": 0}
-            fail_cat = {}                            # cause -> [count, hint] for the failure summary
+            fail_cat = {}                            # cause -> [count, hint, [slugs]] for the summary
             building = []
             for r in rs:
                 counts[r.status] = counts.get(r.status, 0) + 1
                 if r.status == "failed":
                     cat, hint = categorize_failure(r.error)
-                    slot = fail_cat.setdefault(cat, [0, hint]); slot[0] += 1
+                    slot = fail_cat.setdefault(cat, [0, hint, []])
+                    slot[0] += 1; slot[2].append(r.slug)
                 if r.status == "built" and r.backend:
                     backends[r.backend] = backends.get(r.backend, 0) + 1
                     if r.backend == "fontc":
@@ -1431,11 +1438,14 @@ class Orchestrator:
                                      "backend": r.backend, "note": r.note})
             building.sort(key=lambda b: -b["dur"])
             fail_categories = sorted(
-                [{"cat": k, "count": v[0], "hint": v[1]} for k, v in fail_cat.items()],
+                [{"cat": k, "count": v[0], "hint": v[1], "families": sorted(v[2])}
+                 for k, v in fail_cat.items()],
                 key=lambda c: -c["count"])
-            fails = [{"slug": s, "error": self.results[s].error, "log": self.results[s].log}
-                     for s in self.failures                # drop ones since rebuilt/re-queued
-                     if s in self.results and self.results[s].status == "failed"][-50:][::-1]
+            # ALL currently-failed families (newest first), not just this session's self.failures —
+            # so the list matches the 'failed N' count even after a resume from state.json.
+            fails = sorted([{"slug": r.slug, "error": r.error[:300], "log": r.log, "ended": r.ended}
+                            for r in rs if r.status == "failed"],
+                           key=lambda f: -f["ended"])[:2000]
             built = sorted(([{"slug": r.slug, "backend": r.backend, "bytes": r.out_bytes,
                               "compare": r.compare, "log": r.log, "ended": r.ended}
                              for r in rs if r.status == "built"]),
@@ -1525,12 +1535,26 @@ class Orchestrator:
     def _fail(self, slug: str, msg: str):
         # NOTE: the throwaway work/ extraction is cleaned by _build_one's finally; here we
         # only drop any partial collected outputs so failures never leak disk under out/.
+        shutil.rmtree(self.build_dir / "out" / slug.replace("/", "__"), ignore_errors=True)
+        # PROACTIVE in-build self-heal: a TRANSIENT failure (network hiccup, transient I/O) often
+        # clears on an immediate retry — re-queue it (up to IN_BUILD_RETRIES) instead of failing,
+        # so the user doesn't have to. (Other causes need a rebuilt venv / human action, which the
+        # cross-run auto-retry on the next Start handles.)
+        cat = categorize_failure(msg)[0]
+        with self.lock:
+            r = self.results.get(slug)
+            tries = r.retries if r is not None else 0
+        if cat in IN_BUILD_RETRY_CATEGORIES and tries < self.IN_BUILD_RETRIES:
+            self._set(slug, status="queued", note=f"auto-retry {tries + 1} ({cat})",
+                      retries=tries + 1, error="")
+            self._emit("retry", slug, attempt=tries + 1, cause=cat)
+            self.q.put(slug)
+            return
         self._set(slug, status="failed", ended=time.time(), error=msg, note="")
         with self.lock:
             if slug not in self.failures:
                 self.failures.append(slug)
         self._emit("failed", slug, error=msg)
-        shutil.rmtree(self.build_dir / "out" / slug.replace("/", "__"), ignore_errors=True)
         self.save_state()
 
     def _build_one(self, wid: int, slug: str):
@@ -2268,6 +2292,19 @@ class CursesFrontend(Frontend):
             cfg = load_config(Path(snap["config_path"]))
         return cfg
 
+    @staticmethod
+    def _display_path(p: str) -> str:
+        """Show a path relative to the current working directory when it lives under it (so a
+        config built with absolute paths reads as e.g. 'gflib-data/build' from where the program
+        was launched); leave far-away paths absolute."""
+        if not p:
+            return p
+        try:
+            rel = os.path.relpath(p, os.getcwd())
+        except ValueError:                            # e.g. different drive on Windows
+            return p
+        return rel if not rel.startswith("..") else p
+
     @classmethod
     def _cfg_init_fields(cls, cfg: dict) -> list:
         """Build editable field descriptors (value string + caret) from a config dict."""
@@ -2283,6 +2320,8 @@ class CursesFrontend(Frontend):
                 if f["key"] == "timeout":
                     v = 0 if not v else int(v)
                 f["value"] = "" if v is None else (f"{v:g}" if isinstance(v, float) else str(v))
+                if f["type"] == "path" and f["value"]:   # render relative to where we were launched
+                    f["value"] = cls._display_path(f["value"])
                 f["_caret"] = len(f["value"])
             fields.append(f)
         return fields
@@ -2411,7 +2450,11 @@ class CursesFrontend(Frontend):
                     + (f" — needs {reqs[0]}" if reqs else " (base — no extra requirements)"),
                     "  " + (" | ".join(fams) if fams else "(none assigned yet)")]
         if kind == "failcat":                             # a failure-cause bucket {cat,count,hint}
-            return [f"{item['count']} families failed: {item['cat']}", "  → " + item.get("hint", "")]
+            fams = item.get("families", [])
+            line2 = ("  " + ", ".join(fams[:6]) + (" …" if len(fams) > 6 else "")) if fams \
+                else "  → " + item.get("hint", "")
+            return [f"{item['count']} families failed: {item['cat']}", line2,
+                    "  → " + item.get("hint", "")][: 2 if not fams else 3]
         if kind == "stats":                               # an op: (op, {total,count,mean,max})
             op, st = item
             return [f"{op}: total {st['total']}s · n {st['count']} · mean {st['mean']}s · max {st['max']}s"]
@@ -2445,10 +2488,13 @@ class CursesFrontend(Frontend):
                 out.append(f"progress: {item['done']}/{item['total']}")
             if item.get("detail"):
                 out += ["", "detail:", "  " + str(item["detail"])]
-        elif view == "failcat":                      # {cat, count, hint}
+        elif view == "failcat":                      # {cat, count, hint, families}
+            fams = item.get("families", [])
             out += [f"Failure cause: {item.get('cat', '')}",
                     f"families affected: {item.get('count', 0)}", "",
-                    "what to do:", "  " + item.get("hint", "")]
+                    "affected families:"]
+            out += ["  " + s for s in fams] or ["  (none)"]
+            out += ["", "what to do:", "  " + item.get("hint", "")]
         elif view == "cohorts":                      # {key, count, requirements, families}
             fams = item.get("families", [])
             out += [f"Cohort: {item.get('key', '')}", f"families: {item.get('count', 0)}", "",
@@ -2504,6 +2550,19 @@ class CursesFrontend(Frontend):
         if isinstance(item, tuple) and item:
             return item[0]
         return None
+
+    @staticmethod
+    def _name_segments(names, name_attr, sep_attr, sep=" | ", empty="(none)"):
+        """Render a name list as colour segments with the SEPARATOR in its own colour, so a long
+        'a | b | c' reads clearly (names one colour, the ' | ' another)."""
+        if not names:
+            return [(empty, name_attr)]
+        segs = []
+        for i, n in enumerate(names):
+            if i:
+                segs.append((sep, sep_attr))
+            segs.append((n, name_attr))
+        return segs
 
     @classmethod
     def _resolve_selection(cls, items, sel, sel_key):
@@ -2636,12 +2695,12 @@ class CursesFrontend(Frontend):
                 return secs
             if v == "cohorts":
                 return [("Dependency cohorts", snap.get("cohorts", []),
-                         # two-colour row: count+key in the cohort colour, family names in GREEN,
-                         # separated by " | " so they read as a distinct list (request)
+                         # count+key in the cohort colour, then family names in GREEN with the
+                         # " | " separators in CYAN so the list reads clearly (request)
                          lambda co: [("%4d  %-14s " % (co["count"], co["key"]),
-                                      0 if co["key"] == "base" else CYAN),
-                                     (" | ".join(co.get("families", [])) or "(no families yet)",
-                                      GREEN)],
+                                      0 if co["key"] == "base" else CYAN)]
+                         + self._name_segments(co.get("families", []), GREEN, CYAN,
+                                               empty="(no families yet)"),
                          lambda co: 0 if co["key"] == "base" else CYAN, "cohorts")]
             if v == "built":
                 return [("Built — successes", snap.get("built_recent", []),
@@ -2653,10 +2712,15 @@ class CursesFrontend(Frontend):
                 cats = snap.get("fail_categories", [])
                 if cats:
                     secs.append(("Failures by cause", cats,
-                                 lambda c: f"{c['count']:>4}  {c['cat']:<24} {c['hint']}",
-                                 lambda c: YEL, "failcat"))
+                                 # count (bold), cause (cyan), hint (dim) — distinct, subtle columns
+                                 lambda c: [(f"{c['count']:>4}  ", curses.A_BOLD),
+                                            (f"{c['cat']:<24}", CYAN),
+                                            (" " + c['hint'], curses.A_DIM)],
+                                 lambda c: CYAN, "failcat"))
                 secs.append(("Failures — newest first", snap.get("failures_recent", []),
-                             lambda f: f"{f['slug']:<34} {f['error']}", lambda f: RED, "failures"))
+                             # family slug (default) + error (dim) so the slug reads clearly
+                             lambda f: [(f"{f['slug']:<34} ", 0), (f['error'], curses.A_DIM)],
+                             lambda f: RED, "failures"))
                 return secs
             if v == "stats":
                 phases = sorted(snap.get("phase_durations", {}).items(), key=lambda kv: -kv[1])
@@ -2671,7 +2735,8 @@ class CursesFrontend(Frontend):
 
         mon = getattr(self, "monitor", False)
         setup = getattr(self, "setup", False)        # pre-build first-run Configuration screen
-        view = "config"                              # land on the Configuration tab (leftmost)
+        # first-run setup IS the config tab; the live dashboard lands on overview (the build status)
+        view = "config" if setup else "overview"
         sel, detail, dscroll = 0, None, 0
         sel_key = None                               # identity of the selected item (follow it as
         section_idx = 0                              #   the list reorders); None right after a move
@@ -2847,18 +2912,35 @@ class CursesFrontend(Frontend):
                     put(2, 0, f" Phase: {plabel}  {pd}/{pt}  {snap['phase_label'][:30]}",
                         YEL | curses.A_BOLD)
                     frac = pd / max(1, pt)
+                    segmented = False
+                    bar_label = f" {pd}/{pt} {plabel} ({int(100 * frac)}%) "
                 else:
                     put(2, 0, f" Phase: {plabel}   built {c['built']}  failed {c['failed']}  "
                               f"skipped {c['skipped']}  building {c['building']}  queued {c['queued']}",
                         curses.A_BOLD)
                     frac = done / grand
+                    segmented = True
+                    bar_label = f" {done}/{grand} processed ({int(100 * frac)}%) "
                 if snap["phase_error"]:
                     put(2, max(0, w - 30), f"ERR {snap['phase_error'][:24]}", RED)
                 barw = max(10, w - 4)
-                fill = int(barw * frac)
-                put(3, 1, "[" + "#" * fill + "-" * (barw - fill) + "]")
-                put(3, max(2, barw // 2), f" {done}/{grand} processed ({int(100 * frac)}%) ",
-                    curses.A_BOLD)
+                if segmented:                         # colour the bar by outcome: built/failed/skipped
+                    bw = int(barw * c["built"] / grand)
+                    fw = int(barw * c["failed"] / grand)
+                    sw = int(barw * c["skipped"] / grand)
+                    rest = max(0, barw - bw - fw - sw)
+                    put(3, 1, "[")
+                    x = 2
+                    for seg_w, seg_attr in ((bw, GREEN), (fw, RED), (sw, curses.A_DIM)):
+                        if seg_w > 0:
+                            put(3, x, "#" * seg_w, seg_attr); x += seg_w
+                    if rest > 0:
+                        put(3, x, "-" * rest, curses.A_DIM); x += rest
+                    put(3, x, "]")
+                else:
+                    fill = int(barw * frac)
+                    put(3, 1, "[" + "#" * fill + "-" * (barw - fill) + "]")
+                put(3, max(2, barw // 2), bar_label, curses.A_BOLD)
             # tabs — Tab / Shift-Tab are the ONLY way to switch (←→ and numbers edit fields)
             x = 1
             for name in self.VIEWS:
