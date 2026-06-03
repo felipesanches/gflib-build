@@ -25,5 +25,17 @@
     }
   },
   "rules": {
+    "ofl/cairo": {
+      "note": "Gue3bara/Cairo: sources/cairo.yaml builds CairoNormal.glyphs, which build.sh generates from sources/Cairo.glyphs via scripts/makenormal.py (needs glyphsLib, in the base venv).",
+      "pre_build": [
+        "python3 scripts/makenormal.py sources/Cairo.glyphs sources/CairoNormal.glyphs"
+      ]
+    },
+    "ofl/cairoplay": {
+      "note": "Gue3bara/Cairo: sources/cairoplay.yaml builds CairoPlay.glyphs, which build.sh generates from sources/Cairo.glyphs via scripts/makeplay.py.",
+      "pre_build": [
+        "python3 scripts/makeplay.py sources/Cairo.glyphs sources/CairoPlay.glyphs"
+      ]
+    }
   }
 }

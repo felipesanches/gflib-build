@@ -10,12 +10,18 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import gflib_build as g
 
-# the shipped build_rules.json parses and (currently) has an empty rule set
+# the shipped build_rules.json parses; every rule is well-formed (slug -> {pre_build: [str,...]})
 shipped = Path(__file__).resolve().parent.parent / "build_rules.json"
 assert shipped.is_file(), "build_rules.json must be version-controlled next to the script"
-assert json.loads(shipped.read_text())["rules"] == {}, "shipped rules start empty"
-assert g.load_build_rules(shipped) == {}
-print("shipped build_rules.json parses; rules start empty")
+rules = g.load_build_rules(shipped)
+for slug, rule in rules.items():
+    assert slug.count("/") == 1, f"rule key should be a family slug: {slug}"
+    cmds = rule.get("pre_build")
+    assert isinstance(cmds, list) and cmds and all(isinstance(c, str) for c in cmds), (slug, rule)
+# the known Cairo cases (generated .glyphs) are registered
+assert "ofl/cairo" in rules and "makenormal" in rules["ofl/cairo"]["pre_build"][0]
+assert "ofl/cairoplay" in rules and "makeplay" in rules["ofl/cairoplay"]["pre_build"][0]
+print(f"shipped build_rules.json parses; {len(rules)} well-formed rule(s): {sorted(rules)}")
 
 # loader reads the 'rules' object
 tf = tempfile.mktemp(suffix=".json")
