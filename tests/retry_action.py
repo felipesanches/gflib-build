@@ -1,7 +1,7 @@
-"""The [R] 'retry now' action. Live (daemon running): a {"retry": [slug]} control message re-queues
-that family via apply_live/_requeue. Finished build (no daemon): _retry_argv builds a one-family
-targeted '--only <slug> --rebuild --yes' re-exec. Only families the run knows how to build are
-re-queued."""
+"""The [R] 'retry now' action: a {"retry": [slug]} control message re-queues that family via
+apply_live/_requeue (the daemon lingers after completion, so this works even when the build shows
+complete — no program re-exec). Only families the run knows how to build, and not already in
+flight, are re-queued."""
 import os
 import sys
 import tempfile
@@ -9,16 +9,6 @@ import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import gflib_build as g
-
-# ---- _retry_argv: keep existing flags, drop one-shot/attach/prior --only, append targeted rebuild
-argv = ["gflib_build.py", "--data-dir", "/d", "--attach", "--only", "ofl/old", "--ui", "curses",
-        "--wizard", "--yes"]
-out = g._retry_argv(argv, "ofl/new")
-assert out[0] == "gflib_build.py" and "--data-dir" in out and "/d" in out and "--ui" in out
-assert "--attach" not in out and "--wizard" not in out and "ofl/old" not in out
-assert out[-4:] == ["--only", "ofl/new", "--rebuild", "--yes"]
-assert "--only=ofl/x" not in g._retry_argv(["s", "--only=ofl/x"], "ofl/new")  # --only=VALUE form too
-print("_retry_argv: drops prior --only / one-shot flags, appends targeted rebuild")
 
 # ---- live re-queue ----
 d = tempfile.mkdtemp(prefix="_retry_")
@@ -30,19 +20,25 @@ args = types.SimpleNamespace(
     build_python="python3", timeout=None, rebuild=False, retry_failed=False, compare=False,
     keep_work=False, keep_fonts=True, mirror_missing=False, _want_build_fontc=False, _data_dir=d)
 o = g.Orchestrator(args)
-o.families = {"ofl/x": g.Family("ofl/x", "X", "u", "c", None, False, [])}
-o.results = {"ofl/x": g.Result(slug="ofl/x", status="failed", error="venv: No module named 'gftools'")}
+o.families = {s: g.Family(s, s, "u", "c", None, False, []) for s in ("ofl/x", "ofl/busy", "ofl/q")}
+o.results = {
+    "ofl/x": g.Result(slug="ofl/x", status="failed", error="venv: No module named 'gftools'"),
+    "ofl/busy": g.Result(slug="ofl/busy", status="building"),   # in flight → must NOT requeue
+    "ofl/q": g.Result(slug="ofl/q", status="queued"),           # already queued → must NOT requeue
+}
 
-# _requeue only touches families this run knows how to build
-n = o._requeue(["ofl/x", "ofl/unknown"])
+# _requeue only touches known, NOT-in-flight families (never double-build a building/queued slug)
+n = o._requeue(["ofl/x", "ofl/busy", "ofl/q", "ofl/unknown"])
 assert n == 1, n
 assert o.results["ofl/x"].status == "queued", o.results["ofl/x"].status
+assert o.results["ofl/busy"].status == "building", "must not re-queue an in-flight family"
+assert o.results["ofl/q"].status == "queued"
 assert "ofl/unknown" not in o.results, "must not invent a result for an unknown family"
 got = []
 while not o.q.empty():
     got.append(o.q.get())
 assert got == ["ofl/x"], got
-print("_requeue: re-queues a known failed family; ignores unknown slugs")
+print("_requeue: re-queues a known failed family; skips in-flight + unknown slugs")
 
 # apply_live routes a {"retry": [...]} control message to _requeue (workers stubbed out)
 o.results["ofl/x"] = g.Result(slug="ofl/x", status="failed", error="venv: No module named 'gftools'")

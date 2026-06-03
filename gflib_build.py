@@ -1096,6 +1096,8 @@ class Orchestrator:
         self._build_total = 0                        # build-dir total bytes; refreshed off-thread
         self._enqueued = 0                            # families queued this run; how many are retries
         self._enqueued_retries = 0
+        self._linger = False                          # detached daemon: stay alive after completion
+        self.LINGER_SECONDS = 1800                    #   so [R]/% bumps apply live (no re-exec)
         self.failures: List[str] = []
         self.workers: List[threading.Thread] = []
         self._wid_counter = 0                    # monotonic worker ids (no collisions on respawn)
@@ -1889,6 +1891,54 @@ class Orchestrator:
                     stop=self.stop, clone_lock=self.clone_locks), daemon=True).start()
         return len(fresh)
 
+    def _run_build_loop(self):
+        """Drain the work queue: spawn/keep workers until nothing is building or queued. Returns
+        when the queue is empty (workers self-exit on all_done) — NOT necessarily 'done forever';
+        a live percent-bump or [R] retry that queues more work keeps it going."""
+        self._ensure_workers(self.args.jobs)
+        while not self.stop.is_set():
+            with self.lock:
+                alive = any(th.is_alive() for th in self.workers)
+                pending = (not self.q.empty()) or any(
+                    r.status == "queued" for r in self.results.values())
+                done_n = sum(1 for r in self.results.values()
+                             if r.status in ("built", "failed", "skipped"))
+            if not alive:
+                if pending:
+                    self._ensure_workers(self.args.jobs)   # live bump → resume building
+                    continue
+                break                                      # queue drained
+            self._task_progress("build", done_n)
+            time.sleep(0.2)
+
+    def _finalize_build_outcome(self):
+        """Set the build task's OUTCOME (built/failed, ❌ when nothing built) — not just a count."""
+        with self.lock:
+            nb = sum(1 for r in self.results.values() if r.status == "built")
+            nf = sum(1 for r in self.results.values() if r.status == "failed")
+            bt = self._task("build")
+            if bt is not None:
+                bt.status = "failed" if (nb == 0 and nf > 0) else "done"
+                bt.t1 = time.time()
+                bt.detail = f"{nb} built, {nf} failed"
+
+    def _linger_wait(self) -> bool:
+        """Detached daemon only: after a build drains, stay ALIVE (status writer + control watcher
+        keep running) so [R] retries and live % bumps apply WITHOUT re-execing the program. Shows
+        the build as complete meanwhile. Returns True if new work arrived (resume the build loop),
+        False on the idle timeout or a stop (let the daemon exit)."""
+        self._set_phase("done")                       # UI shows BUILD COMPLETE while we linger
+        deadline = time.time() + self.LINGER_SECONDS
+        while not self.stop.is_set() and time.time() < deadline:
+            with self.lock:
+                pending = (not self.q.empty()) or any(
+                    r.status == "queued" for r in self.results.values())
+            if pending:                               # a live retry / % bump queued more work
+                self._set_phase("build")
+                return True
+            time.sleep(0.5)
+        return False
+
     def _drive(self):
         try:
             # Task: clone google/fonts (shallow) if the worklist needs METADATA and it's absent.
@@ -1974,44 +2024,20 @@ class Orchestrator:
                 with self.lock:
                     build_total = len(self.results)   # queued now + any already-built (resume)
                 self._task_start("build", build_total)
-                self._ensure_workers(self.args.jobs)  # spawn the initial pool (atomic)
-                # Completion is decided here, NOT by setting the global `stop` on all_done():
-                # that lets a live percent-bump re-open the build. The workers self-exit when
-                # (all_done and queue empty); when none are alive we re-check, UNDER THE LOCK,
-                # whether a live bump queued more work — if so, respawn and keep going; else the
-                # build is truly done. `stop` stays reserved for shutdown (Ctrl-C / --stop).
-                while True:
-                    if self.stop.is_set():
-                        break
-                    with self.lock:
-                        alive = any(th.is_alive() for th in self.workers)
-                        pending = (not self.q.empty()) or any(
-                            r.status == "queued" for r in self.results.values())
-                        done_n = sum(1 for r in self.results.values()
-                                     if r.status in ("built", "failed", "skipped"))
-                    if not alive:
-                        if pending:
-                            self._ensure_workers(self.args.jobs)   # live bump → resume building
-                            continue
-                        break                          # build truly complete
-                    self._task_progress("build", done_n)
-                    time.sleep(0.2)
-                self.stop.set()                        # build done → abort the pre-warmer's clones
-                # the build task's OUTCOME, not just "processed 15/15": show built/failed, and
-                # mark it failed (❌, not ✅) when every build failed — so it never looks like a
-                # success when nothing built.
-                with self.lock:
-                    nb = sum(1 for r in self.results.values() if r.status == "built")
-                    nf = sum(1 for r in self.results.values() if r.status == "failed")
-                    bt = self._task("build")
-                    if bt is not None:
-                        bt.status = "failed" if (nb == 0 and nf > 0) else "done"
-                        bt.t1 = time.time()
-                        bt.detail = f"{nb} built, {nf} failed"
-
-                # (c) let the pre-warmer wind down. The build loop already set `stop` once builds
-                # finished, which aborts any remaining clones; this just joins it cleanly.
-                if prewarm is not None:
+                # Build, then (detached daemon only) LINGER so [R] retries and live % bumps apply
+                # without re-execing the program. The workers self-exit when (all_done and queue
+                # empty); `stop` stays reserved for true shutdown (Ctrl-C / --stop / idle timeout).
+                first = True
+                while not self.stop.is_set():
+                    if not first:
+                        self._task_running("build", len(self.results))   # resumed → reopen the task
+                    self._run_build_loop()
+                    self._finalize_build_outcome()
+                    first = False
+                    if not self._linger or not self._linger_wait():
+                        break                          # foreground, or idle/stop while lingering
+                self.stop.set()                        # truly done → abort the pre-warmer's clones
+                if prewarm is not None:                # let the pre-warmer wind down
                     prewarm.join(timeout=10)
                     at = self._task("archive")
                     if at is not None and at.status == "running":
@@ -2032,6 +2058,13 @@ class Orchestrator:
                     else:
                         done_note = f"nothing to build: all {built} selected families already built"
                 self._task_done("build", done_note)
+                # detached daemon: linger even with nothing queued, so [R] on a failure works live
+                while self._linger and not self.stop.is_set() and self._linger_wait():
+                    self._task_running("build", len(self.results))
+                    self._run_build_loop()
+                    self._finalize_build_outcome()
+                if self._linger:
+                    self.stop.set()
         except Exception as e:
             with self.lock:
                 self.phase_error = str(e)
@@ -2692,12 +2725,16 @@ class CursesFrontend(Frontend):
                     if slug and dview == "building":     # already in flight — never double-build it
                         flash, flash_frames = f"{slug} is already building", 10
                     elif slug and dview in ("failures", "built"):   # a finished family → retry it
-                        if snap.get("daemon_alive", True) and not snap.get("done"):
+                        # The daemon lingers after completion, so a live retry works even when the
+                        # build shows complete — no program reload, the lists stay put. Only if the
+                        # daemon has truly exited (idle-timed-out) do we tell the user to re-run.
+                        if snap.get("daemon_alive", True):
                             ok = write_control(self.orch.build_dir, {"retry": [slug]})
                             flash, flash_frames = ((f"⟳ retrying {slug} …" if ok
                                                     else f"⚠ couldn't request retry of {slug}"), 16)
-                        else:                            # finished build → targeted rebuild (re-exec)
-                            return ("retry", slug)
+                        else:
+                            flash, flash_frames = ("build daemon has exited — re-run "
+                                                   "(or [C] then Start) to resume and retry", 24)
                 elif ch == curses.KEY_RIGHT and len(secs) > 1:   # → next section (Ctrl+Tab is
                     section_idx = (section_idx + 1) % len(secs); sel = 0   # eaten by most terminals)
                 elif ch == curses.KEY_LEFT and len(secs) > 1:    # ← previous section
@@ -2997,41 +3034,12 @@ def pick_frontend(name: str) -> str:
 
 def run_monitor(build_dir: Path, ui: str):
     """Attach a read-only live monitor to a (possibly detached) build at build_dir.
-    Returns "reconfigure" if the user pressed C to go back to the setup wizard. ("retry", slug)
-    from [R] on a FINISHED build re-execs a one-family targeted rebuild (never returns)."""
+    Returns "reconfigure" if the user pressed C to go back to the setup wizard. [R] retries the
+    selected family LIVE via control.json (the daemon lingers after completion), so there is no
+    program re-exec to do here."""
     fe = FRONTENDS[ui if ui in FRONTENDS else "plain"](MonitorState(build_dir))
     fe.monitor = True
-    r = fe.run()
-    if isinstance(r, tuple) and len(r) == 2 and r[0] == "retry":
-        reexec_retry(r[1])                            # no live daemon → targeted rebuild; never returns
-    return r
-
-
-def _retry_argv(argv: list, slug: str) -> list:
-    """Build the re-exec argv for a one-family targeted rebuild: keep the existing flags but drop
-    any prior --only / one-shot flags and append `--only <slug> --rebuild --yes`. Pure (testable)."""
-    drop = {"--attach", "--wizard", "-y", "--yes", "--rebuild", "--retry-failed", "--reset", "--stop"}
-    out, skip = [], False
-    for a in argv:
-        if skip:
-            skip = False; continue
-        if a == "--only":
-            skip = True; continue                     # drop a prior "--only <value>"
-        if a.startswith("--only="):
-            continue
-        if a in drop:
-            continue
-        out.append(a)
-    return out + ["--only", slug, "--rebuild", "--yes"]
-
-
-def reexec_retry(slug: str):
-    """Re-exec a one-family targeted rebuild (the dashboard's [R] with no live daemon). Mirrors
-    reexec_wizard; reuses the documented `--only <slug> --rebuild` path."""
-    argv = [sys.executable] + _retry_argv(sys.argv, slug)
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os.execv(sys.executable, argv)
+    return fe.run()
 
 
 def reexec_wizard():
@@ -3646,7 +3654,8 @@ def main():
 
     if detach:
         if daemonize(build_dir):                  # detached daemon: run the build, headless
-            orch.run()
+            orch._linger = True                   # stay alive after completion so the dashboard's
+            orch.run()                            # [R]/live-% apply without re-execing the program
             orch.join()
             orch.save_state()
             return
