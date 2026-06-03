@@ -1947,6 +1947,12 @@ class Orchestrator:
                                             f"{', '.join(retry[:3])} not in this run's worklist "
                                             f"(raise % to include) or already building")
                     del self.control_log[:-50]
+        if "pause" in settings:                       # pause/resume the worker pool (web button)
+            if settings["pause"]:
+                self.paused.set()
+            else:
+                self.paused.clear()
+            changed.append("paused" if settings["pause"] else "resumed")
         if changed:
             with self.lock:
                 self.control_log.append(f"[{hms(self.snapshot_elapsed())}] " + ", ".join(changed))
@@ -3285,8 +3291,225 @@ class CursesFrontend(Frontend):
             time.sleep(0.25)
 
 
+WEB_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>gflib-build dashboard</title>
+<style>
+:root{--bg:#0b0e14;--fg:#cbd5e1;--dim:#64748b;--g:#4ade80;--r:#f87171;--y:#fbbf24;--c:#22d3ee;
+ --pan:#111827;--bd:#1f2937;--sel:#1e3a5f}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
+ font:13px/1.45 ui-monospace,Menlo,Consolas,monospace}
+#hdr{padding:8px 12px;border-bottom:1px solid var(--bd)}
+#hdr .t{font-weight:700}.stat{color:var(--c)}.muted{color:var(--dim)}
+#bar{height:18px;margin:6px 0 2px;background:#0f1521;border:1px solid var(--bd);border-radius:3px;
+ display:flex;overflow:hidden;position:relative}
+#bar .seg{height:100%}#bar .lbl{position:absolute;width:100%;text-align:center;font-weight:700;
+ line-height:18px;color:#e5e7eb;text-shadow:0 0 3px #000}
+#tabs{display:flex;gap:2px;padding:6px 8px 0;border-bottom:1px solid var(--bd);flex-wrap:wrap}
+.tab{padding:5px 12px;cursor:pointer;border:1px solid var(--bd);border-bottom:none;border-radius:5px 5px 0 0;
+ background:#0f1521;color:var(--dim)}.tab.on{background:var(--pan);color:var(--fg);font-weight:700}
+.tab .b{display:inline-block;min-width:18px;text-align:center;margin-left:6px;padding:0 5px;border-radius:8px;
+ background:#1e293b;color:var(--fg);font-size:11px}
+#wrap{display:flex;gap:10px;padding:10px;align-items:flex-start}
+#main{flex:1;min-width:0}#side{width:330px;flex-shrink:0}
+.card{background:var(--pan);border:1px solid var(--bd);border-radius:6px;margin-bottom:10px}
+.card h3{margin:0;padding:6px 10px;font-size:12px;border-bottom:1px solid var(--bd);color:var(--c)}
+.card .body{padding:4px 0;max-height:46vh;overflow:auto}
+.row{padding:3px 10px;display:flex;gap:10px;cursor:pointer;white-space:nowrap}
+.row:hover{background:#0f1726}.row.sel{background:var(--sel)}
+.row .s{flex:1;overflow:hidden;text-overflow:ellipsis}.row .meta{color:var(--dim)}
+.badge{display:inline-block;min-width:54px;text-align:center;padding:0 6px;border-radius:3px;font-size:11px}
+.bg-new{background:#14331f;color:var(--g)}.bg-retry{background:#3a2e0a;color:var(--y)}
+.bg-rebuild{background:#0c2e36;color:var(--c)}
+.g{color:var(--g)}.r{color:var(--r)}.y{color:var(--y)}.c{color:var(--c)}.d{color:var(--dim)}
+#ctl{padding:8px 12px;border-top:1px solid var(--bd);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button{background:#1e293b;color:var(--fg);border:1px solid var(--bd);border-radius:4px;padding:4px 10px;
+ cursor:pointer;font:inherit}button:hover{background:#243248}button:disabled{opacity:.4;cursor:default}
+#log{font-size:11px;color:var(--dim);padding:0 12px 8px;white-space:pre-wrap;max-height:90px;overflow:auto}
+kbd{background:#1e293b;border:1px solid var(--bd);border-radius:3px;padding:0 4px}
+table.kv td{padding:2px 10px}table.kv td:first-child{color:var(--dim)}
+</style></head><body>
+<div id="hdr"></div>
+<div id="tabs"></div>
+<div id="wrap"><div id="main"></div><div id="side"></div></div>
+<div id="ctl"></div><div id="log"></div>
+<script>
+let snap=null,tab='overview',selKey=null;
+const TABS=['overview','queue','cohorts','built','failures','stats','config'];
+const E=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function human(n){n=+n||0;const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(Math.abs(n)>=1024&&i<4){n/=1024;i++}return(i?n.toFixed(1):n.toFixed(0))+u[i]}
+function hms(s){s=Math.max(0,Math.floor(+s||0));const h=(s/3600|0),m=(s%3600/60|0),x=s%60;return(h?h+':':'')+String(m).padStart(2,'0')+':'+String(x).padStart(2,'0')}
+async function poll(){try{const r=await fetch('/api/status');snap=await r.json();render()}catch(e){}}
+async function ctl(set){try{await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({set:set})});setTimeout(poll,250)}catch(e){}}
+function pick(slug){selKey=(selKey===slug?null:slug);render()}
+function rows(items,fn){return items&&items.length?items.map(fn).join(''):'<div class="row d">(none)</div>'}
+function frow(slug,inner){const sel=selKey===slug?' sel':'';return '<div class="row'+sel+'" onclick="pick(\''+E(slug)+'\')">'+inner+'</div>'}
+
+function render(){
+ if(!snap||snap.error){document.getElementById('hdr').innerHTML='<span class="r">waiting for build status… '+E(snap&&snap.error||'')+'</span>';return}
+ const c=snap.counts||{},bk=snap.backends||{},cfg=snap.config||{};
+ const grand=snap.total||1,proc=(c.built||0)+(c.failed||0)+(c.skipped||0),pct=Math.round(100*proc/grand);
+ const seg=(n,cls)=>n>0?'<div class="seg '+cls+'" style="width:'+(100*n/grand)+'%;background:var(--'+cls+')"></div>':'';
+ document.getElementById('hdr').innerHTML=
+  '<div class="t">Google Fonts library build'+(snap.paused?' <span class="y">[PAUSED]</span>':'')+
+   '<span class="muted" style="float:right">elapsed '+hms(snap.elapsed)+'</span></div>'+
+  '<div class="muted">build dir '+human(snap.disk_build_total)+' · free '+human(snap.disk_free)+
+   ' · jobs <span class="stat">'+snap.jobs+'</span> · cohorts <span class="stat">'+(snap.cohorts||[]).length+'</span>'+
+   ' · fontc '+(bk.fontc||0)+'/fontmake '+(bk.fontmake||0)+' · phase <span class="stat">'+E(snap.phase)+'</span>'+
+   (snap.done?' <span class="g">— BUILD COMPLETE</span>':'')+'</div>'+
+  '<div class="muted">built <span class="g">'+(c.built||0)+'</span> · failed <span class="r">'+(c.failed||0)+
+   '</span> · skipped '+(c.skipped||0)+' · building <span class="y">'+(c.building||0)+'</span> · queued <span class="c">'+(c.queued||0)+'</span></div>'+
+  '<div id="bar">'+seg(c.built,'g')+seg(c.failed,'r')+seg(c.skipped,'d')+
+   '<span class="lbl">'+proc+'/'+grand+' processed ('+pct+'%)</span></div>';
+ // tabs
+ const tc={overview:'',queue:c.queued,cohorts:(snap.cohorts||[]).length,built:c.built,failures:c.failed,stats:'',config:''};
+ document.getElementById('tabs').innerHTML=TABS.map(t=>'<div class="tab'+(t===tab?' on':'')+'" onclick="tab=\''+t+'\';render()">'+
+   t+(tc[t]?'<span class="b">'+tc[t]+'</span>':'')+'</div>').join('');
+ // main
+ let h='';const b=snap.building||[];
+ if(b.length)h+=card('▶ Now building ('+b.length+')',rows(b,x=>frow(x.slug,
+   '<span class="y" style="width:34px">w'+x.worker+'</span><span class="s">'+E(x.slug)+'</span><span class="meta">'+hms(x.dur)+'  '+E(x.note||x.backend||'')+'</span>')));
+ h+=TAB_RENDER[tab]?TAB_RENDER[tab]():'';
+ document.getElementById('main').innerHTML=h;
+ document.getElementById('side').innerHTML=panel();
+ controls();
+}
+function card(title,body){return '<div class="card"><h3>'+E(title)+'</h3><div class="body">'+body+'</div></div>'}
+const MARK={pending:'⏳',running:'🔄',done:'✅',failed:'❌',skipped:'➖'};
+const TAB_RENDER={
+ overview:()=>{
+  const t=snap.tasks||[],a=snap.archive_recent||[],f=snap.failures_recent||[];
+  let h=card('Pipeline',rows(t,x=>frow(x.key,'<span class="s">'+(MARK[x.status]||'?')+' '+E(x.name)+'</span><span class="meta">'+
+    (x.total?x.done+'/'+x.total+'  ':'')+(x.elapsed?hms(x.elapsed):'')+'  '+E(x.detail||'')+'</span>')));
+  if(a.length)h+=card('Archive — mirrored',rows(a,x=>frow(x.repo,'<span class="'+(x.status==='failed'?'r':'g')+'">'+(x.status==='added'?'+ ':'✗ ')+E(x.repo)+'</span>')));
+  h+=card('Recent failures ('+(snap.counts.failed||0)+')',rows(f.slice(0,60),x=>frow(x.slug,'<span class="r s">'+E(x.slug)+'</span><span class="meta d">'+E(x.error)+'</span>')));
+  return h},
+ queue:()=>{const q=snap.queued_list||[];const bc={new:'bg-new',retry:'bg-retry',rebuild:'bg-rebuild'};
+  return card('Queued — priority order ('+(snap.counts.queued||0)+(q.length<(snap.counts.queued||0)?', showing '+q.length:'')+')',
+   rows(q,x=>frow(x.slug,'<span class="badge '+(bc[x.kind]||'')+'">'+E(x.kind)+'</span><span class="s">'+E(x.slug)+'</span>')))},
+ cohorts:()=>card('Dependency cohorts',rows(snap.cohorts||[],x=>frow(x.key,
+   '<span class="c" style="width:120px">'+x.count+'  '+E(x.key)+'</span><span class="s g">'+(x.families||[]).map(E).join(' <span class="c">|</span> ')+'</span>'))),
+ built:()=>card('Built — successes ('+(snap.counts.built||0)+')',rows(snap.built_recent||[],x=>frow(x.slug,
+   '<span class="g s">'+E(x.slug)+'</span><span class="meta">'+E(x.backend||'')+'  '+human(x.bytes)+'  '+E(x.compare||'')+'</span>'))),
+ failures:()=>{let h=card('Failures by cause',rows(snap.fail_categories||[],x=>frow('cat:'+x.cat,
+    '<span class="c" style="width:40px;text-align:right">'+x.count+'</span><span class="y" style="width:200px">'+E(x.cat)+'</span><span class="meta d s">'+E(x.hint)+'</span>')));
+  h+=card('Failures — newest first ('+(snap.counts.failed||0)+')',rows((snap.failures_recent||[]).slice(0,200),x=>frow(x.slug,
+    '<span class="r s">'+E(x.slug)+'</span><span class="meta d">'+E(x.error)+'</span>')));return h},
+ stats:()=>{const o=snap.op_stats||{},p=snap.phase_durations||{},m=snap.migration||{};
+  let h=card('Per-operation timing',rows(Object.keys(o),k=>frow('op:'+k,'<span class="s">'+E(k)+'</span><span class="meta">n='+o[k].count+'  mean '+o[k].mean+'s  max '+o[k].max+'s</span>')));
+  h+=card('Phase durations',rows(Object.keys(p),k=>frow('ph:'+k,'<span class="s">'+E(k)+'</span><span class="meta">'+hms(p[k])+'</span>')));
+  h+=card('fontc → fontmake migration','<table class="kv">'+Object.keys(m).map(k=>'<tr><td>'+E(k)+'</td><td>'+m[k]+'</td></tr>').join('')+'</table>');return h},
+ config:()=>{const cf=snap.config||{};return card('Configuration',
+   '<table class="kv">'+Object.keys(cf).map(k=>'<tr><td>'+E(k)+'</td><td>'+E(cf[k])+'</td></tr>').join('')+'</table>')},
+};
+function panel(){
+ if(!selKey)return card('Details','<div class="row d">click a row to inspect it</div>');
+ const f=(snap.failures_recent||[]).find(x=>x.slug===selKey);
+ const q=(snap.queued_list||[]).find(x=>x.slug===selKey);
+ const bu=(snap.built_recent||[]).find(x=>x.slug===selKey);
+ let body='';
+ if(f)body='<div class="row"><b class="r">'+E(selKey)+'</b></div><div class="row d" style="white-space:pre-wrap">'+E(f.error)+'</div>';
+ else if(q){const why={new:'a fresh target — never built before',retry:'re-attempt after a previous failure',rebuild:'rebuild of a family that already built'};
+   body='<div class="row"><b>'+E(selKey)+'</b> <span class="badge bg-'+q.kind+'">'+E(q.kind)+'</span></div><div class="row d">'+E(why[q.kind]||'')+'</div>'}
+ else if(bu)body='<div class="row"><b class="g">'+E(selKey)+'</b></div><div class="row d">backend '+E(bu.backend)+' · '+human(bu.bytes)+' · vs shipped: '+E(bu.compare||'n/a')+'</div>';
+ else body='<div class="row"><b>'+E(selKey)+'</b></div>';
+ const canRetry=f||bu||q;
+ if(canRetry&&!q)body+='<div class="row"><button onclick="ctl({retry:[\''+E(selKey)+'\']})">⟳ Retry this family</button></div>';
+ return card('Details',body)+card('Control log',(snap.control_log||[]).slice(-12).reverse().map(x=>'<div class="row d">'+E(x)+'</div>').join('')||'<div class="row d">(none)</div>')}
+function controls(){
+ const cf=snap.config||{},jobs=snap.jobs||1,pc=(cf.percent!=null?cf.percent:100);
+ document.getElementById('ctl').innerHTML=
+  'jobs <button onclick="ctl({jobs:'+(jobs-1)+'})" '+(jobs<=1?'disabled':'')+'>−</button> <span class="stat">'+jobs+'</span> <button onclick="ctl({jobs:'+(jobs+1)+'})">+</button>'+
+  ' &nbsp; % <button onclick="ctl({percent:'+Math.max(1,pc-5)+'})">−5</button> <span class="stat">'+(+pc).toFixed(0)+'</span> <button onclick="ctl({percent:'+Math.min(100,pc+5)+'})">+5</button>'+
+  ' &nbsp; <button onclick="ctl({pause:'+(!snap.paused)+'})">'+(snap.paused?'▶ Resume':'⏸ Pause')+'</button>'+
+  ' &nbsp; <span class="muted">live polling every 1.5s · controls go to the running build via control.json</span>';
+ document.getElementById('log').textContent='';
+}
+setInterval(poll,1500);poll();
+</script></body></html>"""
+
+
+class WebFrontend(Frontend):
+    """Browser dashboard that mirrors the curses TUI: it serves the SAME snapshot() at /api/status
+    and routes live controls (jobs / percent / retry / pause) to control.json via /api/control —
+    exactly the channel the curses monitor uses. A static page polls + renders every tab."""
+    port = 8765
+
+    def __init__(self, state):
+        self.state = state
+        self.monitor = False
+
+    def run(self):
+        import http.server
+        import socketserver
+        fe = self
+        bd = getattr(self.state, "build_dir", None)
+        build_dir = Path(bd) if bd is not None else Path(".")
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, body, ctype):
+                data = body.encode("utf-8") if isinstance(body, str) else body
+                try:
+                    self.send_response(code)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
+            def do_GET(self):
+                if self.path == "/" or self.path.startswith("/index"):
+                    self._send(200, WEB_HTML, "text/html; charset=utf-8")
+                elif self.path.startswith("/api/status"):
+                    try:
+                        snap = fe.state.snapshot()
+                    except Exception as e:                # never let a render error kill the server
+                        snap = {"error": str(e)}
+                    self._send(200, json.dumps(snap), "application/json")
+                else:
+                    self._send(404, "not found", "text/plain")
+
+            def do_POST(self):
+                if self.path.startswith("/api/control"):
+                    try:
+                        n = int(self.headers.get("Content-Length") or 0)
+                        data = json.loads((self.rfile.read(n) if n else b"{}").decode("utf-8") or "{}")
+                        settings = data.get("set") if isinstance(data, dict) else None
+                        ok = write_control(build_dir, settings) if isinstance(settings, dict) else False
+                    except Exception:
+                        ok = False
+                    self._send(200, json.dumps({"ok": bool(ok)}), "application/json")
+                else:
+                    self._send(404, "not found", "text/plain")
+
+        class Server(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        try:
+            httpd = Server(("127.0.0.1", self.port), H)
+        except OSError as e:
+            print(f"web dashboard: cannot bind 127.0.0.1:{self.port} ({e}) — "
+                  f"try --web-port", file=sys.stderr)
+            return None
+        print(f"\n  gflib-build web dashboard → http://127.0.0.1:{self.port}/\n"
+              f"  (Ctrl-C stops the dashboard; the build keeps running in the background)\n",
+              file=sys.stderr)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        return None
+
+
 FRONTENDS = {"curses": CursesFrontend, "plain": PlainFrontend,
-             "json": JsonFrontend, "none": NoneFrontend}
+             "json": JsonFrontend, "none": NoneFrontend, "web": WebFrontend}
 
 
 def pick_frontend(name: str) -> str:
@@ -3301,13 +3524,15 @@ def pick_frontend(name: str) -> str:
         return "plain"
 
 
-def run_monitor(build_dir: Path, ui: str):
+def run_monitor(build_dir: Path, ui: str, port: int = 8765):
     """Attach a read-only live monitor to a (possibly detached) build at build_dir.
     Returns "reconfigure" if the user pressed C to go back to the setup wizard. [R] retries the
     selected family LIVE via control.json (the daemon lingers after completion), so there is no
-    program re-exec to do here."""
+    program re-exec to do here. The web monitor serves a browser dashboard on `port`."""
     fe = FRONTENDS[ui if ui in FRONTENDS else "plain"](MonitorState(build_dir))
     fe.monitor = True
+    if ui == "web":
+        fe.port = port
     return fe.run()
 
 
@@ -3672,7 +3897,8 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--keep-work", action="store_true", help="keep throwaway extractions")
     ap.add_argument("--keep-fonts", dest="keep_fonts", action="store_true", default=True)
     ap.add_argument("--discard-fonts", dest="keep_fonts", action="store_false")
-    ap.add_argument("--ui", choices=["auto", "curses", "plain", "json", "none"], default="auto",
+    ap.add_argument("--web-port", type=int, default=8765, help="port for --ui web (default 8765)")
+    ap.add_argument("--ui", choices=["auto", "curses", "plain", "json", "none", "web"], default="auto",
                     help="frontend (ncurses is optional; plain/json/none for other tooling)")
     ap.add_argument("--list", action="store_true", help="print the buildable worklist and exit")
     ap.add_argument("--cohorts-report", action="store_true",
@@ -3729,7 +3955,7 @@ def main():
     if args.attach:
         if pick_frontend(args.ui) == "curses" and not sys.stdout.isatty():
             sys.exit("--attach needs a terminal")
-        if run_monitor(mon_build_dir, pick_frontend(args.ui)) == "reconfigure":
+        if run_monitor(mon_build_dir, pick_frontend(args.ui), args.web_port) == "reconfigure":
             reexec_wizard()                      # C: drop --attach, re-exec into the wizard
         return
 
@@ -3768,7 +3994,7 @@ def main():
             sys.exit(f"a build is running at {build_dir}; attach from a terminal or use --attach")
         print(f"a build is already running at {build_dir} — reattaching live monitor "
               f"(q leaves it running; C reconfigures; --stop to cancel).", file=sys.stderr)
-        if run_monitor(build_dir, ui) == "reconfigure":
+        if run_monitor(build_dir, ui, args.web_port) == "reconfigure":
             reexec_wizard()
         return
 
@@ -3918,7 +4144,7 @@ def main():
     # A fresh interactive (curses) build runs detached by default: quitting the UI (q) frees the
     # shell while the build keeps running, and re-running reattaches a live monitor. plain/json/
     # none stay in the foreground for scripting/logging; --detach forces detach for any UI.
-    detach = args.detach or ui == "curses"
+    detach = args.detach or ui in ("curses", "web")
 
     # if a previous build is still running here (e.g. the user pressed C to reconfigure and is
     # now starting a new one), stop it first so the two don't clobber the same build_dir
@@ -3957,7 +4183,7 @@ def main():
               file=sys.stderr)
         time.sleep(0.5)
         if ui != "none":
-            if run_monitor(build_dir, ui) == "reconfigure":   # C: back to the wizard
+            if run_monitor(build_dir, ui, args.web_port) == "reconfigure":   # C: back to the wizard
                 reexec_wizard()
         return
 

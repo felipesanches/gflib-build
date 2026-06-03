@@ -252,6 +252,15 @@ intent so nothing is lost as the tool evolves.
     line) and restricts the whole run to those families — they become the entire queue (highest
     priority). `--retry-category "output name mismatch"` re-attempts only failures of that cause
     (like `--retry-failed`, but targeted — e.g. after fixing `collect_outputs`).
+60. **Queue tab.** A `queue` tab lists the waiting families in priority order, each tagged **new**
+    (never built), **retry** (after a failure), or **rebuild** (of a prior success) — the only three
+    kinds a family can be queued under.
+61. **Web dashboard (`--ui web`).** A browser UI that mirrors the TUI: it serves the same `snapshot()`
+    at `/api/status` and routes live controls (jobs / percent / retry / pause) to `control.json` via
+    `/api/control` — the same channel the curses monitor uses. All tabs (overview, queue, cohorts,
+    built, failures, stats, config), the segmented progress bar, pinned "Now building", per-row detail
+    and the control log are rendered from the live snapshot, polled every 1.5 s. Pure stdlib
+    (`http.server`); `--web-port` sets the port (default 8765).
 
 ---
 
