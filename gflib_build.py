@@ -244,14 +244,22 @@ def git(args: List[str], cwd: Optional[Path] = None, timeout: int = 600):
     return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
 
 
-def git_clone_mirror(url: str, dest: str, timeout: int = 1800,
-                     stop: "Optional[threading.Event]" = None):
-    """`git clone --mirror url dest`, but ABORTABLE: polled against `stop` so a shutdown /
-    --stop / build-completion terminates an in-flight clone promptly instead of blocking up to
-    `timeout` (and blocking interpreter exit on the executor's non-daemon threads). `--quiet`
-    keeps stderr tiny so the captured pipe can't deadlock on a big repo's progress output. On
-    ANY failure (abort/timeout/error) the partial mirror dir is removed so it is never later
-    mistaken for a complete mirror by an `is_dir()` check."""
+# Network hiccups that a clone usually survives on a second try (vs. permanent errors like
+# "repository not found" / "authentication failed", which must NOT be retried).
+TRANSIENT_CLONE_ERRORS = (
+    "invalid index-pack output", "fetch-pack", "early eof", "rpc failed", "unexpected disconnect",
+    "the remote end hung up", "connection reset", "connection timed out", "operation timed out",
+    "could not resolve host", "tls", "ssl_", "gnutls", "remote error:", "503", "500",
+)
+
+
+def is_transient_clone_error(err: str) -> bool:
+    low = (err or "").lower()
+    return any(s in low for s in TRANSIENT_CLONE_ERRORS)
+
+
+def _clone_mirror_once(url: str, dest: str, timeout: int,
+                       stop: "Optional[threading.Event]" = None):
     proc = subprocess.Popen(["git", "clone", "--mirror", "--quiet", url, dest],
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     deadline = time.time() + timeout
@@ -274,6 +282,35 @@ def git_clone_mirror(url: str, dest: str, timeout: int = 1800,
             err = "aborted"
         elif not err.strip():
             err = f"timed out after {timeout}s"
+    return rc, aborted, err
+
+
+def git_clone_mirror(url: str, dest: str, timeout: int = 1800,
+                     stop: "Optional[threading.Event]" = None, attempts: int = 3,
+                     on_retry: Optional[Callable[[int, str], None]] = None):
+    """`git clone --mirror url dest`, but ABORTABLE and AUTO-RETRYING: polled against `stop` so a
+    shutdown / --stop / build-completion terminates an in-flight clone promptly instead of blocking
+    up to `timeout`. A failed attempt whose error is TRANSIENT (network hiccup such as
+    'fetch-pack: invalid index-pack output') is retried up to `attempts` times with a short
+    abortable backoff; permanent errors (repo missing/private) are not retried. `--quiet` keeps
+    stderr tiny; on any failure the partial mirror dir is removed (never a half mirror)."""
+    rc, aborted, err = 1, False, ""
+    for attempt in range(1, max(1, attempts) + 1):
+        rc, aborted, err = _clone_mirror_once(url, dest, timeout, stop)
+        if rc == 0 or aborted:
+            break
+        if attempt >= attempts or not is_transient_clone_error(err):
+            break
+        if on_retry:
+            on_retry(attempt, err.strip().splitlines()[-1] if err.strip() else str(rc))
+        if stop is not None:
+            if stop.wait(min(10, 2 * attempt)):        # abortable backoff
+                aborted = True
+                break
+        else:
+            time.sleep(min(10, 2 * attempt))
+    if rc != 0 and not aborted and attempts > 1 and is_transient_clone_error(err):
+        err = err.rstrip() + f"  (after {attempts} attempts)"
     return rc, "", err
 
 
