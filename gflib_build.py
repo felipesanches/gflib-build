@@ -2755,7 +2755,10 @@ class CursesFrontend(Frontend):
                         pass
 
             grand = snap["total"] or 1
-            done = c["built"] + c["failed"]
+            # the bar = how much of the worklist is PROCESSED (built + failed + skipped), so it
+            # reaches 100% when nothing is queued/building — not built/total (which would stick
+            # below 100% whenever anything failed or was skipped).
+            done = c["built"] + c["failed"] + c["skipped"]
             ph = snap["phase"]
             plabel = self.PHASE_LABEL.get(ph, ph)
             pre_build = bool(snap.get("pre_build")) or setup
@@ -2778,15 +2781,17 @@ class CursesFrontend(Frontend):
                         YEL | curses.A_BOLD)
                     frac = pd / max(1, pt)
                 else:
-                    put(2, 0, f" Phase: {plabel}   built {c['built']}/{grand}  failed {c['failed']}  "
-                              f"building {c['building']}  queued {c['queued']}", curses.A_BOLD)
+                    put(2, 0, f" Phase: {plabel}   built {c['built']}  failed {c['failed']}  "
+                              f"skipped {c['skipped']}  building {c['building']}  queued {c['queued']}",
+                        curses.A_BOLD)
                     frac = done / grand
                 if snap["phase_error"]:
                     put(2, max(0, w - 30), f"ERR {snap['phase_error'][:24]}", RED)
                 barw = max(10, w - 4)
                 fill = int(barw * frac)
                 put(3, 1, "[" + "#" * fill + "-" * (barw - fill) + "]")
-                put(3, max(2, barw // 2), f" {int(100 * frac)}% ", curses.A_BOLD)
+                put(3, max(2, barw // 2), f" {done}/{grand} processed ({int(100 * frac)}%) ",
+                    curses.A_BOLD)
             # tabs — Tab / Shift-Tab are the ONLY way to switch (←→ and numbers edit fields)
             x = 1
             for name in self.VIEWS:
