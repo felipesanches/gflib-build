@@ -171,6 +171,13 @@ intent so nothing is lost as the tool evolves.
 36. **No separate wizard — the Configuration tab is the setup.** First-run setup is the
     Configuration tab itself (dashboard chrome, all fields editable, ▶ Start), and the same tab
     in the live dashboard does live edits. One config interface, not two.
+37. **One Configuration tab, fully editable in place.** ←/→ move the text cursor / ±step /
+    cycle, type to edit — no reloading a separate screen to edit. Tab navigation is `Tab` /
+    `Shift-Tab` only (so ←/→ and number keys are free for editing).
+38. **A "built" tab** lists the successfully built families (successes), parallel to Failures.
+39. **Section navigation** — multi-section tabs (overview, stats) are navigable section by
+    section: ←/→ focus a section (the ▼-marked one), ↑/↓ navigate its items, ↵ acts on the
+    selected item. (Ctrl+Tab is intercepted by most terminals, so ←/→ is the binding.)
 
 ---
 
@@ -335,45 +342,42 @@ banner + progress bar and is **navigable** — four views switchable with the **
  disk +12.3GiB  free 290.0GiB  jobs 8  cohorts 28  fontc 980/fontmake 240
  Phase: building   built 412/1503  failed 7  building 8  queued 1076
  [######################------------------------------------]  31%
-  1 config  2 overview  3 cohorts  4 failures  5 stats   [←→]tabs [↑↓]select
- Pipeline  (↑↓ select · ↵ details) -----------------------------------------
-  ✅ clone google/fonts          00:00:31   <build-dir>/google-fonts
-  ➖ build fontc from source                 (skipped — binary detected)
-  ✅ discover worklist           00:00:04   1503 queued of 1503 selected
-  🔄 populate archive   340/1320  25% 03:12  added: notofonts/noto-cjk
+  config  overview  cohorts  built  failures  stats        [Tab]/[⇧Tab] switch tabs
+ ▼ Pipeline (6) -------------------------------------------------------------
   🔄 build fonts        612/1503  40% 03:12  (mirror + cohort + compile, streaming)
- Archive — repos mirrored (newest last) -------------------------------------
-  + google/fonts-sources    + notofonts/latin-greek-cyrillic   ✗ owner/dead-repo
- Now building ----------------------------------------------------------------
+ ▷ Archive — mirrored (340) -------------------------------------------------
+  + google/fonts-sources    + notofonts/latin-greek-cyrillic
+ ▷ Now building (8) ---------------------------------------------------------
   w 1 ofl/notosanstc                       02:10  checkout
-  w 2 ofl/roboto                           00:42  fontmake
- [q]uit — build runs on  [↑↓]select [↵]details [←→]tabs
+ ▷ Recent failures (7) ------------------------------------------------------
+  ofl/foldit                       gftools.builder exit 1: KeyError 'instances'
+ [Tab]tabs  [←→]section  [↑↓]item  [↵]details  [C]onfig  [q]uit
 ```
 
-- **config** (leftmost, the default landing tab) — the live configuration, reflecting the
-  current settings (it falls back to the persisted config file, so it's never a list of
-  `None`). `↑`/`↓` pick a field, `space` toggles a bool/cycles a choice, `+`/`-` adjusts a
-  number, `↵`/`a` **applies the change to the RUNNING build** — no restart. Raising **percent**
-  immediately fetches+cohorts+builds the newly-included families; raising **jobs** spawns more
-  parallel workers; backend/timeout/compare/populate also apply live. Path/source changes need
-  a restart (`C`). Auto-fixed dependencies + applied changes are listed at the bottom.
-- **overview** — the pipeline task-list, the live archive-population list (repos appear as
-  they are mirrored), now-building (each entry shows its step: `checkout` while the source
-  is being extracted, then the cohort/backend), and recent failures.
+Tabs (switch with **`Tab` / `Shift-Tab` only**):
+- **config** (leftmost, default) — the ONE Configuration tab, used for both first-run setup
+  and live editing (no separate wizard). `↑`/`↓` pick a field; **`←`/`→` move the text cursor /
+  ±step a number / cycle a choice**; type to edit; `space` toggles. On a running build, the
+  live-editable fields (percent, jobs, backend, timeout, compare, populate) apply with **✓ apply
+  changes** — raising **percent** immediately fetches+cohorts+builds more families, raising
+  **jobs** spawns more workers; path/source fields show `(restart: C)`. First run shows the same
+  tab with **▶ Start build / Cancel**.
+- **overview** — the pipeline task-list + the live archive list + now-building + recent failures,
+  as navigable **sections**.
 - **cohorts** — the dependency cohorts, live (largest first).
+- **built** — the list of **successfully built** families (newest first; ↵ shows output path,
+  size, vs-shipped comparison + rebuild command).
 - **failures** — all failures, newest first.
-- **stats** — fontc-migration tally + per-phase / per-operation timing.
+- **stats** — fontc-migration tally + per-phase / per-operation timing (sections).
 
-Keys: **`←`/`→`** (or `Tab`) switch views, `1`/`2`/`3`/`4` jump to a view, **`↑`/`↓` select**
-an item in the current tab's list, **`↵` open a detail overlay** for the selected item (a
-failure's full error + log tail, a cohort's requirements, a task's detail, an op's timing;
-`Esc`/`←`/`↵` returns), **`C` back to the setup wizard** (change settings / start over — the
-program re-execs into the wizard; the running build is replaced only when you actually hit
-*Start*, so cancelling leaves it running), `q` quit. The **elapsed clock is cumulative** — it
-reflects the real time the build has spent across reopen/resume, not reset to zero. Full
-per-family logs are at
-`<build-dir>/logs/<slug>.log`. For non-interactive use pick `--ui plain` (prints phase
-transitions + progress), `--ui json`, or `--ui none`.
+Keys: **`Tab`/`Shift-Tab`** switch tabs; within a tab **`←`/`→` move focus between sections**
+(the `▼`-marked one), **`↑`/`↓` navigate items** in the focused section, **`↵` open a detail
+overlay** (a failure's error + log tail, a built family's output, a cohort's requirements, a
+task/op's detail; `Esc`/`↵` returns); `C` opens/returns to the Configuration tab, `q` quits.
+(`Ctrl+Tab` for sections is intercepted by most terminals — e.g. gnome-terminal's own tab
+switching — so `←`/`→` is the reliable binding.) The **elapsed clock is cumulative** across
+reopen/resume. Full per-family logs are at `<build-dir>/logs/<slug>.log`. For non-interactive
+use pick `--ui plain`, `--ui json`, or `--ui none`.
 
 ### Quit anytime — the build keeps running, resume straight to live updates
 
