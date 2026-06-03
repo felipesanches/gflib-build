@@ -54,7 +54,7 @@ def drain(sec):
 
 TAB = b"\t"
 drain(0.8)
-os.write(fd, TAB); drain(0.6)      # overview (default) -> cohorts
+os.write(fd, TAB); os.write(fd, TAB); drain(0.6)      # overview -> queue -> cohorts
 os.write(fd, b"\r"); drain(0.4)                        # open the focused cohort's detail overlay
 txt = out.decode("utf-8", "replace")
 os.write(fd, b"q"); drain(1.0)

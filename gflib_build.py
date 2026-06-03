@@ -95,6 +95,7 @@ class Result:
     cohort: str = ""                 # venv cohort key
     note: str = ""                   # transient ("installing deps", ...)
     retries: int = 0                 # in-build auto-retries spent on a transient failure
+    queued_kind: str = ""            # why it's queued: new | retry | rebuild (for the Queue tab)
     error: str = ""
     log: str = ""
     out_bytes: int = 0
@@ -1389,11 +1390,12 @@ class Orchestrator:
         only = set(self.args.only.split(",")) if self.args.only else None
         retry_cats = {c.strip() for c in getattr(self.args, "retry_category", "").split(",")
                       if c.strip()}                  # extra causes to re-attempt (e.g. after a fix)
-        todo, retries = [], 0
+        todo, retries, kinds = [], 0, {}
         for slug, fam in self.families.items():
             if only and slug not in only:
                 continue
             prev = self.results.get(slug)
+            kind = "new"                                  # never built before
             if prev and not self.args.rebuild:
                 if prev.status == "built":
                     continue
@@ -1407,8 +1409,14 @@ class Orchestrator:
                     if not (self.args.retry_failed or cat in AUTO_RETRY_CATEGORIES
                             or cat in retry_cats):
                         continue
-                    retries += 1
-            todo.append(slug)
+                    retries += 1; kind = "retry"
+                # a queued/building/skipped prior (an interrupted/resumed run) is still "new"
+            elif prev and self.args.rebuild:              # --rebuild forces even built families
+                if prev.status == "built":
+                    kind = "rebuild"
+                elif prev.status == "failed":
+                    kind = "retry"; retries += 1
+            todo.append(slug); kinds[slug] = kind
         self._enqueued = len(todo)
         self._enqueued_retries = retries
 
@@ -1433,7 +1441,7 @@ class Orchestrator:
 
         for slug in todo:
             with self.lock:    # _enqueue now runs in the driver thread, racing the status writer
-                self.results[slug] = Result(slug=slug, status="queued")
+                self.results[slug] = Result(slug=slug, status="queued", queued_kind=kinds[slug])
             self.q.put(slug)
 
     # ---- read-only views
@@ -1488,8 +1496,13 @@ class Orchestrator:
                          "both_identical": 0, "both_differ": 0}
             fail_cat = {}                            # cause -> [count, hint, [slugs]] for the summary
             building = []
+            queued = []
             for r in rs:
                 counts[r.status] = counts.get(r.status, 0) + 1
+                if r.status == "queued":
+                    fam = self.families.get(r.slug)
+                    w = ((1000 if fam.is_variable else 0) + len(fam.shipped_fonts)) if fam else 0
+                    queued.append({"slug": r.slug, "kind": r.queued_kind or "new", "_w": w})
                 if r.status == "failed":
                     cat, hint = categorize_failure(r.error)
                     slot = fail_cat.setdefault(cat, [0, hint, []])
@@ -1511,6 +1524,8 @@ class Orchestrator:
                     building.append({"slug": r.slug, "worker": r.worker, "dur": r.dur(),
                                      "backend": r.backend, "note": r.note})
             building.sort(key=lambda b: -b["dur"])
+            queued.sort(key=lambda q: -q["_w"])      # priority order (variable + more fonts first)
+            queued_list = [{"slug": q["slug"], "kind": q["kind"]} for q in queued[:1000]]
             fail_categories = sorted(
                 [{"cat": k, "count": v[0], "hint": v[1], "families": sorted(v[2])}
                  for k, v in fail_cat.items()],
@@ -1559,7 +1574,7 @@ class Orchestrator:
             "jobs": self.args.jobs, "paused": self.paused.is_set(),
             "total": len(rs), "counts": counts, "backends": backends,
             "building": building, "failures_recent": fails, "built_recent": built,
-            "fail_categories": fail_categories,
+            "queued_list": queued_list, "fail_categories": fail_categories,
             "cohorts_ready": self.venvs.ready_count() if self.venvs else 0,
             "phase": phase, "phase_total": ptot, "phase_done": pdone,
             "phase_label": plabel, "phase_error": perr,
@@ -1620,7 +1635,7 @@ class Orchestrator:
             tries = r.retries if r is not None else 0
         if cat in IN_BUILD_RETRY_CATEGORIES and tries < self.IN_BUILD_RETRIES:
             self._set(slug, status="queued", note=f"auto-retry {tries + 1} ({cat})",
-                      retries=tries + 1, error="")
+                      retries=tries + 1, error="", queued_kind="retry")
             self._emit("retry", slug, attempt=tries + 1, cause=cat)
             self.q.put(slug)
             return
@@ -1971,7 +1986,9 @@ class Orchestrator:
                 cur = self.results.get(slug)
                 if cur is not None and cur.status in ("queued", "building"):
                     continue                          # already in flight — never double-build a slug
-                self.results[slug] = Result(slug=slug, status="queued")
+                kind = ("rebuild" if cur and cur.status == "built"
+                        else "retry" if cur and cur.status == "failed" else "new")
+                self.results[slug] = Result(slug=slug, status="queued", queued_kind=kind)
                 self.q.put(slug)
                 n += 1
         return n
@@ -1991,7 +2008,7 @@ class Orchestrator:
             for f in sample:
                 if f.slug not in self.results:        # not already queued/built/failed
                     self.families[f.slug] = f
-                    self.results[f.slug] = Result(slug=f.slug, status="queued")
+                    self.results[f.slug] = Result(slug=f.slug, status="queued", queued_kind="new")
                     fresh.append(f)
             bt = self._task("build")
             if bt is not None:
@@ -2346,7 +2363,7 @@ class CursesFrontend(Frontend):
     # emoji status marks (ASCII fallback chosen at runtime if the terminal can't render them)
     EMOJI = {"pending": "⏳", "running": "🔄", "done": "✅", "failed": "❌", "skipped": "➖"}
     ASCII = {"pending": "..", "running": ">>", "done": "OK", "failed": "XX", "skipped": "--"}
-    VIEWS = ("config", "overview", "cohorts", "built", "failures", "stats")
+    VIEWS = ("config", "overview", "queue", "cohorts", "built", "failures", "stats")
 
     # Full config schema for the ONE Configuration tab (first-run setup AND live editing).
     # `live`=True fields can change on a running build; the rest need a restart.
@@ -2533,6 +2550,12 @@ class CursesFrontend(Frontend):
         if kind == "building":
             return [f"building {item['slug']} — step '{item.get('note') or item.get('backend') or 'starting'}'"
                     f"  (worker {item['worker']}, {hms(item['dur'])})"]
+        if kind == "queue":
+            k = item.get("kind", "new")
+            why = {"new": "a fresh target — never built before",
+                   "retry": "re-attempt after a previous build failure",
+                   "rebuild": "rebuild of a family that already built (--rebuild / [R])"}
+            return [f"queued: {item['slug']}  —  {k}", "  " + why.get(k, "")]
         if kind == "failures":
             return [f"{item['slug']}  FAILED:", "  " + str(item.get("error", ""))]
         if kind == "built":
@@ -2583,6 +2606,14 @@ class CursesFrontend(Frontend):
                 out.append(f"progress: {item['done']}/{item['total']}")
             if item.get("detail"):
                 out += ["", "detail:", "  " + str(item["detail"])]
+        elif view == "queue":                        # {slug, kind}
+            k = item.get("kind", "new")
+            out += [f"Queued family: {item.get('slug', '')}", f"kind: {k}", "",
+                    {"new": "A fresh target — this family has never been built.",
+                     "retry": "Re-attempt after a previous build FAILURE (its cause may now be fixable: "
+                              "a rebuilt venv, a retried clone, a code fix, …).",
+                     "rebuild": "Rebuild of a family that already built successfully — forced by "
+                                "--rebuild or by pressing [R] on a built family."}.get(k, "")]
         elif view == "failcat":                      # {cat, count, hint, families}
             fams = item.get("families", [])
             out += [f"Failure cause: {item.get('cat', '')}",
@@ -2787,6 +2818,15 @@ class CursesFrontend(Frontend):
                              lambda f: [(f"{f['slug']:<34} ", RED), (f['error'], RED | curses.A_DIM)],
                              lambda f: RED, "failures"))
                 return secs
+            if v == "queue":
+                # waiting families in priority order, tagged by WHY they're queued:
+                # new (never built) · retry (after a failure) · rebuild (of a prior success)
+                kcol = {"new": GREEN, "retry": YEL, "rebuild": CYAN}
+                return [("Queued — priority order (variable + larger families first)",
+                         snap.get("queued_list", []),
+                         lambda e: [("  %-8s " % e.get("kind", "new"), kcol.get(e.get("kind"), 0)),
+                                    (e["slug"], 0)],
+                         lambda e: kcol.get(e.get("kind"), 0), "queue")]
             if v == "cohorts":
                 return [("Dependency cohorts", snap.get("cohorts", []),
                          # count+key in the cohort colour, then family names in GREEN with the
