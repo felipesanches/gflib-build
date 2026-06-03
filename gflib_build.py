@@ -60,6 +60,7 @@ CONFIG_CANDIDATES = ("sources/config.yaml", "sources/config.yml", "config.yaml",
 FONT_SUBDIRS = ("fonts/ttf", "fonts/variable", "fonts/otf", "fonts", ".")
 MAX_JOBS = 256                                       # hard cap on parallel jobs (matches the config
 #                                                      schema max; bounds untrusted control.json input)
+MAX_FAILURE_HISTORY = 5000                           # in-memory cap for the persistent failure log
 REQ_FILES = ("requirements.txt", "requirements.in")
 
 RE_REPO = re.compile(r'repository_url:\s*"([^"]+)"')
@@ -1200,6 +1201,12 @@ class Orchestrator:
         self._archive_seen: set = set()                # de-dup repos across pre-warmer + workers
         self._cohort_members: Dict[str, set] = {}      # cohort key -> {slugs} (assigned live)
         self._cohort_reqs: Dict[str, str] = {}         # cohort key -> normalized requirements
+        # PERSISTENT failure history — every failure is recorded to failure-history.jsonl (append-
+        # only, never cleared) so "how things broke" survives restarts AND re-attempts, even after a
+        # family is later retried/built. Loaded into memory (tail) for the UI.
+        self.failure_history: List[dict] = []
+        self._fail_hist_path = self.build_dir / "failure-history.jsonl"
+        self._load_failure_history()
         self.clone_locks = KeyedLocks()                # per-repo: pre-warmer vs workers never clash
         self.driver: Optional[threading.Thread] = None
         # end-to-end task-list rendered live in the UI (each maps to a phase key)
@@ -1299,17 +1306,59 @@ class Orchestrator:
             if len(self.archive_log) > 400:
                 del self.archive_log[:-400]
 
+    def _rebuild_cohorts(self):
+        """Rebuild the cohorts display dict from _cohort_members/_cohort_reqs (call under the lock)."""
+        self.cohorts = {k: {"count": len(v), "requirements": self._cohort_reqs.get(k, ""),
+                            "families": sorted(self.families[s].name if s in self.families
+                                               else s for s in v)}
+                        for k, v in sorted(self._cohort_members.items(),
+                                           key=lambda kv: -len(kv[1]))}
+
     def _note_cohort(self, slug: str, cohort: str, req_text: str):
         """Assign a family to its cohort live, as soon as its repo is available — rebuilds the
         cohorts view incrementally (no global scan barrier)."""
         with self.lock:
             self._cohort_members.setdefault(cohort, set()).add(slug)
             self._cohort_reqs.setdefault(cohort, normalize_requirements(req_text))
-            self.cohorts = {k: {"count": len(v), "requirements": self._cohort_reqs.get(k, ""),
-                                "families": sorted(self.families[s].name if s in self.families
-                                                   else s for s in v)}
-                            for k, v in sorted(self._cohort_members.items(),
-                                               key=lambda kv: -len(kv[1]))}
+            self._rebuild_cohorts()
+
+    def _load_failure_history(self):
+        """Load the tail of the persistent failure log into memory for the UI (the file itself is
+        append-only and kept forever)."""
+        try:
+            if self._fail_hist_path.is_file():
+                lines = self._fail_hist_path.read_text(errors="replace").splitlines()[-MAX_FAILURE_HISTORY:]
+                for ln in lines:
+                    try:
+                        self.failure_history.append(json.loads(ln))
+                    except Exception:
+                        pass
+        except OSError:
+            pass
+
+    def _record_failure(self, slug: str, cause: str, msg: str):
+        """Append a durable failure record (failure-history.jsonl) + archive the failing family log
+        to logs/failed/ so a later successful rebuild can't erase how it broke."""
+        r = self.results.get(slug)
+        entry = {"ts": time.time(), "slug": slug, "cause": cause, "error": (msg or "")[:400],
+                 "backend": (r.backend if r else "") or ""}
+        with self.lock:
+            self.failure_history.append(entry)
+            del self.failure_history[:-MAX_FAILURE_HISTORY]
+        try:
+            with open(self._fail_hist_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError:
+            pass
+        try:                                              # keep the failing log even if it's rebuilt
+            safe = slug.replace("/", "__")
+            src = self.build_dir / "logs" / f"{safe}.log"
+            if src.is_file():
+                dst = self.build_dir / "logs" / "failed" / f"{safe}.log"
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+        except OSError:
+            pass
 
     def _archive_progress(self, done: int, url: str, status: str, reason: str = ""):
         """Per-repo callback from the concurrent archive pre-warmer: feed the live list and
@@ -1364,6 +1413,13 @@ class Orchestrator:
                                                    if k in Result.__dataclass_fields__})
                 # carry the prior sessions' elapsed so the clock continues, not resets
                 self._resumed_elapsed = float(data.get("elapsed_so_far", 0.0))
+                # restore the COHORT map so the cohorts tab (and the venv cache it represents) shows
+                # up immediately after a restart instead of looking empty / freshly deleted.
+                self._cohort_members = {k: set(v) for k, v in data.get("cohort_members", {}).items()}
+                self._cohort_reqs = dict(data.get("cohort_reqs", {}))
+                if self._cohort_members:
+                    with self.lock:
+                        self._rebuild_cohorts()
             except Exception:
                 pass
 
@@ -1371,7 +1427,9 @@ class Orchestrator:
         with self.lock:
             data = {"saved_at": time.time(), "build_dir": str(self.build_dir),
                     "elapsed_so_far": self._resumed_elapsed + (time.time() - self.start_time),
-                    "results": {s: asdict(r) for s, r in self.results.items()}}
+                    "results": {s: asdict(r) for s, r in self.results.items()},
+                    "cohort_members": {k: sorted(v) for k, v in self._cohort_members.items()},
+                    "cohort_reqs": dict(self._cohort_reqs)}
         tmp = self.state_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, indent=1))
         tmp.replace(self.state_path)
@@ -1581,7 +1639,11 @@ class Orchestrator:
             "phase": phase, "phase_total": ptot, "phase_done": pdone,
             "phase_label": plabel, "phase_error": perr,
             "cohorts": [{"key": k, "count": v["count"], "requirements": v["requirements"],
-                         "families": v.get("families", [])} for k, v in cohorts],
+                         "families": v.get("families", []),
+                         # the venv on disk = the cache; show whether it's ready to reuse
+                         "cached": (self.build_dir / "venvs" / k / ".gflib-installed").is_file()}
+                        for k, v in cohorts],
+            "failure_history": self.failure_history[-400:][::-1],   # persistent; newest first
             "op_stats": op_stats, "phase_durations": phase_dur, "migration": migration,
             "tasks": tasks, "archive_recent": archive_recent, "config": config,
             "control_log": control_log,
@@ -1645,6 +1707,7 @@ class Orchestrator:
         with self.lock:
             if slug not in self.failures:
                 self.failures.append(slug)
+        self._record_failure(slug, cat, msg)         # durable record + archived log (survives reruns)
         self._emit("failed", slug, error=msg)
         self.save_state()
 
@@ -2569,6 +2632,10 @@ class CursesFrontend(Frontend):
             return [f"queued: {item['slug']}  —  {k}", "  " + why.get(k, "")]
         if kind == "failures":
             return [f"{item['slug']}  FAILED:", "  " + str(item.get("error", ""))]
+        if kind == "history":
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(item.get("ts", 0)))
+            return [f"{item.get('slug', '')}  —  {item.get('cause', '')}  ({when})",
+                    "  " + str(item.get("error", ""))]
         if kind == "built":
             return [f"{item['slug']} ✓ built with {item.get('backend', '?')} — "
                     f"{human(item.get('bytes', 0))}, vs shipped: {item.get('compare') or 'not compared'}"]
@@ -2617,6 +2684,13 @@ class CursesFrontend(Frontend):
                 out.append(f"progress: {item['done']}/{item['total']}")
             if item.get("detail"):
                 out += ["", "detail:", "  " + str(item["detail"])]
+        elif view == "history":                      # {ts, slug, cause, error, backend}
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(item.get("ts", 0)))
+            out += [f"Failure: {item.get('slug', '')}", f"when: {when}",
+                    f"cause: {item.get('cause', '')}", f"backend: {item.get('backend', '') or '—'}", "",
+                    "error:", "  " + str(item.get("error", "")), "",
+                    "(persistent record — kept even after this family is re-attempted or built; the "
+                    "failing log is archived under logs/failed/)"]
         elif view == "queue":                        # {slug, kind}
             k = item.get("kind", "new")
             out += [f"Queued family: {item.get('slug', '')}", f"kind: {k}", "",
@@ -2839,10 +2913,13 @@ class CursesFrontend(Frontend):
                                     (e["slug"], 0)],
                          lambda e: kcol.get(e.get("kind"), 0), "queue")]
             if v == "cohorts":
-                return [("Dependency cohorts", snap.get("cohorts", []),
-                         # count+key in the cohort colour, then family names in GREEN with the
-                         # " | " separators in CYAN so the list reads clearly (request)
-                         lambda co: [("%4d  %-14s " % (co["count"], co["key"]),
+                # ● = the venv is cached on disk (reused next run); ○ = not yet built. count+key in
+                # the cohort colour, family names GREEN with CYAN " | " separators (request).
+                return [("Dependency cohorts  (● = venv cached on disk, reused next run)",
+                         snap.get("cohorts", []),
+                         lambda co: [("● " if co.get("cached") else "○ ",
+                                      GREEN if co.get("cached") else curses.A_DIM),
+                                     ("%4d  %-14s " % (co["count"], co["key"]),
                                       0 if co["key"] == "base" else CYAN)]
                          + self._name_segments(co.get("families", []), GREEN, CYAN,
                                                empty="(no families yet)"),
@@ -2862,10 +2939,18 @@ class CursesFrontend(Frontend):
                                             (f"{c['cat']:<24}", CYAN),
                                             (" " + c['hint'], curses.A_DIM)],
                                  lambda c: CYAN, "failcat"))
-                secs.append(("Failures — newest first", snap.get("failures_recent", []),
+                secs.append(("Failures — newest first (current)", snap.get("failures_recent", []),
                              # family slug (default) + error (dim) so the slug reads clearly
                              lambda f: [(f"{f['slug']:<34} ", RED), (f['error'], RED | curses.A_DIM)],
                              lambda f: RED, "failures"))
+                hist = snap.get("failure_history", [])
+                if hist:
+                    secs.append(("Failure history (persistent — survives restarts & re-attempts)", hist,
+                                 lambda h: [(time.strftime("%m-%d %H:%M ",
+                                                           time.localtime(h.get("ts", 0))), curses.A_DIM),
+                                            (f"{(h.get('cause') or '')[:20]:<20} ", YEL),
+                                            (h.get("slug", ""), 0)],
+                                 lambda h: 0, "history"))
                 return secs
             if v == "stats":
                 phases = sorted(snap.get("phase_durations", {}).items(), key=lambda kv: -kv[1])
@@ -3400,14 +3485,18 @@ const TAB_RENDER={
  queue:()=>{const q=snap.queued_list||[];const bc={new:'bg-new',retry:'bg-retry',rebuild:'bg-rebuild'};
   return card('Queued — priority order ('+(snap.counts.queued||0)+(q.length<(snap.counts.queued||0)?', showing '+q.length:'')+')',
    rows(q,x=>frow(x.slug,'<span class="badge '+(bc[x.kind]||'')+'">'+E(x.kind)+'</span><span class="s">'+E(x.slug)+'</span>')))},
- cohorts:()=>card('Dependency cohorts',rows(snap.cohorts||[],x=>frow(x.key,
-   '<span class="c" style="width:120px">'+x.count+'  '+E(x.key)+'</span><span class="s g">'+(x.families||[]).map(E).join(' <span class="c">|</span> ')+'</span>'))),
+ cohorts:()=>card('Dependency cohorts  (● = venv cached on disk, reused next run)',rows(snap.cohorts||[],x=>frow(x.key,
+   '<span class="'+(x.cached?'g':'d')+'">'+(x.cached?'●':'○')+'</span> <span class="c" style="width:110px">'+x.count+'  '+E(x.key)+'</span><span class="s g">'+(x.families||[]).map(E).join(' <span class="c">|</span> ')+'</span>'))),
  built:()=>card('Built — successes ('+(snap.counts.built||0)+')',rows(snap.built_recent||[],x=>frow(x.slug,
    '<span class="g s">'+E(x.slug)+'</span><span class="meta">'+E(x.backend||'')+'  '+human(x.bytes)+'  '+E(x.compare||'')+'</span>'))),
  failures:()=>{let h=card('Failures by cause',rows(snap.fail_categories||[],x=>frow('cat:'+x.cat,
     '<span class="c" style="width:40px;text-align:right">'+x.count+'</span><span class="y" style="width:200px">'+E(x.cat)+'</span><span class="meta d s">'+E(x.hint)+'</span>')));
-  h+=card('Failures — newest first ('+(snap.counts.failed||0)+')',rows((snap.failures_recent||[]).slice(0,200),x=>frow(x.slug,
-    '<span class="r s">'+E(x.slug)+'</span><span class="meta d">'+E(x.error)+'</span>')));return h},
+  h+=card('Failures — newest first ('+(snap.counts.failed||0)+', current)',rows((snap.failures_recent||[]).slice(0,200),x=>frow(x.slug,
+    '<span class="r s">'+E(x.slug)+'</span><span class="meta d">'+E(x.error)+'</span>')));
+  const fh=snap.failure_history||[];
+  if(fh.length)h+=card('Failure history (persistent — survives restarts & re-attempts)',rows(fh,x=>frow('h:'+E(x.slug)+(x.ts||0),
+    '<span class="d" style="width:120px">'+new Date((x.ts||0)*1000).toLocaleString().slice(0,17)+'</span><span class="y" style="width:150px">'+E((x.cause||'').slice(0,20))+'</span><span class="s meta d">'+E(x.error)+'</span>')));
+  return h},
  stats:()=>{const o=snap.op_stats||{},p=snap.phase_durations||{},m=snap.migration||{};
   let h=card('Per-operation timing',rows(Object.keys(o),k=>frow('op:'+k,'<span class="s">'+E(k)+'</span><span class="meta">n='+o[k].count+'  mean '+o[k].mean+'s  max '+o[k].max+'s</span>')));
   h+=card('Phase durations',rows(Object.keys(p),k=>frow('ph:'+k,'<span class="s">'+E(k)+'</span><span class="meta">'+hms(p[k])+'</span>')));
@@ -3420,8 +3509,10 @@ function panel(){
  const f=(snap.failures_recent||[]).find(x=>x.slug===selKey);
  const q=(snap.queued_list||[]).find(x=>x.slug===selKey);
  const bu=(snap.built_recent||[]).find(x=>x.slug===selKey);
+ const hh=(snap.failure_history||[]).find(x=>'h:'+x.slug+(x.ts||0)===selKey);
  let body='';
- if(f)body='<div class="row"><b class="r">'+E(selKey)+'</b></div><div class="row d" style="white-space:pre-wrap">'+E(f.error)+'</div>';
+ if(hh)body='<div class="row"><b class="r">'+E(hh.slug)+'</b> <span class="y">'+E(hh.cause)+'</span> <span class="d">'+new Date((hh.ts||0)*1000).toLocaleString()+'</span></div><div class="row d" style="white-space:pre-wrap">'+E(hh.error)+'</div>';
+ else if(f)body='<div class="row"><b class="r">'+E(selKey)+'</b></div><div class="row d" style="white-space:pre-wrap">'+E(f.error)+'</div>';
  else if(q){const why={new:'a fresh target — never built before',retry:'re-attempt after a previous failure',rebuild:'rebuild of a family that already built'};
    body='<div class="row"><b>'+E(selKey)+'</b> <span class="badge bg-'+q.kind+'">'+E(q.kind)+'</span></div><div class="row d">'+E(why[q.kind]||'')+'</div>'}
  else if(bu)body='<div class="row"><b class="g">'+E(selKey)+'</b></div><div class="row d">backend '+E(bu.backend)+' · '+human(bu.bytes)+' · vs shipped: '+E(bu.compare||'n/a')+'</div>';
