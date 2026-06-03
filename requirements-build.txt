@@ -2,11 +2,12 @@
 # Pinned to the gfonts_agents build_registry baseline so results are comparable to the
 # existing reproducible-build run (most diffs then categorize as "compiler-version").
 #
-# NOTE: gftools is pinned to the published tag 0.9.99 (on PyPI). The earlier pin
-# `0.9.100.dev4` was a setuptools_scm dev version (4 commits past tag v0.9.99) that only
-# ever existed in a local editable install — it is NOT on PyPI, so every venv's `pip
-# install` failed with "No matching distribution found for gftools==0.9.100.dev4", leaving
-# every cohort interpreter without fontmake/gftools. To reproduce the exact dev build, instead
+# SELF-HEALING: you do NOT need to hand-manage these pins. If any pinned version is
+# unavailable on PyPI (e.g. a stale setuptools_scm dev pin like the old `gftools==0.9.100.dev4`,
+# which never existed on the index), gflib-build's venv installer automatically drops just
+# that pin and lets pip backtrack to a compatible version — and records it. Valid pins are
+# kept as-is, so reproducibility holds for everything that resolves.
+# gftools is pinned to the published tag 0.9.99. To reproduce a specific dev build instead,
 # install from git, e.g.:  gftools @ git+https://github.com/googlefonts/gftools@<commit>
 fontmake==3.11.1
 fonttools==4.61.1

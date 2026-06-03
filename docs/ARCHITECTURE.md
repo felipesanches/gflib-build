@@ -133,6 +133,18 @@ the interpreter's `bin/` prepended to `PATH` (gftools.builder shells out to
 `--experimental-fontc <bin>`. `auto` tries `fontc` first and falls back to `fontmake`,
 recording the backend that actually built each family — the **Rust-migration metric**.
 
+## Self-healing dependency installs (`VenvManager._create`)
+
+`pip install` runs against an `effective-requirements.txt` (base + cohort). If it fails, the
+log is scanned (`_parse_unsatisfiable`) for packages pip "could not find a version that
+satisfies" (a pinned version absent from PyPI — e.g. a stale setuptools_scm dev pin). Those
+pins are dropped (`relax_requirements` keeps the package, removes the `==ver`) and the install
+is retried — up to a few rounds, each relaxing any newly-reported unsatisfiable pin. Base-pin
+relaxations are cached in `self._relaxed` (under the global lock) and shared by every later
+cohort, so the failing first attempt happens once, not per cohort. Each relaxation is recorded
+in `self.relaxations` → `snapshot()["dep_relaxations"]` (shown in the config tab). Valid pins
+are never touched, so reproducibility holds for everything that resolves.
+
 ## Dependency cohorts (`VenvManager`)
 
 `cohort_key_for(requirements)` = `"base"` if empty, else `"c-" + sha1(normalized)[:12]`,

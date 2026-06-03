@@ -600,6 +600,40 @@ def read_requirements_from_mirror(mirror: Path, commit: str) -> str:
 
 # =============================================================================== venvs
 
+def _req_pkg_name(line: str) -> str:
+    """Package name from a requirements line, or '' for blank/comment/option/URL lines."""
+    s = line.strip()
+    if not s or s.startswith("#") or s.startswith("-") or "://" in s:
+        return ""
+    m = re.match(r"^([A-Za-z0-9_.][A-Za-z0-9_.\-]*)", s)
+    return m.group(1).lower() if m else ""
+
+
+def _parse_unsatisfiable(text: str) -> set:
+    """Packages pip reported it could not satisfy — i.e. a pinned version absent from the index
+    (the classic 'No matching distribution found for X==Y' / 'Could not find a version …')."""
+    bad = set()
+    for pat in (r"Could not find a version that satisfies the requirement\s+([A-Za-z0-9_.\-]+)",
+                r"No matching distribution found for\s+([A-Za-z0-9_.\-]+)"):
+        for m in re.finditer(pat, text):
+            bad.add(m.group(1).lower())
+    return bad
+
+
+def relax_requirements(lines: List[str], relax: set) -> List[str]:
+    """Drop the version pin (keep just the package name) for any requirement whose package is in
+    `relax`, so pip's resolver backtracks to a compatible version instead of failing on an
+    absent/dev pin. Other pins are untouched, so reproducibility holds for everything valid."""
+    out = []
+    for ln in lines:
+        pkg = _req_pkg_name(ln)
+        if pkg and pkg in relax:
+            out.append(f"{pkg}    # auto-relaxed by gflib-build: pinned version unavailable on PyPI")
+        else:
+            out.append(ln)
+    return out
+
+
 class VenvManager:
     """Create and reuse one venv per distinct dependency cohort.
 
@@ -617,6 +651,8 @@ class VenvManager:
         self._global = threading.Lock()
         self._locks: Dict[str, threading.Lock] = {}
         self._ready: Dict[str, str] = {}
+        self._relaxed: set = set()               # base pins auto-relaxed once, shared by cohorts
+        self.relaxations: List[str] = []         # human-readable record (surfaced to the UI)
 
     def cohort_key(self, req_text: str) -> str:
         return cohort_key_for(req_text)
@@ -664,19 +700,42 @@ class VenvManager:
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if rc.returncode != 0:
             return "", f"venv create rc={rc.returncode}: {rc.stdout.decode('utf-8','replace')[:200]}"
-        install = [str(py), "-m", "pip", "install", "--disable-pip-version-check",
-                   "--cache-dir", str(self.pip_cache)]
-        if self.base_req and self.base_req.is_file():
-            install += ["-r", str(self.base_req)]
-        if key != "base":
-            req_path = vdir / "cohort-requirements.txt"
-            req_path.write_text(req_text)
-            install += ["-r", str(req_path)]
-        with open(log, "wb") as lf:
-            p = subprocess.run(install, stdout=lf, stderr=subprocess.STDOUT)
-        if p.returncode != 0:
-            return "", f"pip install rc={p.returncode} (see {log.name})"
-        return str(py), ""
+
+        base_lines = (self.base_req.read_text().splitlines()
+                      if (self.base_req and self.base_req.is_file()) else [])
+        cohort_lines = req_text.splitlines() if key != "base" else []
+        base_pkgs = {_req_pkg_name(l) for l in base_lines} - {""}
+        eff_path = vdir / "effective-requirements.txt"
+        with self._global:
+            relax = set(self._relaxed)            # start from base pins already known-broken
+        # SELF-HEALING install: if pip can't satisfy a pinned version (a stale/dev pin absent
+        # from PyPI), drop just that pin and retry — so the user never has to hand-manage pins.
+        for attempt in range(6):
+            eff = relax_requirements(base_lines + cohort_lines, relax)
+            eff_path.write_text("\n".join(eff) + "\n")
+            install = [str(py), "-m", "pip", "install", "--disable-pip-version-check",
+                       "--cache-dir", str(self.pip_cache), "-r", str(eff_path)]
+            with open(log, "wb" if attempt == 0 else "ab") as lf:
+                if relax:
+                    lf.write(f"# gflib-build attempt {attempt + 1}: auto-relaxed pins "
+                             f"{sorted(relax)}\n".encode())
+                p = subprocess.run(install, stdout=lf, stderr=subprocess.STDOUT)
+            if p.returncode == 0:
+                base_fixed = relax & base_pkgs
+                if base_fixed:
+                    with self._global:
+                        new = base_fixed - self._relaxed
+                        self._relaxed |= base_fixed
+                        if new:                   # record once, for the UI / log
+                            self.relaxations.append(
+                                f"auto-relaxed base pins (unavailable on PyPI): {sorted(new)}")
+                return str(py), ""
+            bad = _parse_unsatisfiable(log.read_text(errors="replace"))
+            if not (bad - relax):                 # nothing NEW to relax → a genuine failure
+                note = f" after auto-relaxing {sorted(relax)}" if relax else ""
+                return "", f"pip install rc={p.returncode}{note} (see {log.name})"
+            relax |= bad
+        return "", f"pip install failed even after auto-relaxing {sorted(relax)} (see {log.name})"
 
 
 # ============================================================================= building
@@ -1162,6 +1221,7 @@ class Orchestrator:
             "op_stats": op_stats, "phase_durations": phase_dur, "migration": migration,
             "tasks": tasks, "archive_recent": archive_recent, "config": config,
             "control_log": control_log,
+            "dep_relaxations": list(self.venvs.relaxations) if self.venvs else [],
             "done": phase == "done",
         }
 
@@ -2181,6 +2241,13 @@ class CursesFrontend(Frontend):
                     v = cfg.get(key)
                     v = ("yes" if v else "no") if key == "manage_venvs" else (v or "(none)")
                     put(row, 1, f"{label:<30} {v}", curses.A_DIM); row += 1
+                relax = snap.get("dep_relaxations", [])
+                if relax:
+                    row += 1
+                    put(row, 0, " auto-fixed dependencies (no manual pinning needed) ".ljust(w - 1, "-"),
+                        curses.A_BOLD); row += 1
+                    for ln in relax[:max(0, (h - row) // 2)]:
+                        put(row, 1, ln, YEL); row += 1
                 clog = snap.get("control_log", [])
                 if clog:
                     row += 1
@@ -2425,7 +2492,8 @@ class MonitorState:
               "cohorts": [], "total": 0, "elapsed": 0, "disk_used_delta": 0, "disk_free": 0,
               "jobs": 0, "paused": False, "phase_total": 0, "phase_done": 0, "phase_label": "",
               "phase_error": "", "op_stats": {}, "phase_durations": {}, "migration": {},
-              "tasks": [], "archive_recent": [], "config": {}, "control_log": [], "done": False}
+              "tasks": [], "archive_recent": [], "config": {}, "control_log": [],
+              "dep_relaxations": [], "done": False}
 
     def __init__(self, build_dir: Path):
         self.build_dir = Path(build_dir)

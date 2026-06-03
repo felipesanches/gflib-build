@@ -155,6 +155,11 @@ intent so nothing is lost as the tool evolves.
     edits them; applying takes effect on the RUNNING build with no restart — raising percent
     fetches/cohorts/builds the newly-included families, raising jobs starts more parallel
     workers (via a `control.json` the daemon polls). Drive config from one monitor at a time.
+33. **Self-healing dependencies — no manual pin management.** If a venv's `pip install` can't
+    satisfy a pinned version (a stale/dev pin absent from PyPI), the installer automatically
+    drops just that pin, lets pip backtrack to a compatible version, retries, and records the
+    relaxation in the config tab. Valid pins are kept, so reproducibility holds for everything
+    that resolves; the user never has to hand-edit `requirements-build.txt` to unblock a build.
 
 ---
 
