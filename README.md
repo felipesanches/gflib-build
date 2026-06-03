@@ -208,10 +208,15 @@ intent so nothing is lost as the tool evolves.
     `skipped (not selected this run)`, so the counters reflect real pending work.
 48. **Proactive self-healing — re-attempt fixable failures.** Starting a build automatically
     *retries* families that failed with a cause a fresh try can clear (broken venv, dependency
-    install, transient fetch, stale mirror, missing system library, …), so pressing `[C]` → Start
+    install, transient fetch, stale mirror, …), so pressing `[C]` → Start
     actually moves things forward instead of instantly declaring the build complete. Genuine build
     errors / unreachable repos are kept (they'd just re-fail) unless you tick **retry ALL failed**
-    in the config tab. A retried family rebuilds its broken venv from scratch.
+    in the config tab. A retried family rebuilds its broken venv from scratch. (A cause that needs
+    a human — a missing system `-dev` library — is *not* auto-retried; fix it then use retry-all.)
+49. **`[R]` — retry the selected family now.** Select a family (e.g. in the *failures* tab) and
+    press `R` to re-attempt just that one. On a live build it's re-queued instantly (the worker
+    picks it back up); on a finished build it launches a one-family targeted rebuild
+    (`--only <slug> --rebuild`).
 
 ---
 
@@ -411,7 +416,8 @@ Tabs (switch with **`Tab` / `Shift-Tab` only**):
 Keys: **`Tab`/`Shift-Tab`** switch tabs; within a tab **`←`/`→` move focus between sections**
 (the `▼`-marked one), **`↑`/`↓` navigate items** in the focused section, **`↵` open a detail
 overlay** (a failure's error + log tail, a built family's output, a cohort's requirements, a
-task/op's detail; `Esc`/`↵` returns); `C` opens/returns to the Configuration tab, `q` quits.
+task/op's detail; `Esc`/`↵` returns); **`R` retries the selected family now**; `C` opens/returns
+to the Configuration tab, `q` quits.
 (`Ctrl+Tab` for sections is intercepted by most terminals — e.g. gnome-terminal's own tab
 switching — so `←`/`→` is the reliable binding.) The **elapsed clock is cumulative** across
 reopen/resume. Full per-family logs are at `<build-dir>/logs/<slug>.log`. For non-interactive
