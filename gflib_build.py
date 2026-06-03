@@ -1180,6 +1180,10 @@ class Orchestrator:
             building.sort(key=lambda b: -b["dur"])
             fails = [{"slug": s, "error": self.results[s].error, "log": self.results[s].log}
                      for s in self.failures[-50:] if s in self.results][::-1]
+            built = sorted(([{"slug": r.slug, "backend": r.backend, "bytes": r.out_bytes,
+                              "compare": r.compare, "log": r.log, "ended": r.ended}
+                             for r in rs if r.status == "built"]),
+                           key=lambda b: -b["ended"])[:200]
         try:
             du = shutil.disk_usage(self.build_dir)
             disk_delta, disk_free = max(0, du.used - self.disk_baseline), du.free
@@ -1212,7 +1216,7 @@ class Orchestrator:
             "disk_used_delta": disk_delta, "disk_free": disk_free,
             "jobs": self.args.jobs, "paused": self.paused.is_set(),
             "total": len(rs), "counts": counts, "backends": backends,
-            "building": building, "failures_recent": fails,
+            "building": building, "failures_recent": fails, "built_recent": built,
             "cohorts_ready": self.venvs.ready_count() if self.venvs else 0,
             "phase": phase, "phase_total": ptot, "phase_done": pdone,
             "phase_label": plabel, "phase_error": perr,
@@ -1881,7 +1885,7 @@ class CursesFrontend(Frontend):
     # emoji status marks (ASCII fallback chosen at runtime if the terminal can't render them)
     EMOJI = {"pending": "⏳", "running": "🔄", "done": "✅", "failed": "❌", "skipped": "➖"}
     ASCII = {"pending": "..", "running": ">>", "done": "OK", "failed": "XX", "skipped": "--"}
-    VIEWS = ("config", "overview", "cohorts", "failures", "stats")
+    VIEWS = ("config", "overview", "cohorts", "built", "failures", "stats")
 
     # Full config schema for the ONE Configuration tab (first-run setup AND live editing).
     # `live`=True fields can change on a running build; the rest need a restart.
@@ -2024,6 +2028,8 @@ class CursesFrontend(Frontend):
             return snap.get("tasks", [])
         if view == "cohorts":
             return snap.get("cohorts", [])
+        if view == "built":
+            return snap.get("built_recent", [])
         if view == "failures":
             return snap.get("failures_recent", [])
         if view == "stats":
@@ -2055,6 +2061,18 @@ class CursesFrontend(Frontend):
                     "requirements:"]
             reqs = (item.get("requirements") or "").splitlines()
             out += ["  " + r for r in reqs] or ["  (none — the 'base' cohort has no requirements file)"]
+        elif view == "built":                        # {slug, backend, bytes, compare, log}
+            slug = item.get("slug", "")
+            out += [f"Built: {slug}",
+                    f"backend: {item.get('backend', '')}",
+                    f"output size: {human(item.get('bytes', 0))}",
+                    f"vs shipped: {item.get('compare') or '(not compared)'}",
+                    f"fonts: {self.orch.build_dir / 'out' / slug.replace('/', '__')}",
+                    f"rebuild: python3 gflib_build.py --only {slug} --rebuild --yes"]
+            log = item.get("log", "")
+            if log:
+                out += ["", "log tail:"]
+                out += ["  " + ln for ln in _read_log_tail(self.orch.build_dir / log, 60)]
         elif view == "failures":                     # {slug, error, log}
             log = item.get("log", "")
             slug = item.get("slug", "")
@@ -2295,6 +2313,15 @@ class CursesFrontend(Frontend):
                           color=lambda co: 0 if co["key"] == "base" else CYAN)
                 if not cohorts:
                     put(row, 1, "(cohorts are assigned live as families build — needs --manage-venvs)")
+            elif view == "built":
+                bl = snap.get("built_recent", [])
+                put(row, 0, f" Built — successes ({c['built']}) · newest first · ↑↓ select · ↵ details "
+                            .ljust(w - 1, "-"), curses.A_BOLD); row += 1
+                draw_list(row, bl, lambda b: "%-36s %-9s %9s  %s" % (
+                    b["slug"], b.get("backend", ""), human(b.get("bytes", 0)),
+                    b.get("compare", "")), color=lambda b: GREEN)
+                if not bl:
+                    put(row, 1, "(no fonts built yet)")
             elif view == "failures":
                 fails = snap["failures_recent"]
                 put(row, 0, f" Failures ({c['failed']}) — newest first · ↑↓ select · ↵ log "
@@ -2647,6 +2674,7 @@ class MonitorState:
     _EMPTY = {"phase": "(waiting for build…)",
               "counts": {"built": 0, "failed": 0, "building": 0, "queued": 0, "skipped": 0},
               "backends": {"fontc": 0, "fontmake": 0}, "building": [], "failures_recent": [],
+              "built_recent": [],
               "cohorts": [], "total": 0, "elapsed": 0, "disk_used_delta": 0, "disk_free": 0,
               "jobs": 0, "paused": False, "phase_total": 0, "phase_done": 0, "phase_label": "",
               "phase_error": "", "op_stats": {}, "phase_durations": {}, "migration": {},
