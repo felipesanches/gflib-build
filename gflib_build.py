@@ -1608,7 +1608,7 @@ class Orchestrator:
                                      "backend": r.backend, "note": r.note})
             building.sort(key=lambda b: -b["dur"])
             queued.sort(key=lambda q: -q["_w"])      # priority order (variable + more fonts first)
-            queued_list = [{"slug": q["slug"], "kind": q["kind"]} for q in queued[:1000]]
+            queued_list = [{"slug": q["slug"], "kind": q["kind"]} for q in queued[:300]]
             fail_categories = sorted(
                 [{"cat": k, "count": v[0], "hint": v[1], "families": sorted(v[2])}
                  for k, v in fail_cat.items()],
@@ -1617,7 +1617,7 @@ class Orchestrator:
             # so the list matches the 'failed N' count even after a resume from state.json.
             fails = sorted([{"slug": r.slug, "error": r.error[:300], "log": r.log, "ended": r.ended}
                             for r in rs if r.status == "failed"],
-                           key=lambda f: -f["ended"])[:2000]
+                           key=lambda f: -f["ended"])[:400]
             built = sorted(([{"slug": r.slug, "backend": r.backend, "bytes": r.out_bytes,
                               "compare": r.compare, "log": r.log, "ended": r.ended}
                              for r in rs if r.status == "built"]),
@@ -3928,13 +3928,35 @@ class MonitorState:
         self.lock = threading.Lock()
         self.workers: List = []
         self.results: Dict = {}
+        self._snap_cache: Optional[dict] = None      # cache the parsed status.json (re-parse on change)
+        self._snap_mtime = -1.0
+        self._snap_parsed_at = 0.0
+        self._pid_alive = False
+        self._pid_checked = 0.0
 
     def snapshot(self) -> dict:
+        # The render loop calls this ~4×/s; re-PARSE the (tens-of-KB) status.json only when it
+        # actually changes (mtime) — re-reading+parsing it every frame is a real source of UI
+        # latency, especially on virtiofs. A 2 s ceiling bounds staleness if mtime is cached stale.
+        path = self.build_dir / "status.json"
+        now = time.time()
         try:
-            snap = json.loads((self.build_dir / "status.json").read_text())
-        except Exception:
-            snap = dict(self._EMPTY)
-        snap["daemon_alive"] = read_daemon_pid(self.build_dir) is not None
+            mt = path.stat().st_mtime
+        except OSError:
+            mt = -1.0
+        if self._snap_cache is None or mt != self._snap_mtime or (now - self._snap_parsed_at) > 2.0:
+            try:
+                self._snap_cache = json.loads(path.read_text())
+                self._snap_mtime = mt
+            except Exception:
+                if self._snap_cache is None:
+                    self._snap_cache = dict(self._EMPTY)
+            self._snap_parsed_at = now
+        if now - self._pid_checked > 1.0:            # the pidfile check is also a syscall — throttle it
+            self._pid_alive = read_daemon_pid(self.build_dir) is not None
+            self._pid_checked = now
+        snap = dict(self._snap_cache)                # shallow copy so daemon_alive can't poison the cache
+        snap["daemon_alive"] = self._pid_alive
         return snap
 
     def all_done(self) -> bool:
