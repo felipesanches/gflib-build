@@ -909,7 +909,7 @@ class Orchestrator:
         self._resumed_elapsed = 0.0   # active wall-time from prior sessions (so the clock
                                        # is cumulative across reopen/resume, not reset to 0)
         self.disk_baseline = self._disk_used()
-        self._size_cache = [0, 0.0]                  # (build-dir total bytes, last-computed time)
+        self._build_total = 0                        # build-dir total bytes; refreshed off-thread
         self.failures: List[str] = []
         self.workers: List[threading.Thread] = []
         self._wid_counter = 0                    # monotonic worker ids (no collisions on respawn)
@@ -929,7 +929,7 @@ class Orchestrator:
         self.phase_label = ""
         self.phase_error = ""
         self.cohorts: Dict[str, dict] = {}
-        self.archive_log: List[Tuple[str, str]] = []   # (status, owner/repo) as repos are mirrored
+        self.archive_log: List[Tuple[str, str, str]] = []  # (status, owner/repo, reason) per mirror
         self._archive_seen: set = set()                # de-dup repos across pre-warmer + workers
         self._cohort_members: Dict[str, set] = {}      # cohort key -> {slugs} (assigned live)
         self._cohort_reqs: Dict[str, str] = {}         # cohort key -> normalized requirements
@@ -1153,32 +1153,41 @@ class Orchestrator:
         except OSError:
             return 0
 
-    def _build_dir_bytes(self) -> int:
-        """Total bytes the build system occupies on disk (the whole build dir: out/, venvs/,
-        work/, caches, logs). Cached ~10 s — it's the cumulative size, not a per-session delta."""
-        now = time.time()
-        if now - self._size_cache[1] < 10:
-            return self._size_cache[0]
-        total = 0
+    def _measure_build_dir(self) -> int:
+        """Compute the total bytes the build system occupies on disk (the whole build dir: out/,
+        venvs/, work/, caches, logs). SLOW (a full tree walk) — must run only on the background
+        size thread, never on a render/snapshot path. `du`'s reported total is valid even when it
+        exits non-zero because a file vanished mid-walk (workers churn work/ during a build), so we
+        trust any numeric stdout and only fall back to os.walk when du gives nothing usable."""
         try:                                          # `du` is fast (C); falls back to os.walk
             p = subprocess.run(["du", "-sk", str(self.build_dir)],
-                               capture_output=True, text=True, timeout=30)
-            if p.returncode == 0 and p.stdout.split():
-                total = int(p.stdout.split()[0]) * 1024
-            else:
-                raise RuntimeError
+                               capture_output=True, text=True, timeout=60)
+            tok = p.stdout.split()
+            if tok and tok[0].isdigit():
+                return int(tok[0]) * 1024             # partial-but-fine even if returncode != 0
         except Exception:
+            pass
+        total = 0
+        try:
+            for root, _dirs, files in os.walk(self.build_dir):
+                for f in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        return total
+
+    def _size_writer(self):
+        """Refresh self._build_total off the UI thread, so snapshot() (called every ~0.25 s on the
+        curses render thread and every ~1 s on the status writer) only ever reads a plain int."""
+        while not self.stop.is_set():
             try:
-                for root, _dirs, files in os.walk(self.build_dir):
-                    for f in files:
-                        try:
-                            total += os.path.getsize(os.path.join(root, f))
-                        except OSError:
-                            pass
+                self._build_total = self._measure_build_dir()
             except Exception:
                 pass
-        self._size_cache = [total, now]
-        return total
+            self.stop.wait(10)                        # interruptible ~10 s pacing
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -1244,7 +1253,7 @@ class Orchestrator:
         return {
             "elapsed": self._resumed_elapsed + (time.time() - self.start_time),
             "disk_used_delta": disk_delta, "disk_free": disk_free,
-            "disk_build_total": self._build_dir_bytes(),
+            "disk_build_total": self._build_total,   # plain int, refreshed by _size_writer (off-thread)
             "jobs": self.args.jobs, "paused": self.paused.is_set(),
             "total": len(rs), "counts": counts, "backends": backends,
             "building": building, "failures_recent": fails, "built_recent": built,
@@ -1515,6 +1524,8 @@ class Orchestrator:
     def run(self):
         self._status_thread = threading.Thread(target=self._status_writer, daemon=True)
         self._status_thread.start()
+        self._size_thread = threading.Thread(target=self._size_writer, daemon=True)
+        self._size_thread.start()
         self._control_thread = threading.Thread(target=self._control_watcher, daemon=True)
         self._control_thread.start()
         self.driver = threading.Thread(target=self._drive, daemon=True)
@@ -2426,6 +2437,8 @@ class CursesFrontend(Frontend):
                     budget = max(0, body_bottom - r)
                     cap = max(1, budget - 2 * (n - 1 - si)) if foc else min(2, len(items))
                     cap = min(cap, len(items), max(1, budget))
+                    if cap < len(items) and cap >= budget and budget >= 2:
+                        cap -= 1                       # reserve the last body row for "(+N more)"
                     top = 0
                     if foc and sel >= cap:
                         top = min(sel - cap + 1, max(0, len(items) - cap))
@@ -2449,7 +2462,18 @@ class CursesFrontend(Frontend):
                 title = (" Configuration — set up your build "
                          if pre_build else " Configuration — edit settings (live where possible) ")
                 put(row, 0, title.ljust(w - 1, "-"), curses.A_BOLD); row += 1
-                for i, f in enumerate(vis):
+                # On a short terminal the fields would overflow into the reserved panel rows; scroll
+                # them (keeping the active field visible) and reserve room for the action button.
+                field_budget = max(1, body_bottom - row - 2)
+                fstart = 0
+                if len(vis) > field_budget:
+                    afield = min(cfg_active, len(vis) - 1)
+                    fstart = min(max(0, afield - field_budget + 1), len(vis) - field_budget)
+                    if fstart > 0:
+                        put(row, 1, f"  ↑ {fstart} more", curses.A_DIM); row += 1
+                        field_budget -= 1
+                for i in range(fstart, min(len(vis), fstart + field_budget)):
+                    f = vis[i]
                     active = (cfg_active == i)
                     editable = setup or f.get("live")
                     if f["type"] == "bool":
@@ -2471,13 +2495,17 @@ class CursesFrontend(Frontend):
                     if active and editable and f["type"] not in ("bool", "choice"):
                         cfg_cursor = (row, VC + min(f.get("_caret", len(f["value"])), len(f["value"])))
                     row += 1
-                # action button(s): ▶ Start build / Cancel (setup) or ✓ apply changes (live)
+                if len(vis) > fstart + field_budget:
+                    put(row, 1, f"  ↓ {len(vis) - fstart - field_budget} more", curses.A_DIM); row += 1
+                # action button(s): ▶ Start build / Cancel (setup) or ✓ apply changes (live).
+                # Clamp into the body so it never lands on the reserved panel rows (and is reachable).
+                brow = min(row + 1, body_bottom - 1)
                 bx = 2
                 for ai, actlbl in enumerate(actions):
-                    put(row + 1, bx, f" {actlbl} ",
+                    put(brow, bx, f" {actlbl} ",
                         curses.A_REVERSE if cfg_active == len(vis) + ai else curses.A_BOLD)
                     bx += len(actlbl) + 4
-                row += 3
+                row = brow + 2
                 relax = snap.get("dep_relaxations", [])
                 if relax and row < body_bottom - 1:
                     put(row, 0, " auto-fixed dependencies (no manual pinning needed) ".ljust(w - 1, "-"),
