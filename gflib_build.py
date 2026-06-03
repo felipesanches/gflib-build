@@ -2744,11 +2744,10 @@ class CursesFrontend(Frontend):
                     secs.append(("Archive — mirrored", arch,
                                  lambda a: ("+ " if a["status"] == "added" else "✗ ") + a["repo"],
                                  lambda a: RED if a["status"] == "failed" else GREEN, None))
-                secs.append(("Now building", snap.get("building", []),
-                             lambda b: f"w{b['worker']:>2} {b['slug']:<34} {hms(b['dur']):>8}  "
-                             f"{b['note'] or b['backend'] or ''}", lambda b: YEL, "building"))
+                # "Now building" is pinned above (shown on every tab), so it's not a section here
                 secs.append(("Recent failures", snap.get("failures_recent", []),
-                             lambda f: f"{f['slug']:<34} {f['error']}", lambda f: RED, "failures"))
+                             lambda f: [(f"{f['slug']:<34} ", 0), (f['error'], curses.A_DIM)],
+                             lambda f: RED, "failures"))
                 return secs
             if v == "cohorts":
                 return [("Dependency cohorts", snap.get("cohorts", []),
@@ -3079,6 +3078,18 @@ class CursesFrontend(Frontend):
                         nxt += " · raise % in config to include skipped"
                     put(row, 0, nxt, curses.A_DIM); row += 1
                 row += 1                              # blank separator below the banner
+            # ---- pinned "Now building": always visible (every tab) while families compile ----
+            building = snap.get("building", [])
+            if building and detail is None and body_bottom - row >= 3:
+                cap = max(1, min(len(building), 5, (body_bottom - row) - 2))
+                put(row, 0, f" ▶ Now building ({len(building)}) ".ljust(w - 1, "-"),
+                    YEL | curses.A_BOLD); row += 1
+                for b in building[:cap]:
+                    put(row, 1, f"w{b['worker']:>2} {b['slug']:<34} {hms(b['dur']):>8}  "
+                                f"{b['note'] or b['backend'] or ''}", YEL); row += 1
+                if len(building) > cap:
+                    put(row, 1, f"  … (+{len(building) - cap} more)", curses.A_DIM); row += 1
+                row += 1                              # gap before the tab body
             if detail is not None:                   # ---- detail overlay for the selected item ----
                 put(5, 0, " Details — [Esc/←/↵] back   [↑↓] scroll ".ljust(w - 1, "-"), curses.A_BOLD)
                 lines = detail                        # captured once when opened (no per-frame I/O)
