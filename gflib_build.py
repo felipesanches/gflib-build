@@ -693,9 +693,15 @@ class VenvManager:
     def _create(self, key: str, req_text: str):
         vdir = self.root / key
         py = vdir / "bin" / "python"
+        ready = vdir / ".gflib-installed"        # written ONLY after a successful pip install
         log = self.root / f"{key}.install.log"
-        if py.exists():
+        if ready.exists() and py.exists():       # verified-ready: reuse it
             return str(py), ""
+        # No success marker → brand-new, OR a previous install failed (e.g. an unavailable pin like
+        # the old gftools==0.9.100.dev4) and left a venv with only pip. Never resurrect that broken
+        # shell — rebuild from scratch so the (now-fixable) requirements get re-installed.
+        if vdir.exists():
+            shutil.rmtree(vdir, ignore_errors=True)
         rc = subprocess.run([self.base_python, "-m", "venv", str(vdir)],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if rc.returncode != 0:
@@ -721,6 +727,10 @@ class VenvManager:
                              f"{sorted(relax)}\n".encode())
                 p = subprocess.run(install, stdout=lf, stderr=subprocess.STDOUT)
             if p.returncode == 0:
+                try:
+                    ready.write_text("ok\n")      # mark verified-ready (else we'd reinstall next run)
+                except OSError:
+                    pass
                 base_fixed = relax & base_pkgs
                 if base_fixed:
                     with self._global:

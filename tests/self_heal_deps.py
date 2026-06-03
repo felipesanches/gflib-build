@@ -42,4 +42,26 @@ out = subprocess.run([py, "-c", "import six; print(six.__version__)"], capture_o
 print("six version installed:", out.stdout.strip())
 assert out.returncode == 0, out.stderr
 assert any("six" in r for r in vm.relaxations), vm.relaxations
-print("\nSELF-HEAL OK (unavailable pin auto-relaxed; install succeeded; recorded)")
+# a successful install must leave a verified-ready marker
+assert (g.Path(work) / "venvs" / "base" / ".gflib-installed").exists(), "success sentinel missing"
+print("install wrote the .gflib-installed success marker")
+
+# ---- regression: a venv with bin/python but a FAILED install (no marker) must NOT be resurrected
+#      as 'ready' — it must be rebuilt. This is the gftools==0.9.100.dev4 mass-failure bug: an early
+#      run left 21 venvs with only pip, and `if py.exists(): return ready` kept serving the broken
+#      shells forever, so every family failed with "No module named gftools". ----
+import subprocess
+broken = g.Path(work) / "venvs" / "c-broken"
+(broken / "bin").mkdir(parents=True)
+(broken / "bin" / "python").symlink_to(sys.executable)       # looks like a venv: python but no deps
+assert not (broken / ".gflib-installed").exists()
+open(req, "w").write("wheel\n")                              # a trivially-satisfiable requirement
+py2, err2 = vm._create("c-broken", "")
+print("rebuild unmarked venv:", "OK" if not err2 else f"FAIL: {err2}")
+assert not err2, err2
+assert (broken / ".gflib-installed").exists(), "rebuilt venv must get the success marker"
+r = subprocess.run([py2, "-c", "import wheel; print(wheel.__version__)"], capture_output=True, text=True)
+assert r.returncode == 0, "venv should have been REBUILT with deps, not resurrected empty:\n" + r.stderr
+print("regression: a venv with no success marker is rebuilt, not resurrected")
+
+print("\nSELF-HEAL OK (unavailable pin auto-relaxed; install succeeded; recorded; no resurrection)")
