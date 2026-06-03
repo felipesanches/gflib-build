@@ -66,10 +66,10 @@ os.waitpid(pid, 0)
 
 no_crash = "_curses.error" not in txt and "Traceback" not in txt
 print("no crash:", no_crash)
-row = "Oswald, Roboto" in txt                          # base cohort row lists both names
+row = "Oswald | Roboto" in txt                         # base cohort row lists both names ( | sep)
 small = "Lato" in txt                                  # the other cohort's single family
 detail = "family names:" in txt                        # detail overlay has a family-names block
-print("base row shows 'Oswald, Roboto':", row)
+print("base row shows 'Oswald | Roboto':", row)
 print("cohort_ab row shows 'Lato':", small)
 print("detail overlay lists family names:", detail)
 assert no_crash and row and small and detail, txt[-800:]

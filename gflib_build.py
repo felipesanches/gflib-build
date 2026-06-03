@@ -2409,7 +2409,7 @@ class CursesFrontend(Frontend):
             fams = item.get("families", [])
             return [f"cohort {item['key']}: {item['count']} families"
                     + (f" — needs {reqs[0]}" if reqs else " (base — no extra requirements)"),
-                    "  " + (", ".join(fams) if fams else "(none assigned yet)")]
+                    "  " + (" | ".join(fams) if fams else "(none assigned yet)")]
         if kind == "failcat":                             # a failure-cause bucket {cat,count,hint}
             return [f"{item['count']} families failed: {item['cat']}", "  → " + item.get("hint", "")]
         if kind == "stats":                               # an op: (op, {total,count,mean,max})
@@ -2491,6 +2491,31 @@ class CursesFrontend(Frontend):
             out += [f"Operation: {op}", f"total: {s['total']} s", f"count: {s['count']}",
                     f"mean: {s['mean']} s", f"max: {s['max']} s"]
         return out
+
+    @staticmethod
+    def _item_key(item):
+        """A stable identity for a list item, so the selection can follow the SAME item as the list
+        reorders / grows / shrinks (e.g. a family moving failed→building→built live)."""
+        if isinstance(item, dict):
+            for k in ("slug", "key", "cat"):
+                if k in item:
+                    return item[k]
+            return item.get("name")
+        if isinstance(item, tuple) and item:
+            return item[0]
+        return None
+
+    @classmethod
+    def _resolve_selection(cls, items, sel, sel_key):
+        """Keep the selection on the SAME item as `items` changes: if `sel_key` still identifies an
+        item, move `sel` onto it; otherwise keep `sel` (clamped). Returns (sel, fresh sel_key).
+        `sel_key` is None right after the user moved (so a move is never undone)."""
+        if sel_key is not None:
+            match = next((i for i, it in enumerate(items) if cls._item_key(it) == sel_key), None)
+            if match is not None:
+                sel = match
+        sel = max(0, min(sel, len(items) - 1)) if items else 0
+        return sel, (cls._item_key(items[sel]) if items else None)
 
     @staticmethod
     def _layout_sections(avail, sizes, fi, sel):
@@ -2611,8 +2636,12 @@ class CursesFrontend(Frontend):
                 return secs
             if v == "cohorts":
                 return [("Dependency cohorts", snap.get("cohorts", []),
-                         lambda co: "%4d  %-14s %s" % (co["count"], co["key"],
-                         (", ".join(co.get("families", [])) or "(no families assigned yet)")),
+                         # two-colour row: count+key in the cohort colour, family names in GREEN,
+                         # separated by " | " so they read as a distinct list (request)
+                         lambda co: [("%4d  %-14s " % (co["count"], co["key"]),
+                                      0 if co["key"] == "base" else CYAN),
+                                     (" | ".join(co.get("families", [])) or "(no families yet)",
+                                      GREEN)],
                          lambda co: 0 if co["key"] == "base" else CYAN, "cohorts")]
             if v == "built":
                 return [("Built — successes", snap.get("built_recent", []),
@@ -2644,7 +2673,8 @@ class CursesFrontend(Frontend):
         setup = getattr(self, "setup", False)        # pre-build first-run Configuration screen
         view = "config"                              # land on the Configuration tab (leftmost)
         sel, detail, dscroll = 0, None, 0
-        section_idx = 0                              # focused section in a multi-section tab
+        sel_key = None                               # identity of the selected item (follow it as
+        section_idx = 0                              #   the list reorders); None right after a move
         cfg_fields = None                            # the editable Configuration fields
         cfg_active = 0                               # selected field, or the action button
         flash, flash_frames = "", 0                  # transient acknowledgement (e.g. [R] retry)
@@ -2682,10 +2712,10 @@ class CursesFrontend(Frontend):
                 return None
             elif ch == 9 and not setup:               # Tab → next tab (live only; setup = config only)
                 view = self.VIEWS[(self.VIEWS.index(view) + 1) % len(self.VIEWS)]
-                cfg_active = sel = section_idx = 0; detail = None
+                cfg_active = sel = section_idx = 0; detail = None; sel_key = None
             elif ch == curses.KEY_BTAB and not setup:  # Shift-Tab → previous tab
                 view = self.VIEWS[(self.VIEWS.index(view) - 1) % len(self.VIEWS)]
-                cfg_active = sel = section_idx = 0; detail = None
+                cfg_active = sel = section_idx = 0; detail = None; sel_key = None
             elif detail is not None:                  # inside the detail overlay
                 if ch in (10, 13, curses.KEY_BACKSPACE, 127, 8, curses.KEY_LEFT):
                     detail = None                     # ↵ / ⌫ / ← all return to the list
@@ -2736,13 +2766,13 @@ class CursesFrontend(Frontend):
                             flash, flash_frames = ("build daemon has exited — re-run "
                                                    "(or [C] then Start) to resume and retry", 24)
                 elif ch == curses.KEY_RIGHT and len(secs) > 1:   # → next section (Ctrl+Tab is
-                    section_idx = (section_idx + 1) % len(secs); sel = 0   # eaten by most terminals)
+                    section_idx = (section_idx + 1) % len(secs); sel = 0; sel_key = None
                 elif ch == curses.KEY_LEFT and len(secs) > 1:    # ← previous section
-                    section_idx = (section_idx - 1) % len(secs); sel = 0
+                    section_idx = (section_idx - 1) % len(secs); sel = 0; sel_key = None
                 elif ch == curses.KEY_DOWN:
-                    sel += 1
+                    sel += 1; sel_key = None          # clear so the move isn't undone by re-resolve
                 elif ch == curses.KEY_UP:
-                    sel = max(0, sel - 1)
+                    sel = max(0, sel - 1); sel_key = None
                 elif ch in (10, 13):                  # ↵ act on the focused section's selection
                     si = min(section_idx, len(secs) - 1) if secs else 0
                     if secs:
@@ -2756,7 +2786,7 @@ class CursesFrontend(Frontend):
                 secs = sections_for(snap, view)
                 section_idx = max(0, min(section_idx, len(secs) - 1)) if secs else 0
                 foc_items = secs[section_idx][1] if secs else []
-                sel = max(0, min(sel, len(foc_items) - 1)) if foc_items else 0
+                sel, sel_key = self._resolve_selection(foc_items, sel, sel_key)
             c, bk = snap["counts"], snap["backends"]
             h, w = stdscr.getmaxyx()
             stdscr.erase()
@@ -2863,8 +2893,19 @@ class CursesFrontend(Frontend):
                         for idx in range(top, top + e["count"]):
                             if r >= body_bottom:
                                 break
-                            a = (color(items[idx]) or 0) | (curses.A_REVERSE if foc and idx == sel else 0)
-                            put(r, 1, fmt(items[idx]), a); r += 1
+                            sel_here = foc and idx == sel
+                            rendered = fmt(items[idx])
+                            if isinstance(rendered, list) and not sel_here:
+                                # multi-colour row: draw each (text, attr) segment in its own colour
+                                x = 1
+                                for text, seg_attr in rendered:
+                                    put(r, x, text, seg_attr); x += len(text)
+                            else:                     # plain string, or a selected row (one reverse)
+                                txt = (rendered if isinstance(rendered, str)
+                                       else "".join(t for t, _a in rendered))
+                                a = (color(items[idx]) or 0) | (curses.A_REVERSE if sel_here else 0)
+                                put(r, 1, txt, a)
+                            r += 1
                         if e["hint"] and r < body_bottom:
                             put(r, 1, f"  … (+{len(items) - e['count']} more)", curses.A_DIM)
                             r += 1
