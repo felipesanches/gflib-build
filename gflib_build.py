@@ -274,6 +274,19 @@ def categorize_failure(error: str):
     if "missing system library" in low:
         return ("missing system library", "a package built from source needs a native -dev library "
                 "(e.g. apt install libcairo2-dev pkg-config) — self-heal can't install system pkgs")
+    if "dependency conflict" in low:
+        return ("dependency conflict", "a cohort dep needs a different version of a base tool; the "
+                "conflicting base pin is auto-relaxed on retry — if it persists the repo pins an "
+                "unbuildable combination")
+    if "resolution too deep" in low:
+        return ("pip resolution too deep", "the repo's requirements make pip backtrack endlessly — "
+                "needs tighter constraints; not auto-fixable")
+    if "setuptools" in low or "pkg_resources" in low:
+        return ("build needs setuptools", "an sdist needs setuptools/pkg_resources at build time — "
+                "now seeded into every venv; a retry should clear it")
+    if "base requirements file not found" in low or "no build requirements" in low:
+        return ("misconfigured requirements", "a stale base-requirements path made the venv install "
+                "nothing — fixed by re-deriving the bundled file; just retry")
     if "pip install" in low or low.startswith("venv:"):
         return ("dependency install failed", "pip couldn't satisfy the cohort requirements; stale "
                 "pins are auto-relaxed — see the cohort's .install.log")
@@ -309,6 +322,7 @@ def categorize_failure(error: str):
 AUTO_RETRY_CATEGORIES = {
     "broken dependency venv", "dependency install failed", "transient fetch error",
     "stale archive mirror", "repo not mirrored", "internal/transient I/O",
+    "dependency conflict", "build needs setuptools", "misconfigured requirements",
 }
 
 
@@ -735,6 +749,19 @@ def scan_missing_system_dep(log_text: str):
     return None
 
 
+def _parse_conflict_pins(text: str, base_pkgs: set) -> set:
+    """A pip ResolutionImpossible names the conflict, e.g. 'The user requested gftools==0.9.99' vs
+    'notobuilder … depends on gftools 0.9.997.dev22+…(from git+…)'. Relaxing OUR pin on the
+    conflicting package lets the cohort's own requirement win. Only relax pins WE control (base
+    toolchain) — never a cohort's own pin."""
+    if "resolutionimpossible" not in text.lower() and "conflicting dependencies" not in text.lower():
+        return set()
+    out = set()
+    for m in re.finditer(r"[Tt]he user requested ([A-Za-z0-9_.\-]+)\s*==", text):
+        out.add(m.group(1).lower())
+    return out & base_pkgs
+
+
 def relax_requirements(lines: List[str], relax: set) -> List[str]:
     """Drop the version pin (keep just the package name) for any requirement whose package is in
     `relax`, so pip's resolver backtracks to a compatible version instead of failing on an
@@ -808,30 +835,49 @@ class VenvManager:
     def _create(self, key: str, req_text: str):
         vdir = self.root / key
         py = vdir / "bin" / "python"
-        ready = vdir / ".gflib-installed"        # written ONLY after a successful pip install
+        ready = vdir / ".gflib-installed"        # holds a hash of the requirements it was built for
         log = self.root / f"{key}.install.log"
-        if ready.exists() and py.exists():       # verified-ready: reuse it
+
+        # Resolve the REQUESTED requirements first, so readiness can be tied to them. A configured
+        # base-requirements file that doesn't exist (e.g. a stale absolute path persisted from
+        # another machine) must FAIL LOUDLY — silently installing nothing produced an empty "base"
+        # venv that was marked ready and then broke every family with "No module named gftools".
+        if self.base_req is not None and not self.base_req.is_file():
+            return "", (f"base requirements file not found: {self.base_req} (stale base_requirements "
+                        f"path — fix it or use --no-manage-venvs)")
+        base_lines = self.base_req.read_text().splitlines() if self.base_req else []
+        cohort_lines = req_text.splitlines() if key != "base" else []
+        requested = base_lines + cohort_lines
+        if not any(_req_pkg_name(l) for l in requested):
+            return "", ("no build requirements — the toolchain (gftools/fontmake/…) would be missing; "
+                        "manage-venvs needs a base requirements file")
+        want_hash = hashlib.sha256("\n".join(requested).encode()).hexdigest()[:16]
+
+        # Reuse only a venv whose marker matches THESE requirements (so an empty/stale/different
+        # install — e.g. one built under a wrong base_requirements path — is rebuilt, not reused).
+        if ready.exists() and py.exists() and ready.read_text().strip() == want_hash:
             return str(py), ""
-        # No success marker → brand-new, OR a previous install failed (e.g. an unavailable pin like
-        # the old gftools==0.9.100.dev4) and left a venv with only pip. Never resurrect that broken
-        # shell — rebuild from scratch so the (now-fixable) requirements get re-installed.
         if vdir.exists():
             shutil.rmtree(vdir, ignore_errors=True)
         rc = subprocess.run([self.base_python, "-m", "venv", str(vdir)],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if rc.returncode != 0:
             return "", f"venv create rc={rc.returncode}: {rc.stdout.decode('utf-8','replace')[:200]}"
+        # Python 3.12+ venvs ship without setuptools/wheel, but legacy sdists (compreffor, …) import
+        # pkg_resources at build time. Seed them so source builds don't fail with "No module named
+        # pkg_resources".
+        subprocess.run([str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check",
+                        "--cache-dir", str(self.pip_cache), "setuptools", "wheel"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        base_lines = (self.base_req.read_text().splitlines()
-                      if (self.base_req and self.base_req.is_file()) else [])
-        cohort_lines = req_text.splitlines() if key != "base" else []
         base_pkgs = {_req_pkg_name(l) for l in base_lines} - {""}
         eff_path = vdir / "effective-requirements.txt"
         with self._global:
             relax = set(self._relaxed)            # start from base pins already known-broken
-        # SELF-HEALING install: if pip can't satisfy a pinned version (a stale/dev pin absent
-        # from PyPI), drop just that pin and retry — so the user never has to hand-manage pins.
-        for attempt in range(6):
+        conflict_relax = set()                    # cohort-local (don't poison the shared base pins)
+        # SELF-HEALING install: drop a pin pip can't satisfy (stale/dev pin absent from PyPI) OR a
+        # base pin a cohort's own dep conflicts with (ResolutionImpossible), then retry.
+        for attempt in range(8):
             eff = relax_requirements(base_lines + cohort_lines, relax)
             eff_path.write_text("\n".join(eff) + "\n")
             install = [str(py), "-m", "pip", "install", "--disable-pip-version-check",
@@ -843,10 +889,10 @@ class VenvManager:
                 p = subprocess.run(install, stdout=lf, stderr=subprocess.STDOUT)
             if p.returncode == 0:
                 try:
-                    ready.write_text("ok\n")      # mark verified-ready (else we'd reinstall next run)
+                    ready.write_text(want_hash + "\n")   # verified-ready FOR these requirements
                 except OSError:
                     pass
-                base_fixed = relax & base_pkgs
+                base_fixed = (relax - conflict_relax) & base_pkgs   # globally-bad pins only
                 if base_fixed:
                     with self._global:
                         new = base_fixed - self._relaxed
@@ -857,13 +903,22 @@ class VenvManager:
                 return str(py), ""
             log_text = log.read_text(errors="replace")
             bad = _parse_unsatisfiable(log_text)
-            if not (bad - relax):                 # nothing NEW to relax → a genuine failure
+            conflicts = _parse_conflict_pins(log_text, base_pkgs)
+            new_relax = (bad | conflicts) - relax
+            if not new_relax:                     # nothing NEW to relax → a genuine failure
                 syslib = scan_missing_system_dep(log_text)   # a missing C library, not a pin we can fix
                 if syslib:
                     return "", f"missing system library: {syslib} (see {log.name})"
+                if "resolutionimpossible" in log_text.lower() or "conflicting dependencies" in log_text.lower():
+                    return "", f"dependency conflict (see {log.name})"
+                if "resolution-too-deep" in log_text.lower():
+                    return "", f"pip resolution too deep — needs tighter constraints (see {log.name})"
+                if "no module named 'pkg_resources'" in log_text.lower():
+                    return "", f"build needs setuptools/pkg_resources (see {log.name})"
                 note = f" after auto-relaxing {sorted(relax)}" if relax else ""
                 return "", f"pip install rc={p.returncode}{note} (see {log.name})"
-            relax |= bad
+            conflict_relax |= conflicts
+            relax |= new_relax
         return "", f"pip install failed even after auto-relaxing {sorted(relax)} (see {log.name})"
 
 
@@ -1377,7 +1432,8 @@ class Orchestrator:
                 [{"cat": k, "count": v[0], "hint": v[1]} for k, v in fail_cat.items()],
                 key=lambda c: -c["count"])
             fails = [{"slug": s, "error": self.results[s].error, "log": self.results[s].log}
-                     for s in self.failures[-50:] if s in self.results][::-1]
+                     for s in self.failures                # drop ones since rebuilt/re-queued
+                     if s in self.results and self.results[s].status == "failed"][-50:][::-1]
             built = sorted(([{"slug": r.slug, "backend": r.backend, "bytes": r.out_bytes,
                               "compare": r.compare, "log": r.log, "ended": r.ended}
                              for r in rs if r.status == "built"]),
@@ -1749,6 +1805,12 @@ class Orchestrator:
             if n:
                 self._ensure_workers(self.args.jobs)  # wake the pool if it had drained
                 changed.append(f"retry {n} now ({', '.join(retry[:3])}{'…' if len(retry) > 3 else ''})")
+            else:                                     # nothing to do — tell the user why
+                with self.lock:
+                    self.control_log.append(f"[{hms(self.snapshot_elapsed())}] retry ignored: "
+                                            f"{', '.join(retry[:3])} not in this run's worklist "
+                                            f"(raise % to include) or already building")
+                    del self.control_log[:-50]
         if changed:
             with self.lock:
                 self.control_log.append(f"[{hms(self.snapshot_elapsed())}] " + ", ".join(changed))
@@ -1775,15 +1837,22 @@ class Orchestrator:
     def _requeue(self, slugs) -> int:
         """Re-attempt specific families RIGHT NOW (the dashboard's [R] on a live build): reset each
         to a fresh 'queued' Result and push it on the work queue. Only families this run knows how
-        to build (in self.families) can be requeued. Queuing makes all_done() False, so the build
-        loop keeps going; the caller ensures workers are running to pick them up."""
+        to build (in self.families) and that are NOT already in flight (a 'queued'/'building' family
+        is skipped — re-queuing one mid-build would have two workers compile the same slug into the
+        same work/ and out/ dirs and corrupt them). Queuing makes all_done() False, so the build
+        loop keeps going; the caller ensures workers are running to pick them up. Returns the count
+        actually requeued."""
         n = 0
         with self.lock:
             for slug in slugs:
-                if slug in self.families:
-                    self.results[slug] = Result(slug=slug, status="queued")
-                    self.q.put(slug)
-                    n += 1
+                if slug not in self.families:
+                    continue
+                cur = self.results.get(slug)
+                if cur is not None and cur.status in ("queued", "building"):
+                    continue                          # already in flight — never double-build a slug
+                self.results[slug] = Result(slug=slug, status="queued")
+                self.q.put(slug)
+                n += 1
         return n
 
     def _extend_worklist(self, new_pct: float) -> int:
@@ -2617,13 +2686,16 @@ class CursesFrontend(Frontend):
                     return "reconfigure"
                 elif ch in (ord("r"), ord("R")) and secs:   # [R] retry the selected family now
                     si = min(section_idx, len(secs) - 1)
-                    items = secs[si][1]
+                    items, dview = secs[si][1], secs[si][4]
                     it = items[min(sel, len(items) - 1)] if items else None
                     slug = it.get("slug") if isinstance(it, dict) else None
-                    if slug:
+                    if slug and dview == "building":     # already in flight — never double-build it
+                        flash, flash_frames = f"{slug} is already building", 10
+                    elif slug and dview in ("failures", "built"):   # a finished family → retry it
                         if snap.get("daemon_alive", True) and not snap.get("done"):
-                            write_control(self.orch.build_dir, {"retry": [slug]})   # live re-enqueue
-                            flash, flash_frames = f"⟳ retrying {slug} …", 16
+                            ok = write_control(self.orch.build_dir, {"retry": [slug]})
+                            flash, flash_frames = ((f"⟳ retrying {slug} …" if ok
+                                                    else f"⚠ couldn't request retry of {slug}"), 16)
                         else:                            # finished build → targeted rebuild (re-exec)
                             return ("retry", slug)
                 elif ch == curses.KEY_RIGHT and len(secs) > 1:   # → next section (Ctrl+Tab is
@@ -3049,9 +3121,13 @@ def cohorts_report(families: List[Family], archive: Path, jobs: int, out_path: O
 
 # =============================================== config persistence / daemon / monitor
 
+# NOTE: base_requirements is intentionally NOT persisted — it's an absolute path that's re-derived
+# from the bundled requirements-build.txt next to the script each run. Persisting it poisoned the
+# config across machines that mount the shared dir at different paths (a stale path made the base
+# venv install nothing yet be marked ready → every family failed with "No module named gftools").
 CONFIG_KEYS = ("source", "google_fonts", "archive", "build_dir", "backend", "fontc_bin",
                "jobs", "percent", "timeout", "populate_archive", "manage_venvs",
-               "retry_failed", "base_requirements", "compare", "data_dir")
+               "retry_failed", "compare", "data_dir")
 
 
 def load_config(path: Path) -> dict:
