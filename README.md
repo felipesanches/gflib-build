@@ -374,7 +374,8 @@ Tabs (switch with **`Tab` / `Shift-Tab` only**):
   tab with **▶ Start build / Cancel**.
 - **overview** — the pipeline task-list + the live archive list + now-building + recent failures,
   as navigable **sections**.
-- **cohorts** — the dependency cohorts, live (largest first).
+- **cohorts** — the dependency cohorts, live (largest first); each row lists the comma-separated
+  **family names** in that cohort (↵ shows the full family list + requirements).
 - **built** — the list of **successfully built** families (newest first; ↵ shows output path,
   size, vs-shipped comparison + rebuild command).
 - **failures** — all failures, newest first.

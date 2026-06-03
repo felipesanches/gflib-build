@@ -1038,7 +1038,9 @@ class Orchestrator:
         with self.lock:
             self._cohort_members.setdefault(cohort, set()).add(slug)
             self._cohort_reqs.setdefault(cohort, normalize_requirements(req_text))
-            self.cohorts = {k: {"count": len(v), "requirements": self._cohort_reqs.get(k, "")}
+            self.cohorts = {k: {"count": len(v), "requirements": self._cohort_reqs.get(k, ""),
+                                "families": sorted(self.families[s].name if s in self.families
+                                                   else s for s in v)}
                             for k, v in sorted(self._cohort_members.items(),
                                                key=lambda kv: -len(kv[1]))}
 
@@ -1260,8 +1262,8 @@ class Orchestrator:
             "cohorts_ready": self.venvs.ready_count() if self.venvs else 0,
             "phase": phase, "phase_total": ptot, "phase_done": pdone,
             "phase_label": plabel, "phase_error": perr,
-            "cohorts": [{"key": k, "count": v["count"],
-                         "requirements": v["requirements"]} for k, v in cohorts],
+            "cohorts": [{"key": k, "count": v["count"], "requirements": v["requirements"],
+                         "families": v.get("families", [])} for k, v in cohorts],
             "op_stats": op_stats, "phase_durations": phase_dur, "migration": migration,
             "tasks": tasks, "archive_recent": archive_recent, "config": config,
             "control_log": control_log,
@@ -2102,8 +2104,10 @@ class CursesFrontend(Frontend):
                     f"{human(item.get('bytes', 0))}, vs shipped: {item.get('compare') or 'not compared'}"]
         if kind == "cohorts":
             reqs = (item.get("requirements") or "").splitlines()
+            fams = item.get("families", [])
             return [f"cohort {item['key']}: {item['count']} families"
-                    + (f" — needs {reqs[0]}" if reqs else " (base — no extra requirements)")]
+                    + (f" — needs {reqs[0]}" if reqs else " (base — no extra requirements)"),
+                    "  " + (", ".join(fams) if fams else "(none assigned yet)")]
         if kind == "stats":                               # an op: (op, {total,count,mean,max})
             op, st = item
             return [f"{op}: total {st['total']}s · n {st['count']} · mean {st['mean']}s · max {st['max']}s"]
@@ -2137,9 +2141,12 @@ class CursesFrontend(Frontend):
                 out.append(f"progress: {item['done']}/{item['total']}")
             if item.get("detail"):
                 out += ["", "detail:", "  " + str(item["detail"])]
-        elif view == "cohorts":                      # {key, count, requirements}
+        elif view == "cohorts":                      # {key, count, requirements, families}
+            fams = item.get("families", [])
             out += [f"Cohort: {item.get('key', '')}", f"families: {item.get('count', 0)}", "",
-                    "requirements:"]
+                    "family names:"]
+            out += ["  " + n for n in fams] or ["  (none assigned yet)"]
+            out += ["", "requirements:"]
             reqs = (item.get("requirements") or "").splitlines()
             out += ["  " + r for r in reqs] or ["  (none — the 'base' cohort has no requirements file)"]
         elif view == "building":                     # {slug, worker, dur, backend, note}
@@ -2231,9 +2238,8 @@ class CursesFrontend(Frontend):
                 return secs
             if v == "cohorts":
                 return [("Dependency cohorts", snap.get("cohorts", []),
-                         lambda co: "%4d  %-16s %s" % (co["count"], co["key"],
-                         (co["requirements"].splitlines()[0][:48]
-                          if co["requirements"].splitlines() else "(no requirements)")),
+                         lambda co: "%4d  %-14s %s" % (co["count"], co["key"],
+                         (", ".join(co.get("families", [])) or "(no families assigned yet)")),
                          lambda co: 0 if co["key"] == "base" else CYAN, "cohorts")]
             if v == "built":
                 return [("Built — successes", snap.get("built_recent", []),
