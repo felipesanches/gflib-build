@@ -1538,7 +1538,7 @@ class CursesFrontend(Frontend):
         except locale.Error:
             pass
         try:
-            curses.wrapper(self._draw)
+            return curses.wrapper(self._draw)        # "reconfigure" if the user pressed C, else None
         except Exception as e:
             print(f"curses error ({e}); switching to plain output.", file=sys.stderr)
             return PlainFrontend(self.orch).run()
@@ -1637,6 +1637,8 @@ class CursesFrontend(Frontend):
                 if not mon:
                     self.orch.stop.set()
                 break
+            elif ch in (ord("C"), ord("c")):         # back to the setup wizard
+                return "reconfigure"
             elif detail is not None:                 # inside the detail overlay
                 if ch in (27, 10, 13, curses.KEY_BACKSPACE, 127, 8, curses.KEY_LEFT):
                     detail = None
@@ -1821,8 +1823,8 @@ class CursesFrontend(Frontend):
             if detail is not None:
                 foot = " [esc/←/↵] back to list   [↑↓] scroll"
             else:
-                foot = (" [q]uit — build runs on  [↑↓]select [↵]details [←→]tabs"
-                        if mon else " [q]uit [p]ause  [↑↓]select [↵]details")
+                foot = (" [q]uit — build runs on  [C]onfigure  [↑↓]select [↵]info [←→]tabs"
+                        if mon else " [q]uit [p]ause  [C]onfigure  [↑↓]select [↵]info")
             if mon and not snap.get("daemon_alive", True):
                 foot = " [q]uit   ⚠ daemon not running (build finished or stopped)"
             put(h - 1, 0, foot + "   logs: " + str(self.orch.build_dir / "logs"), curses.A_DIM)
@@ -1850,10 +1852,25 @@ def pick_frontend(name: str) -> str:
 
 
 def run_monitor(build_dir: Path, ui: str):
-    """Attach a read-only live monitor to a (possibly detached) build at build_dir."""
+    """Attach a read-only live monitor to a (possibly detached) build at build_dir.
+    Returns "reconfigure" if the user pressed C to go back to the setup wizard."""
     fe = FRONTENDS[ui if ui in FRONTENDS else "plain"](MonitorState(build_dir))
     fe.monitor = True
-    fe.run()
+    return fe.run()
+
+
+def reexec_wizard():
+    """Restart the program forcing the setup wizard (the dashboard's 'C' key). Re-exec is the
+    simplest reliable way to return to the (one-shot, curses) wizard from the monitor; any
+    running daemon is left alone and is only replaced if the user actually starts a new build.
+    Drops flags that would bypass the wizard (--attach/--yes/-y) and forces --wizard."""
+    drop = {"--attach", "--yes", "-y"}
+    argv = [sys.executable] + [a for a in sys.argv if a not in drop]
+    if "--wizard" not in argv:
+        argv.append("--wizard")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, argv)
 
 
 def print_timing_summary(data: dict):
@@ -2340,7 +2357,8 @@ def main():
     if args.attach:
         if pick_frontend(args.ui) == "curses" and not sys.stdout.isatty():
             sys.exit("--attach needs a terminal")
-        run_monitor(mon_build_dir, pick_frontend(args.ui))
+        if run_monitor(mon_build_dir, pick_frontend(args.ui)) == "reconfigure":
+            reexec_wizard()                      # C: drop --attach, re-exec into the wizard
         return
 
     # ---- resolve paths (defaults from --data-dir; auto-detect where possible) ----
@@ -2366,13 +2384,15 @@ def main():
     # ---- if a build is ALREADY RUNNING in this build_dir, just reattach a live monitor ----
     # (resume straight to live updates — no wizard — from this or any other terminal; q leaves
     #  it running, --stop cancels). Prevents accidentally starting a second build in one dir.
-    if not read_only and read_daemon_pid(build_dir) is not None:
+    # `--wizard` (incl. the dashboard's C re-exec) skips this so the wizard always shows.
+    if not read_only and not args.wizard and read_daemon_pid(build_dir) is not None:
         ui = pick_frontend(args.ui)
         if ui == "curses" and not sys.stdout.isatty():
             sys.exit(f"a build is running at {build_dir}; attach from a terminal or use --attach")
         print(f"a build is already running at {build_dir} — reattaching live monitor "
-              f"(q leaves it running; --stop to cancel).", file=sys.stderr)
-        run_monitor(build_dir, ui)
+              f"(q leaves it running; C reconfigures; --stop to cancel).", file=sys.stderr)
+        if run_monitor(build_dir, ui) == "reconfigure":
+            reexec_wizard()
         return
 
     need_gf_clone = args.source == "metadata" and not (gf and (gf / "ofl").is_dir())
@@ -2539,13 +2559,28 @@ def main():
     #      the builds ALL run live inside the driver, rendered as a task-list in the UI ----
     args._want_build_fontc = want_build_fontc
     args._data_dir = str(data_dir)
-    orch = Orchestrator(args)
 
     ui = pick_frontend(args.ui)
     # A fresh interactive (curses) build runs detached by default: quitting the UI (q) frees the
     # shell while the build keeps running, and re-running reattaches a live monitor. plain/json/
     # none stay in the foreground for scripting/logging; --detach forces detach for any UI.
     detach = args.detach or ui == "curses"
+
+    # if a previous build is still running here (e.g. the user pressed C to reconfigure and is
+    # now starting a new one), stop it first so the two don't clobber the same build_dir
+    old = read_daemon_pid(build_dir)
+    if old:
+        print(f"stopping the previous build daemon ({old}) at {build_dir}…", file=sys.stderr)
+        try:
+            os.kill(old, signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(60):
+            if read_daemon_pid(build_dir) is None:
+                break
+            time.sleep(0.1)
+
+    orch = Orchestrator(args)
     print(f"Starting build pipeline (backend={args.backend}); the live UI shows clone / fontc / "
           f"discover / archive / cohorts / build as a task-list.", file=sys.stderr)
 
@@ -2567,16 +2602,21 @@ def main():
               file=sys.stderr)
         time.sleep(0.5)
         if ui != "none":
-            run_monitor(build_dir, ui)
+            if run_monitor(build_dir, ui) == "reconfigure":   # C: back to the wizard
+                reexec_wizard()
         return
 
     orch.run()
     frontend = FRONTENDS[ui](orch)
+    action = None
     try:
-        frontend.run()
-        orch.join()
+        action = frontend.run()
+        if action != "reconfigure":
+            orch.join()
     finally:
         orch.save_state()
+    if action == "reconfigure":                       # C in a foreground UI: back to the wizard
+        reexec_wizard()
 
     c = orch.snapshot()["counts"]
     print(f"\nDONE: built {c['built']}, failed {c['failed']}. "

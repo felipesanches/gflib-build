@@ -144,6 +144,8 @@ intent so nothing is lost as the tool evolves.
     etc.); `Esc`/`←`/`↵` returns.
 29. **Cumulative clock.** The elapsed timer represents the real time spent so far across
     reopen/resume — it is not reset to zero when the program is reopened.
+30. **`C` returns to the setup wizard** from the live dashboard (to change settings / start
+    over); the running build is replaced only if the user actually starts a new one.
 
 ---
 
@@ -333,8 +335,11 @@ arrows** (or `Tab`):
 Keys: **`←`/`→`** (or `Tab`) switch views, `1`/`2`/`3`/`4` jump to a view, **`↑`/`↓` select**
 an item in the current tab's list, **`↵` open a detail overlay** for the selected item (a
 failure's full error + log tail, a cohort's requirements, a task's detail, an op's timing;
-`Esc`/`←`/`↵` returns), `q` quit. The **elapsed clock is cumulative** — it reflects the real
-time the build has spent across reopen/resume, not reset to zero. Full per-family logs are at
+`Esc`/`←`/`↵` returns), **`C` back to the setup wizard** (change settings / start over — the
+program re-execs into the wizard; the running build is replaced only when you actually hit
+*Start*, so cancelling leaves it running), `q` quit. The **elapsed clock is cumulative** — it
+reflects the real time the build has spent across reopen/resume, not reset to zero. Full
+per-family logs are at
 `<build-dir>/logs/<slug>.log`. For non-interactive use pick `--ui plain` (prints phase
 transitions + progress), `--ui json`, or `--ui none`.
 
