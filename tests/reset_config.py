@@ -53,4 +53,18 @@ for f in fields:
 os.unlink(cfgf)
 print("config: falls back to persisted settings; fields initialise without bare 'None'")
 
+# ---- retry_failed must PERSIST (it's in CONFIG_KEYS) so it survives a [C] reconfigure cycle ----
+import types
+assert "retry_failed" in g.CONFIG_KEYS, "retry_failed missing from CONFIG_KEYS → won't persist"
+cfgf2 = tempfile.mktemp(suffix=".config")
+saved = types.SimpleNamespace(source="metadata", google_fonts="/gf", archive="/a", build_dir="/b",
+                              backend="auto", fontc_bin=None, jobs=4, percent=10.0, timeout=None,
+                              populate_archive=True, manage_venvs=True, retry_failed=True,
+                              base_requirements=None, compare=False, data_dir="/d")
+g.save_config(g.Path(cfgf2), saved)
+loaded = g.load_config(g.Path(cfgf2))
+assert loaded.get("retry_failed") is True, f"retry_failed did not round-trip: {loaded}"
+os.unlink(cfgf2)
+print("config: retry_failed round-trips through save/load (persists across reconfigure)")
+
 print("\nRESET+CONFIG OK")

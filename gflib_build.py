@@ -245,11 +245,15 @@ def git(args: List[str], cwd: Optional[Path] = None, timeout: int = 600):
 
 
 # Network hiccups that a clone usually survives on a second try (vs. permanent errors like
-# "repository not found" / "authentication failed", which must NOT be retried).
+# "repository not found" / "authentication failed" / "access denied", which must NOT be retried).
+# Kept SPECIFIC on purpose: loose tokens like "500"/"tls"/"remote error:" false-match genuine build
+# errors and permanent access failures (a build error whose log tail merely contains "500" must not
+# be treated as a transient fetch and retried forever).
 TRANSIENT_CLONE_ERRORS = (
     "invalid index-pack output", "fetch-pack", "early eof", "rpc failed", "unexpected disconnect",
     "the remote end hung up", "connection reset", "connection timed out", "operation timed out",
-    "could not resolve host", "tls", "ssl_", "gnutls", "remote error:", "503", "500",
+    "could not resolve host", "gnutls_handshake", "ssl connect error", "tls handshake",
+    "returned error: 50", "returned error: 429",
 )
 
 
@@ -295,11 +299,16 @@ def categorize_failure(error: str):
 
 # Failure causes that a fresh attempt can plausibly clear (a rebuilt venv, a retried clone, an
 # updated mirror, …) — these are RE-ATTEMPTED automatically on the next build, so the system heals
-# itself instead of treating "failed" as terminal. Genuine build errors and unreachable repos are
-# NOT here (they'd just re-fail slowly); the explicit `retry_failed` option re-attempts those too.
+# itself instead of treating "failed" as terminal. Causes that CANNOT change without human action
+# outside the tool are NOT here (they'd just re-fail, expensively): a "missing system library"
+# needs an apt install, "repo unreachable"/genuine build errors won't fix themselves. The explicit
+# `retry_failed` option re-attempts even those (e.g. after the user installs the -dev package).
+# Note: a "broken dependency venv" IS retried, which rebuilds the venv once; if that rebuild then
+# fails for a missing system library, the new error is no longer auto-retryable — so a cohort that
+# needs an apt package costs exactly ONE rebuild attempt, not one on every Start.
 AUTO_RETRY_CATEGORIES = {
     "broken dependency venv", "dependency install failed", "transient fetch error",
-    "stale archive mirror", "repo not mirrored", "internal/transient I/O", "missing system library",
+    "stale archive mirror", "repo not mirrored", "internal/transient I/O",
 }
 
 
@@ -1558,7 +1567,11 @@ class Orchestrator:
                 mok, merr, mbuilt, mbytes = attempt("fontmake", out_dir / "fontmake", fresh=True)
                 if not (fok or mok):
                     self._set(slug, fontc_error=ferr)
-                    return self._fail(slug, f"both backends failed (fontc: {ferr[:80]})")
+                    # keep BOTH errors (the categoriser keys on substrings like 'No module named
+                    # gftools'; dropping fontmake's error or over-truncating would misclassify a
+                    # broken-venv failure as a non-retryable build error)
+                    return self._fail(slug, f"both backends failed — fontc: {ferr[:120]} || "
+                                            f"fontmake: {merr[:120]}")
                 vs = ""
                 if fok and mok:
                     vs = timed("vs", lambda: compare_backends(python, fbuilt, mbuilt, fam.shipped_fonts))
@@ -2970,7 +2983,7 @@ def cohorts_report(families: List[Family], archive: Path, jobs: int, out_path: O
 
 CONFIG_KEYS = ("source", "google_fonts", "archive", "build_dir", "backend", "fontc_bin",
                "jobs", "percent", "timeout", "populate_archive", "manage_venvs",
-               "base_requirements", "compare", "data_dir")
+               "retry_failed", "base_requirements", "compare", "data_dir")
 
 
 def load_config(path: Path) -> dict:

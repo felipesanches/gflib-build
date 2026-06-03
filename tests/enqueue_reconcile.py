@@ -22,7 +22,8 @@ o = g.Orchestrator(args)
 
 # this run's worklist (in self.families): includes failures with both fixable and genuine causes
 fams = [g.Family(s, s, "u", "c", None, False, []) for s in
-        ("ofl/a", "ofl/venvfail", "ofl/transient", "ofl/builderr", "ofl/unreachable")]
+        ("ofl/a", "ofl/venvfail", "ofl/transient", "ofl/builderr", "ofl/unreachable",
+         "ofl/syslib", "ofl/both")]
 o.families = {f.slug: f for f in fams}
 o.results = {
     "ofl/a": g.Result(slug="ofl/a", status="queued"),            # in worklist → re-queued
@@ -35,6 +36,11 @@ o.results = {
                              error="gftools.builder exit 1: KeyError 'instances'"),  # genuine → keep
     "ofl/unreachable": g.Result(slug="ofl/unreachable", status="failed",
                                 error="mirror clone failed: remote: Repository not found"),  # keep
+    "ofl/syslib": g.Result(slug="ofl/syslib", status="failed",       # needs apt → NOT auto-retried
+                           error="venv: missing system library: cairo (install libcairo2-dev)"),
+    # broken venv reported via the 'both' backend wrapper must still be recognised as fixable:
+    "ofl/both": g.Result(slug="ofl/both", status="failed",
+                         error="both backends failed — fontc: No module named 'gftools' || fontmake: No module named 'gftools'"),
     # stale in-flight from a prior run, NOT in this worklist:
     "ofl/old1": g.Result(slug="ofl/old1", status="queued"),
     "ofl/old2": g.Result(slug="ofl/old2", status="building"),
@@ -48,10 +54,12 @@ o._enqueue()
 assert o.results["ofl/a"].status == "queued", o.results["ofl/a"].status
 assert o.results["ofl/venvfail"].status == "queued", "broken-venv failure must be retried"
 assert o.results["ofl/transient"].status == "queued", "transient fetch failure must be retried"
+assert o.results["ofl/both"].status == "queued", "broken venv via 'both' wrapper must be retried"
 assert o.results["ofl/builderr"].status == "failed", "genuine build error must NOT auto-retry"
 assert o.results["ofl/unreachable"].status == "failed", "unreachable repo must NOT auto-retry"
-print("auto-retry: fixable failures re-queued; genuine/unreachable kept failed")
-assert o._enqueued_retries == 2, o._enqueued_retries
+assert o.results["ofl/syslib"].status == "failed", "missing system library must NOT auto-retry (needs apt)"
+print("auto-retry: fixable failures re-queued; genuine/unreachable/syslib kept failed")
+assert o._enqueued_retries == 3, o._enqueued_retries     # venvfail + transient + both
 print(f"retry count exposed for the UI: {o._enqueued_retries}")
 
 # stale in-flight (not in worklist) reconciled to skipped; out-of-worklist built untouched
@@ -63,12 +71,12 @@ print("stale queued/building reconciled to skipped; out-of-worklist built preser
 qitems = []
 while not o.q.empty():
     qitems.append(o.q.get())
-assert set(qitems) == {"ofl/a", "ofl/venvfail", "ofl/transient"}, qitems
+assert set(qitems) == {"ofl/a", "ofl/venvfail", "ofl/transient", "ofl/both"}, qitems
 print("work queue holds the worklist + retried failures:", sorted(qitems))
 
 snap = o.snapshot()
-assert snap["counts"]["queued"] == 3, snap["counts"]
-assert snap["counts"]["failed"] == 2, snap["counts"]          # only the genuine ones remain failed
+assert snap["counts"]["queued"] == 4, snap["counts"]
+assert snap["counts"]["failed"] == 3, snap["counts"]          # builderr + unreachable + syslib
 assert snap["counts"]["skipped"] == 2 and snap["counts"]["built"] == 1, snap["counts"]
 print("snapshot counts coherent:", snap["counts"])
 

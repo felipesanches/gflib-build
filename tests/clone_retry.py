@@ -9,12 +9,17 @@ import gflib_build as g
 
 g.time.sleep = lambda *_a, **_k: None                 # don't actually wait during backoff
 
-# ---- classifier ----
+# ---- classifier (kept SPECIFIC: loose tokens like "500"/"tls"/"remote error:" must NOT match) ----
 assert g.is_transient_clone_error("fatal: fetch-pack: invalid index-pack output")
 assert g.is_transient_clone_error("error: RPC failed; curl 92 ...")
+assert g.is_transient_clone_error("The requested URL returned error: 503")
 assert not g.is_transient_clone_error("remote: Repository not found")
 assert not g.is_transient_clone_error("fatal: Authentication failed")
-print("classifier: transient vs permanent OK")
+# a genuine BUILD error whose text merely contains a bare 500 / 'remote error:' must not be
+# misread as a transient fetch (which would auto-retry it forever)
+assert not g.is_transient_clone_error("gftools.builder exit 1: error code 500 building glyph")
+assert not g.is_transient_clone_error("remote: error: access denied or repository not exported")
+print("classifier: transient vs permanent (no loose-token false positives) OK")
 
 calls = {"n": 0}
 
