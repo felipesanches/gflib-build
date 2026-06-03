@@ -31,16 +31,22 @@ files at the pinned commit. **Iterate**: re-run, see what still fails at the bui
 
 ## ⚠️ NOT a pre-build problem — bigger wins live elsewhere
 
-### Output-collection mismatch (a **gflib-build** fix, not a rule)
-Many `produced no expected font files` failures are families whose build **succeeds** but whose
-output font isn't matched by gflib-build's `collect_outputs` (name/path differs from the shipped
-binary). Confirmed for `ofl/anekgurmukhi`, `ofl/tiltprism`, `ofl/peddana` (and by extension the
-`appajid` Telugu set `lakkireddy`/`mallanna`), `ofl/bigshoulderstextsc` /
-`bigshouldersinlinedisplaysc`. Strongly suspected for most other `produced no expected font files`
-cases (`blinker`, `hindkochi`, `darumadropone`, `lalezar`, `blakahollow`, `goudybookletter1911`,
-`londrinasketch`, `redrose`, `rubikscribble`, `rubikburned`, `sumana`, `gentiumplus`). **Fixing
-`collect_outputs` to match built fonts more robustly would recover ~15–20 families at once — higher
-value than any individual rule.** Next iteration.
+### Output-collection mismatch — ✅ FIXED in `collect_outputs` (commit 17f497d)
+Many `produced no expected font files` failures were families whose build **succeeds** but whose
+output font wasn't matched by gflib-build's `collect_outputs` — it scanned only a fixed shallow dir
+list, while gftools-builder writes to whatever `outputDir` the config sets (e.g.
+`fonts/<Family>/variable/`). Now `collect_outputs` searches recursively + filters to fonts written
+during the build (mtime) + reports built-but-misnamed fonts. **Verified end-to-end**: `EkType/Anek`
+(`outputDir: ../../fonts/AnekGurmukhi`) builds in 16s and is now collected (was a false failure).
+
+Likely recovered by this fix (dir mismatch — build succeeds into a custom `outputDir`):
+`ofl/anekgurmukhi` (proven). Others to re-test: `tiltprism`, `bigshoulderstextsc`/
+`bigshouldersinlinedisplaysc`, and the `produced no expected font files` set generally.
+
+**Caveat (don't over-claim):** not every such failure is a collection bug. `ofl/peddana` (and the
+`appajid` Telugu set built from FontForge-derived UFOs) genuinely fails fontmake with
+`qcurve / unsupported segment` — a real source/conversion bug. The exact recovery count needs a
+re-run of the library.
 
 ### Config should point elsewhere (override config, not a rule)
 - **`ofl/khula`** — config points at `Khula_superpolator.sp3` (Superpolator, unbuildable) but the
