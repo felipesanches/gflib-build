@@ -244,16 +244,66 @@ def git(args: List[str], cwd: Optional[Path] = None, timeout: int = 600):
     return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
 
 
-def ensure_mirror(archive: Path, repo_url: str, commit: str, mirror_missing: bool):
+def git_clone_mirror(url: str, dest: str, timeout: int = 1800,
+                     stop: "Optional[threading.Event]" = None):
+    """`git clone --mirror url dest`, but ABORTABLE: polled against `stop` so a shutdown /
+    --stop / build-completion terminates an in-flight clone promptly instead of blocking up to
+    `timeout` (and blocking interpreter exit on the executor's non-daemon threads). `--quiet`
+    keeps stderr tiny so the captured pipe can't deadlock on a big repo's progress output. On
+    ANY failure (abort/timeout/error) the partial mirror dir is removed so it is never later
+    mistaken for a complete mirror by an `is_dir()` check."""
+    proc = subprocess.Popen(["git", "clone", "--mirror", "--quiet", url, dest],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    deadline = time.time() + timeout
+    aborted = False
+    while proc.poll() is None:
+        if (stop is not None and stop.is_set()) or time.time() > deadline:
+            aborted = stop is not None and stop.is_set()
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            break
+        time.sleep(0.3)
+    rc = proc.returncode if proc.returncode is not None else 1
+    err = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+    if rc != 0:
+        shutil.rmtree(dest, ignore_errors=True)        # never leave a partial mirror behind
+        if aborted:
+            err = "aborted"
+        elif not err.strip():
+            err = f"timed out after {timeout}s"
+    return rc, "", err
+
+
+def ensure_mirror(archive: Path, repo_url: str, commit: str, mirror_missing: bool,
+                  clone_lock: "Optional[KeyedLocks]" = None,
+                  on_clone: Optional[Callable[[str], None]] = None,
+                  stop: "Optional[threading.Event]" = None):
+    """Locate the bare mirror for repo_url (clone-on-demand if `mirror_missing`). `clone_lock`
+    (shared with the archive pre-warmer) serializes cloning per repo so it's never done twice;
+    `on_clone(repo_url)` fires only when THIS call actually performs the clone (for the live
+    list); `stop` makes an in-flight clone abortable."""
     mp = mirror_path(archive, repo_url)
     if not mp.is_dir():
         if not mirror_missing:
             return None, f"mirror absent: {mp.name} (use --mirror-missing)"
-        mp.parent.mkdir(parents=True, exist_ok=True)
-        rc, _, err = git(["clone", "--mirror", repo_url, str(mp)], timeout=1800)
-        if rc != 0:
-            tail = err.strip().splitlines()[-1] if err.strip() else str(rc)
-            return None, f"mirror clone failed: {tail}"
+        lk = clone_lock(repo_url) if clone_lock else None
+        if lk:
+            lk.acquire()
+        try:
+            if not mp.is_dir():           # re-check under the per-repo lock (the pre-warmer or
+                mp.parent.mkdir(parents=True, exist_ok=True)   # another worker may have cloned it)
+                rc, _, err = git_clone_mirror(repo_url, str(mp), timeout=1800, stop=stop)
+                if rc != 0:
+                    tail = err.strip().splitlines()[-1] if err.strip() else str(rc)
+                    return None, f"mirror clone failed: {tail}"
+                if on_clone:
+                    on_clone(repo_url)
+        finally:
+            if lk:
+                lk.release()
     rc, _, _ = git(["--git-dir", str(mp), "cat-file", "-e", f"{commit}^{{commit}}"])
     if rc != 0:
         git(["--git-dir", str(mp), "remote", "update", "--prune"], timeout=1800)
@@ -383,13 +433,32 @@ def _repo_short(url: str) -> str:
     return "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else url)
 
 
+class KeyedLocks:
+    """A registry of per-key locks (here: one per repo_url) so the concurrent archive
+    pre-warmer and the build workers never `git clone --mirror` the same repo twice."""
+    def __init__(self):
+        self._locks: Dict[str, threading.Lock] = {}
+        self._guard = threading.Lock()
+
+    def __call__(self, key: str) -> threading.Lock:
+        with self._guard:
+            lk = self._locks.get(key)
+            if lk is None:
+                lk = self._locks[key] = threading.Lock()
+            return lk
+
+
 def populate_archive(repo_urls, archive: Path, jobs: int,
                      on_progress: Optional[Callable[[int, int, str, str], None]] = None,
-                     stop: "Optional[threading.Event]" = None):
+                     stop: "Optional[threading.Event]" = None,
+                     clone_lock: "Optional[KeyedLocks]" = None):
     """Ensure every repo_url has a bare mirror in the archive; clone --mirror the missing
     ones (APPEND-ONLY — existing mirrors are skipped read-only and NEVER modified/deleted).
-    Returns (added, failed, present). Parallel across `jobs`; aborts promptly if `stop` set."""
-    from concurrent.futures import ThreadPoolExecutor
+    Returns (added, failed, present). Parallel across `jobs`; aborts promptly if `stop` set.
+    `on_progress` fires the moment each clone *completes* (via as_completed) so a slow early
+    clone no longer batches the live list. `clone_lock` (shared with the build workers)
+    serializes cloning per repo so a repo is never mirrored twice concurrently."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     urls = sorted(set(repo_urls))
     added: List[str] = []
     failed: List[Tuple[str, str]] = []
@@ -403,15 +472,26 @@ def populate_archive(repo_urls, archive: Path, jobs: int,
         mp = mirror_path(archive, url)
         if mp.is_dir():
             return ("present", url, "")  # existing mirror: read-only, never touched
-        mp.parent.mkdir(parents=True, exist_ok=True)
-        rc, _, err = git(["clone", "--mirror", url, str(mp)], timeout=1800)
+        lk = clone_lock(url) if clone_lock else None
+        if lk:
+            lk.acquire()
+        try:
+            if mp.is_dir():               # another cloner (a worker) won the race — present now
+                return ("present", url, "")
+            mp.parent.mkdir(parents=True, exist_ok=True)
+            rc, _, err = git_clone_mirror(url, str(mp), timeout=1800, stop=stop)
+        finally:
+            if lk:
+                lk.release()
         if rc != 0:
             tail = err.strip().splitlines()[-1] if err.strip() else str(rc)
             return ("failed", url, tail)
         return ("added", url, "")
 
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
-        for status, url, msg in ex.map(one, urls):
+        futs = [ex.submit(one, u) for u in urls]
+        for fut in as_completed(futs):           # report each repo the instant it finishes
+            status, url, msg = fut.result()
             with lock:
                 done[0] += 1
                 if status == "added":
@@ -786,6 +866,10 @@ class Orchestrator:
         self.phase_error = ""
         self.cohorts: Dict[str, dict] = {}
         self.archive_log: List[Tuple[str, str]] = []   # (status, owner/repo) as repos are mirrored
+        self._archive_seen: set = set()                # de-dup repos across pre-warmer + workers
+        self._cohort_members: Dict[str, set] = {}      # cohort key -> {slugs} (assigned live)
+        self._cohort_reqs: Dict[str, str] = {}         # cohort key -> normalized requirements
+        self.clone_locks = KeyedLocks()                # per-repo: pre-warmer vs workers never clash
         self.driver: Optional[threading.Thread] = None
         # end-to-end task-list rendered live in the UI (each maps to a phase key)
         self.tasks: List[Task] = self._build_tasks()
@@ -812,10 +896,11 @@ class Orchestrator:
             Task("build_fontc", "build fontc from source",
                  "pending" if want_fontc else "skipped"),
             Task("discover", "discover worklist (METADATA / archive)"),
+            # archive (pre-warm) and build run CONCURRENTLY; cohorts are assigned live by the
+            # workers as each repo becomes available (no separate scan barrier).
             Task("archive", "populate archive (mirror missing)",
                  "pending" if populate else "skipped"),
-            Task("cohorts", "scan dependency cohorts"),
-            Task("build", "build fonts"),
+            Task("build", "build fonts (mirror + cohort + compile, streaming)"),
         ]
 
     def _task(self, key: str) -> Optional[Task]:
@@ -854,16 +939,49 @@ class Orchestrator:
                 t.status, t.t1, t.detail = "failed", time.time(), detail
             self.phase_error = detail
 
-    def _archive_progress(self, done: int, url: str, status: str):
-        """Per-repo callback from populate_archive: keep a live, growing list of the repos
-        actually mirrored into the archive (newly added / failed; 'present' is silent)."""
+    # ---- concurrent-task helpers: update a task WITHOUT grabbing the global phase (so the
+    # archive pre-warmer and the build can both show "running" at once; the build owns `phase`)
+    def _task_running(self, key: str, total: int = 0, detail: str = ""):
+        with self.lock:
+            t = self._task(key)
+            if t is not None:
+                t.status, t.t0, t.t1, t.total, t.done, t.detail = (
+                    "running", time.time(), 0.0, total, 0, detail)
+
+    def _task_update(self, key: str, done: int, detail: str = ""):
+        with self.lock:
+            t = self._task(key)
+            if t is not None:
+                t.done, t.detail = done, detail
+
+    def _note_mirrored(self, url: str, status: str):
+        """Record a repo the instant it lands in the archive (pre-warmer OR a worker), de-duped,
+        so the live archive list grows gradually as mirroring happens."""
         short = _repo_short(url)
+        with self.lock:
+            if short in self._archive_seen:
+                return
+            self._archive_seen.add(short)
+            self.archive_log.append((status, short))
+            if len(self.archive_log) > 400:
+                del self.archive_log[:-400]
+
+    def _note_cohort(self, slug: str, cohort: str, req_text: str):
+        """Assign a family to its cohort live, as soon as its repo is available — rebuilds the
+        cohorts view incrementally (no global scan barrier)."""
+        with self.lock:
+            self._cohort_members.setdefault(cohort, set()).add(slug)
+            self._cohort_reqs.setdefault(cohort, normalize_requirements(req_text))
+            self.cohorts = {k: {"count": len(v), "requirements": self._cohort_reqs.get(k, "")}
+                            for k, v in sorted(self._cohort_members.items(),
+                                               key=lambda kv: -len(kv[1]))}
+
+    def _archive_progress(self, done: int, url: str, status: str):
+        """Per-repo callback from the concurrent archive pre-warmer: feed the live list and
+        advance the (concurrent) archive task — WITHOUT touching `phase` (the build owns it)."""
         if status in ("added", "failed"):
-            with self.lock:
-                self.archive_log.append((status, short))
-                if len(self.archive_log) > 400:
-                    del self.archive_log[:-400]
-        self._task_progress("archive", done, f"{status}: {short}")
+            self._note_mirrored(url, status)
+        self._task_update("archive", done, f"{status}: {_repo_short(url)}")
 
     # ---- phase helpers (also accumulate per-phase wall-clock durations)
     def _close_phase(self, now: float):
@@ -1107,8 +1225,14 @@ class Orchestrator:
                   ended=0.0, error="", note="checkout", backend="", log=log_rel)
         self._emit("started", slug, worker=wid)
         try:
+            # clone-on-demand whenever we're populating the archive (or --mirror-missing): the
+            # worker may reach a family before the pre-warmer mirrored its repo. The shared
+            # per-repo lock means only one of them clones; on_clone feeds the live archive list.
+            clone_ok = self.args.mirror_missing or bool(self.args.populate_archive)
             mirror, err = timed("mirror", lambda: ensure_mirror(
-                self.archive, fam.repo_url, fam.commit, self.args.mirror_missing))
+                self.archive, fam.repo_url, fam.commit, clone_ok,
+                clone_lock=self.clone_locks,
+                on_clone=lambda u: self._note_mirrored(u, "added"), stop=self.stop))
             flog("mirror: " + (f"ok ({mirror.name})" if not err else f"FAIL {err}"))
             if err:
                 return self._fail(slug, err)
@@ -1127,6 +1251,7 @@ class Orchestrator:
                     flog(f"venv: installing cohort {key}…")
                 python, cohort, verr = timed("venv", lambda: self.venvs.get_python(req, installing))
                 self._set(slug, cohort=cohort, note="")
+                self._note_cohort(slug, cohort, req)      # live cohort assignment → cohorts view
                 flog(f"venv: cohort {cohort} " + ("ok" if not verr else f"FAIL {verr}"))
                 if verr:
                     return self._fail(slug, f"venv: {verr}")
@@ -1332,38 +1457,35 @@ class Orchestrator:
                     f"{self.q.qsize()} queued of {len(fams)} selected "
                     f"({self.args.percent:g}%; {total} with source, {skipped} skipped)")
 
-            # Task: populate the archive (mirror any missing upstream repos) — append-only.
-            # `stop` is threaded through so Ctrl-C aborts these long phases promptly.
-            t = self._task("archive")
-            if (t is not None and t.status == "pending"
-                    and self.families and not self.stop.is_set()):
-                urls = sorted({f.repo_url for f in self.families.values()})
-                self._task_start("archive", len(urls))
-                added, failed, present = populate_archive(
-                    urls, self.archive, self.args.jobs,
-                    on_progress=lambda d, n, u, st: self._archive_progress(d, u, st),
-                    stop=self.stop)
-                self._task_done(  # "unreachable" (not "failed") to avoid confusion with BUILD failures
-                    "archive",
-                    f"{len(added)} mirrored, {present} present, {len(failed)} unreachable")
-
-            # Task: scan/generate the dependency cohorts (read-only)
-            if self.families and not self.stop.is_set():
-                self._task_start("cohorts", len(self.families))
-                groups, sigs = scan_cohorts(
-                    list(self.families.values()), self.archive, self.args.jobs,
-                    on_progress=lambda d, n, s: self._task_progress("cohorts", d, s), stop=self.stop)
-                with self.lock:
-                    self.cohorts = {k: {"count": len(v), "requirements": sigs.get(k, "")}
-                                    for k, v in sorted(groups.items(), key=lambda kv: -len(kv[1]))}
-                self._task_done("cohorts", f"{len(groups)} cohorts")
-
-            # Task: build — guard on the QUEUE, not just on families: when --only/resume
-            # filter everything out, the queue is empty and workers would never self-terminate
-            # (all_done() is False for an empty results dict), so we must skip starting them.
+            # ---- DYNAMIC PIPELINE: archive pre-warm + builds run CONCURRENTLY (no barriers) ----
+            # The workers are self-sufficient: each one mirrors-on-demand, assigns its cohort, and
+            # compiles its family the moment that family's repo is available. A background archive
+            # pre-warmer mirrors missing repos ahead of the builders (idle I/O overlapping CPU
+            # builds), sharing per-repo clone locks so no repo is ever cloned twice. So nothing
+            # blocks on a global "mirror everything, then scan cohorts, then build" barrier.
             if self.q.qsize() and not self.stop.is_set():
                 if self.venvs is not None:
                     self.venvs.ensure_base()
+
+                # (a) concurrent archive pre-warmer (only if --populate-archive)
+                prewarm = None
+                at = self._task("archive")
+                if at is not None and at.status == "pending" and self.families:
+                    urls = sorted({f.repo_url for f in self.families.values()})
+                    self._task_running("archive", len(urls))
+
+                    def _prewarm():
+                        added, failed, present = populate_archive(
+                            urls, self.archive, self.args.jobs,
+                            on_progress=lambda d, n, u, st: self._archive_progress(d, u, st),
+                            stop=self.stop, clone_lock=self.clone_locks)
+                        self._task_done(  # "unreachable" ≠ build failures
+                            "archive",
+                            f"{len(added)} mirrored, {present} present, {len(failed)} unreachable")
+                    prewarm = threading.Thread(target=_prewarm, daemon=True)
+                    prewarm.start()
+
+                # (b) build workers — start immediately; they clone-on-demand + cohort-on-demand
                 with self.lock:
                     build_total = len(self.results)   # queued now + any already-built (resume)
                 self._task_start("build", build_total)
@@ -1391,6 +1513,14 @@ class Orchestrator:
                         bt.status = "failed" if (nb == 0 and nf > 0) else "done"
                         bt.t1 = time.time()
                         bt.detail = f"{nb} built, {nf} failed"
+
+                # (c) let the pre-warmer wind down. The build loop already set `stop` once builds
+                # finished, which aborts any remaining clones; this just joins it cleanly.
+                if prewarm is not None:
+                    prewarm.join(timeout=10)
+                    at = self._task("archive")
+                    if at is not None and at.status == "running":
+                        self._task_done("archive", "stopped (build finished)")
             elif self._task("build") is not None and self._task("build").status == "pending":
                 done_note = ("nothing to build" if not self.families
                              else "nothing new to build (already built / filtered out)")
@@ -1754,11 +1884,13 @@ class CursesFrontend(Frontend):
                     line = f"{mark} {t['name']:<30} {prog:<13} {el:>8}  {t['detail']}"
                     a = SATTR.get(t["status"], 0) | (curses.A_REVERSE if i == sel else 0)
                     put(row, 1, line, a); row += 1
-                # live, growing list of repos as they are mirrored into the archive
+                # live, growing list of repos as they are mirrored into the archive (the archive
+                # pre-warmer + the workers feed this concurrently with the builds, so show it
+                # whenever it has content and the run is still going)
                 arch = snap.get("archive_recent", [])
-                if arch and ph == "archive":
+                if arch and not snap["done"]:
                     row += 1
-                    put(row, 0, " Archive — repos mirrored (newest last) ".ljust(w - 1, "-"),
+                    put(row, 0, " Archive — repos mirrored, newest last (live) ".ljust(w - 1, "-"),
                         curses.A_BOLD); row += 1
                     for a in arch[-max(0, (h - row) // 3):]:
                         col = RED if a["status"] == "failed" else GREEN
@@ -1789,7 +1921,7 @@ class CursesFrontend(Frontend):
                                if co["requirements"].splitlines() else "(no requirements)")),
                           color=lambda co: 0 if co["key"] == "base" else CYAN)
                 if not cohorts:
-                    put(row, 1, f"(cohorts appear during the '{self.PHASE_LABEL['cohorts']}' phase)")
+                    put(row, 1, "(cohorts are assigned live as families build — needs --manage-venvs)")
             elif view == "failures":
                 fails = snap["failures_recent"]
                 put(row, 0, f" Failures ({c['failed']}) — newest first · ↑↓ select · ↵ log "

@@ -38,16 +38,24 @@ in the UI. Each step is a `Task` (`key/name/status/t0/t1/done/total/detail`) exp
    opted in and no binary was found/given (skipped otherwise). Sets `args.fontc_bin`.
 3. **`discover`** — `discover()` / `discover_from_archive()` + `sample_evenly()` build the
    worklist, then `_enqueue()` populates the queue.
-4. **`archive`** (if `--populate-archive`) — `populate_archive()` mirrors any referenced
-   upstream repo not already present (parallel; append-only; never mutates/deletes). Each
-   newly-mirrored repo is appended to `self.archive_log` → `snapshot()["archive_recent"]`,
-   a live, growing list rendered in the UI.
-5. **`cohorts`** — `scan_cohorts()` reads each family's `requirements.txt` (read-only `git
-   show`) and groups them; the live list is published in `self.cohorts`.
-6. **`build`** — creates the base venv (if `--manage-venvs`), starts the worker pool, and
-   waits until `all_done()`.
-7. **`done`** — set in `_drive`'s `finally` (even on error: `phase_error` is recorded, and
+4. **`build`** (streaming — NO barriers) — `archive` pre-warm and `build` run **concurrently**:
+   - A background **archive pre-warmer** (`populate_archive()`, only if `--populate-archive`)
+     mirrors missing repos ahead of the builders using idle I/O. It reports each repo the
+     instant its clone *completes* (`as_completed`), appending to `self.archive_log` →
+     `snapshot()["archive_recent"]` (a live, growing list).
+   - The **build worker pool** starts immediately and is self-sufficient: each `_build_one`
+     **mirrors-on-demand**, **assigns its cohort** (`VenvManager.get_python` →
+     `_note_cohort` rebuilds `self.cohorts` live), and compiles — the moment that family's
+     repo is available. So nothing waits on a global "mirror-all then scan-all then build"
+     barrier; cohorts are evaluated per-repo as repos land.
+   - A shared **per-repo clone lock** (`KeyedLocks`, `self.clone_locks`) is used by BOTH the
+     pre-warmer and the workers, so a repo is never `git clone --mirror`'d twice. Clones go
+     through `git_clone_mirror()` which is **abortable** (polls `stop`) and removes a partial
+     mirror on abort/timeout — so shutdown/`--stop`/completion never blocks on a slow clone.
+5. **`done`** — set in `_drive`'s `finally` (even on error: `phase_error` is recorded, and
    the in-flight task is marked `failed`), which also saves state and closes the events file.
+
+`scan_cohorts()` / `cohorts_report()` remain for the read-only `--cohorts-report` preview.
 
 `main()` only resolves paths, runs the **setup wizard**, and validates (fail-fast) *before*
 the driver; every expensive/long step (clone, fontc, discover, mirror, cohorts, build) runs

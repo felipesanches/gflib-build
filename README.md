@@ -146,6 +146,11 @@ intent so nothing is lost as the tool evolves.
     reopen/resume — it is not reset to zero when the program is reopened.
 30. **`C` returns to the setup wizard** from the live dashboard (to change settings / start
     over); the running build is replaced only if the user actually starts a new one.
+31. **Dynamic, streaming pipeline (no barriers).** Mirroring, cohort assignment, and building
+    run concurrently: a repo is evaluated for its cohort and built the moment it's available
+    in the archive — the build does not wait for "populate archive" to finish. An archive
+    pre-warmer mirrors ahead using idle I/O; a shared per-repo clone lock means no repo is
+    cloned twice; clones are abortable so shutdown never blocks. The archive list grows live.
 
 ---
 
@@ -299,10 +304,11 @@ corner). Ideal for validating the tool end-to-end before committing to a full ru
 The **entire interaction** is ncurses — not just the builds. A run drives a background
 pipeline rendered as a live **task-list** with emoji status (✅ done · 🔄 running · ⏳
 pending · ❌ failed · ➖ n/a) plus per-task progress and elapsed time:
-**`clone google/fonts`** → **`build fontc`** → **`discover worklist`** → **`populate
-archive`** → **`scan cohorts`** → **`build fonts`** → **`done`**. The dashboard also shows a
-phase banner + progress bar and is **navigable** — four views switchable with the **←/→
-arrows** (or `Tab`):
+**`clone google/fonts`** → **`build fontc`** → **`discover worklist`** → then **`populate
+archive`** and **`build fonts`** running **concurrently** (mirroring, cohort assignment and
+compiling all stream together — no barriers) → **`done`**. The dashboard also shows a phase
+banner + progress bar and is **navigable** — four views switchable with the **←/→ arrows**
+(or `Tab`):
 
 ```
  Google Fonts library build                                   elapsed 01:23:45
@@ -315,8 +321,7 @@ arrows** (or `Tab`):
   ➖ build fontc from source                 (skipped — binary detected)
   ✅ discover worklist           00:00:04   1503 queued of 1503 selected
   🔄 populate archive   340/1320  25% 03:12  added: notofonts/noto-cjk
-  ⏳ scan dependency cohorts
-  ⏳ build fonts
+  🔄 build fonts        612/1503  40% 03:12  (mirror + cohort + compile, streaming)
  Archive — repos mirrored (newest last) -------------------------------------
   + google/fonts-sources    + notofonts/latin-greek-cyrillic   ✗ owner/dead-repo
  Now building ----------------------------------------------------------------

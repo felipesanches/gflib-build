@@ -40,7 +40,7 @@ g.build_fontc_from_source = fake_build_fontc
 
 g.discover = lambda gf: (FAMS, 12, 7)
 
-def fake_populate(urls, archive, jobs, on_progress=None, stop=None):
+def fake_populate(urls, archive, jobs, on_progress=None, stop=None, clone_lock=None):
     added = []
     for i, u in enumerate(sorted(set(urls)), 1):
         time.sleep(0.15)
@@ -49,13 +49,6 @@ def fake_populate(urls, archive, jobs, on_progress=None, stop=None):
         if on_progress: on_progress(i, len(urls), u, st)
     return added, [], 0
 g.populate_archive = fake_populate
-
-def fake_scan(families, archive, jobs, on_progress=None, stop=None):
-    for i, f in enumerate(families, 1):
-        time.sleep(0.05)
-        if on_progress: on_progress(i, len(families), "deps")
-    return {"base": [f.slug for f in families]}, {"base": ""}
-g.scan_cohorts = fake_scan
 
 def fake_build_one(self, wid, slug):
     time.sleep(0.2)
@@ -86,9 +79,13 @@ for t in s["tasks"]:
           f"{t['elapsed']}s  {t['detail']}")
 print("max archive_recent seen:", max_archive)
 print("counts:", s["counts"])
-assert [t["status"] for t in s["tasks"]] == ["done"] * 6, "all tasks should be done"
+assert [t["status"] for t in s["tasks"]] == ["done"] * 5, "all 5 tasks should be done"
+assert [t["key"] for t in s["tasks"]] == ["clone_gf", "build_fontc", "discover", "archive", "build"]
 assert seen_phases[:2] == ["clone_gf", "build_fontc"], seen_phases  # discover may be too fast to poll
 assert seen_phases[-1] == "done"
+# archive runs CONCURRENTLY with build (it no longer owns a phase), so "archive" is not in the
+# phase sequence; the build phase is what follows discover:
+assert "build" in seen_phases, seen_phases
 assert s["counts"]["built"] == 5, s["counts"]
 assert max_archive > 0, "archive_recent should have grown"
 print("\nSMOKE OK")
