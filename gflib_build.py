@@ -3032,10 +3032,12 @@ class CursesFrontend(Frontend):
                         pass
 
             grand = snap["total"] or 1
-            # the bar = how much of the worklist is PROCESSED (built + failed + skipped), so it
-            # reaches 100% when nothing is queued/building — not built/total (which would stick
-            # below 100% whenever anything failed or was skipped).
-            done = c["built"] + c["failed"] + c["skipped"]
+            # the bar = progress over the IN-SCOPE worklist (built + failed + queued + building =
+            # total − skipped). 'skipped' means NOT SELECTED this run (outside the current % sample
+            # or --only) — counting it as "done" made the bar read ~100% even when most of the
+            # library was never attempted. It reaches 100% when the selected work is done.
+            inscope = c["built"] + c["failed"] + c["queued"] + c["building"]
+            done = c["built"] + c["failed"]
             ph = snap["phase"]
             plabel = self.PHASE_LABEL.get(ph, ph)
             pre_build = bool(snap.get("pre_build")) or setup
@@ -3060,23 +3062,28 @@ class CursesFrontend(Frontend):
                     segmented = False
                     bar_label = f" {pd}/{pt} {plabel} ({int(100 * frac)}%) "
                 else:
+                    # skipped = NOT selected this run — surface it with the fix (raise % / drop --only)
+                    skip_hint = (f"   ⟵ {c['skipped']} skipped (not selected — raise % to 100 to "
+                                 f"build them)" if c["skipped"] else "")
                     put(2, 0, f" Phase: {plabel}   built {c['built']}  failed {c['failed']}  "
-                              f"skipped {c['skipped']}  building {c['building']}  queued {c['queued']}",
-                        curses.A_BOLD)
-                    frac = done / grand
+                              f"building {c['building']}  queued {c['queued']}", curses.A_BOLD)
+                    if skip_hint:
+                        put(2, max(0, w - len(skip_hint) - 1), skip_hint.strip(), YEL)
+                    frac = done / max(1, inscope)
                     segmented = True
-                    bar_label = f" {done}/{grand} processed ({int(100 * frac)}%) "
+                    bar_label = f" {done}/{inscope} attempted ({int(100 * frac)}%)" + \
+                                (f" · {c['skipped']} skipped" if c["skipped"] else "") + " "
                 if snap["phase_error"]:
                     put(2, max(0, w - 30), f"ERR {snap['phase_error'][:24]}", RED)
                 barw = max(10, w - 4)
-                if segmented:                         # colour the bar by outcome: built/failed/skipped
-                    bw = int(barw * c["built"] / grand)
-                    fw = int(barw * c["failed"] / grand)
-                    sw = int(barw * c["skipped"] / grand)
-                    rest = max(0, barw - bw - fw - sw)
+                if segmented:                         # colour the IN-SCOPE bar by outcome: built/failed
+                    base = max(1, inscope)
+                    bw = int(barw * c["built"] / base)
+                    fw = int(barw * c["failed"] / base)
+                    rest = max(0, barw - bw - fw)     # queued + building (not yet attempted)
                     put(3, 1, "[")
                     x = 2
-                    for seg_w, seg_attr in ((bw, GREEN), (fw, RED), (sw, curses.A_DIM)):
+                    for seg_w, seg_attr in ((bw, GREEN), (fw, RED)):
                         if seg_w > 0:
                             put(3, x, "#" * seg_w, seg_attr); x += seg_w
                     if rest > 0:
@@ -3352,8 +3359,9 @@ function frow(slug,inner){const sel=selKey===slug?' sel':'';return '<div class="
 function render(){
  if(!snap||snap.error){document.getElementById('hdr').innerHTML='<span class="r">waiting for build status… '+E(snap&&snap.error||'')+'</span>';return}
  const c=snap.counts||{},bk=snap.backends||{},cfg=snap.config||{};
- const grand=snap.total||1,proc=(c.built||0)+(c.failed||0)+(c.skipped||0),pct=Math.round(100*proc/grand);
- const seg=(n,cls)=>n>0?'<div class="seg '+cls+'" style="width:'+(100*n/grand)+'%;background:var(--'+cls+')"></div>':'';
+ const grand=snap.total||1,inscope=Math.max(1,(c.built||0)+(c.failed||0)+(c.queued||0)+(c.building||0));
+ const done=(c.built||0)+(c.failed||0),pct=Math.round(100*done/inscope);
+ const seg=(n,cls)=>n>0?'<div class="seg '+cls+'" style="width:'+(100*n/inscope)+'%;background:var(--'+cls+')"></div>':'';
  document.getElementById('hdr').innerHTML=
   '<div class="t">Google Fonts library build'+(snap.paused?' <span class="y">[PAUSED]</span>':'')+
    '<span class="muted" style="float:right">elapsed '+hms(snap.elapsed)+'</span></div>'+
@@ -3362,9 +3370,10 @@ function render(){
    ' · fontc '+(bk.fontc||0)+'/fontmake '+(bk.fontmake||0)+' · phase <span class="stat">'+E(snap.phase)+'</span>'+
    (snap.done?' <span class="g">— BUILD COMPLETE</span>':'')+'</div>'+
   '<div class="muted">built <span class="g">'+(c.built||0)+'</span> · failed <span class="r">'+(c.failed||0)+
-   '</span> · skipped '+(c.skipped||0)+' · building <span class="y">'+(c.building||0)+'</span> · queued <span class="c">'+(c.queued||0)+'</span></div>'+
-  '<div id="bar">'+seg(c.built,'g')+seg(c.failed,'r')+seg(c.skipped,'d')+
-   '<span class="lbl">'+proc+'/'+grand+' processed ('+pct+'%)</span></div>';
+   '</span> · building <span class="y">'+(c.building||0)+'</span> · queued <span class="c">'+(c.queued||0)+'</span>'+
+   ((c.skipped||0)?' · <span class="y">'+c.skipped+' skipped — not selected this run (raise % to 100 to build them)</span>':'')+'</div>'+
+  '<div id="bar">'+seg(c.built,'g')+seg(c.failed,'r')+
+   '<span class="lbl">'+done+'/'+inscope+' attempted ('+pct+'%)'+((c.skipped||0)?' · '+c.skipped+' skipped':'')+'</span></div>';
  // tabs
  const tc={overview:'',queue:c.queued,cohorts:(snap.cohorts||[]).length,built:c.built,failures:c.failed,stats:'',config:''};
  document.getElementById('tabs').innerHTML=TABS.map(t=>'<div class="tab'+(t===tab?' on':'')+'" data-tab="'+t+'">'+
