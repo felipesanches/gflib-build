@@ -267,6 +267,9 @@ def categorize_failure(error: str):
             or "could not launch builder" in low or "module specification" in low):
         return ("broken dependency venv", "the cohort venv is missing its packages — it is rebuilt "
                 "automatically on the next run")
+    if "missing system library" in low:
+        return ("missing system library", "a package built from source needs a native -dev library "
+                "(e.g. apt install libcairo2-dev pkg-config) — self-heal can't install system pkgs")
     if "pip install" in low or low.startswith("venv:"):
         return ("dependency install failed", "pip couldn't satisfy the cohort requirements; stale "
                 "pins are auto-relaxed — see the cohort's .install.log")
@@ -689,6 +692,30 @@ def _parse_unsatisfiable(text: str) -> set:
     return bad
 
 
+# Debian/Ubuntu -dev packages for the native libraries the font-build Python stack compiles against
+# (only relevant when pip has to build a package from source — e.g. on a Python with no wheels).
+_SYSLIB_HINT = {"cairo": "libcairo2-dev", "freetype2": "libfreetype-dev", "freetype": "libfreetype-dev",
+                "fontconfig": "libfontconfig1-dev", "harfbuzz": "libharfbuzz-dev",
+                "glib-2.0": "libglib2.0-dev", "libffi": "libffi-dev"}
+
+
+def scan_missing_system_dep(log_text: str):
+    """If a pip install failed building a C/meson extension because a SYSTEM library is missing
+    (not a Python-pin problem the self-heal can fix), return a short '<lib> (install <pkg>)' string,
+    else None. Recognises meson's `Dependency "X" not found`, pkg-config's `No package 'X' found`,
+    and gcc's `fatal error: X.h: No such file`."""
+    for rx in (r'Dependency "([^"]+)" not found', r"No package '([^']+)' found"):
+        m = re.search(rx, log_text)
+        if m:
+            lib = m.group(1)
+            pkg = _SYSLIB_HINT.get(lib.lower())
+            return f"{lib} ({'install ' + pkg if pkg else 'install its -dev package'})"
+    m = re.search(r"fatal error:\s*([\w./+-]+\.h):\s*No such file", log_text)
+    if m:
+        return f"C headers <{m.group(1)}> (install the matching -dev package)"
+    return None
+
+
 def relax_requirements(lines: List[str], relax: set) -> List[str]:
     """Drop the version pin (keep just the package name) for any requirement whose package is in
     `relax`, so pip's resolver backtracks to a compatible version instead of failing on an
@@ -809,8 +836,12 @@ class VenvManager:
                             self.relaxations.append(
                                 f"auto-relaxed base pins (unavailable on PyPI): {sorted(new)}")
                 return str(py), ""
-            bad = _parse_unsatisfiable(log.read_text(errors="replace"))
+            log_text = log.read_text(errors="replace")
+            bad = _parse_unsatisfiable(log_text)
             if not (bad - relax):                 # nothing NEW to relax → a genuine failure
+                syslib = scan_missing_system_dep(log_text)   # a missing C library, not a pin we can fix
+                if syslib:
+                    return "", f"missing system library: {syslib} (see {log.name})"
                 note = f" after auto-relaxing {sorted(relax)}" if relax else ""
                 return "", f"pip install rc={p.returncode}{note} (see {log.name})"
             relax |= bad

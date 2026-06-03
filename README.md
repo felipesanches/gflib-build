@@ -187,7 +187,25 @@ intent so nothing is lost as the tool evolves.
     `disk +0B`-on-reopen was useless; the header now reports the whole build dir's on-disk size.
 42. **Sections fill the available space + live resize.** Multi-section tabs no longer collapse
     items while the screen is half-empty: the visible height is shared fairly across sections
-    (water-fill), and the layout re-flows the instant the terminal is resized.
+    (water-fill), and the layout re-flows the instant the terminal is resized. The focused
+    section's selected item is *always* kept on-screen (a `_layout_sections` planner that provably
+    fits the body — verified by a 330k-case sweep).
+43. **Never resurrect a broken dependency venv.** A venv whose `pip install` failed (e.g. an
+    unpublished pin) leaves `bin/python` with no packages; it must be rebuilt, not reused. Readiness
+    is gated on a `.gflib-installed` success marker, so a half-installed cohort venv is rebuilt on
+    the next run instead of failing every family with “No module named gftools”.
+44. **Auto-retry transient clone failures.** `fetch-pack: invalid index-pack output` and similar
+    network hiccups are retried a few times (abortable backoff); permanent errors (repo
+    missing/private) are not.
+45. **Failure-cause summary.** Failures are grouped by cause with an actionable hint (broken venv →
+    rebuilt next run; transient fetch → retried; stale mirror → `git remote update`; …) — shown in
+    the *failures* tab, the status panel, and the completion banner.
+46. **Completion / stopped banner.** When the build finishes or the daemon dies, a prominent banner
+    states the outcome (built/failed/skipped of N), the top failure cause, and next steps — so the
+    dashboard never just looks frozen mid-flight.
+47. **Coherent counts.** Families left `queued`/`building` by a prior run that aren't in the current
+    worklist (e.g. queued at a higher `--percent`, now outside the sample) are reconciled to
+    `skipped (not selected this run)`, so the counters reflect real pending work.
 
 ---
 

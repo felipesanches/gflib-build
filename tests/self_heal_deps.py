@@ -26,6 +26,16 @@ assert relaxed[3] == "-r other.txt" and relaxed[4].startswith("ufo2ft @")   # un
 assert g._req_pkg_name("Django>=4") == "django" and g._req_pkg_name("# x") == ""
 print("unit: parser + relaxer OK")
 
+# ---- unit: a MISSING SYSTEM LIBRARY (not a Python pin) is detected + categorised distinctly ----
+meson = 'meson.build:31:12: ERROR: Dependency "cairo" not found (tried pkg-config and cmake)'
+dep = g.scan_missing_system_dep(meson)
+assert dep and "cairo" in dep and "libcairo2-dev" in dep, dep
+assert g.scan_missing_system_dep("fatal error: ft2build.h: No such file").startswith("C headers")
+assert g.scan_missing_system_dep("No matching distribution found for gftools==0.9.1") is None
+cat, hint = g.categorize_failure("venv: missing system library: cairo (install libcairo2-dev)")
+assert cat == "missing system library" and "libcairo2-dev" in hint, (cat, hint)
+print("unit: missing-system-library detection + categorisation OK")
+
 # ---- real (light) install: bad pin on a tiny pkg → must self-heal ----
 work = tempfile.mkdtemp(prefix="_self_heal_")
 req = os.path.join(work, "base.txt")
