@@ -2561,15 +2561,16 @@ class MonitorState:
         return self.snapshot().get("done", False)
 
 
-def setup_wizard(spec, plan_fn):
-    """Interactive ncurses settings form. `spec` is a list of field dicts:
+def config_screen(spec, plan_fn):
+    """The first-run **Configuration tab**: an interactive ncurses settings form (there is no
+    separate "wizard"). `spec` is a list of field dicts:
        {key, label, type: text|path|int|stepnum|bool|choice, value, choices?, step?, min?,
         max?, show_if?(values)->bool}.
-    Fields are pre-populated with the resolved defaults; the user edits them (editable
+    Fields are pre-populated with the resolved current settings; the user edits them (editable
     fields have a movable text cursor; `stepnum` also reacts to ←/→ with ±step; `choice`
     cycles with ←/→/space; `bool` toggles with space; conditional fields appear/disappear via
     `show_if`) while a live 'Plan' (plan_fn(values)->[str]) updates. Returns the edited
-    {key: typed value} dict to proceed, or None to cancel. Raises if curses is unusable."""
+    {key: typed value} dict to ▶ Start, or None to cancel. Raises if curses is unusable."""
     import curses
     EDIT = ("text", "path", "int", "stepnum")
     fields = []
@@ -2580,7 +2581,7 @@ def setup_wizard(spec, plan_fn):
             f["_caret"] = len(f["value"])
         fields.append(f)
     by_key = {f["key"]: f for f in fields}
-    buttons = ["Start", "Cancel"]
+    buttons = ["▶ Start build", "Cancel"]
     VALCOL = 38
 
     def typed():
@@ -2617,13 +2618,23 @@ def setup_wizard(spec, plan_fn):
             cursor = None
 
             def put(y, x, s, a=0):
-                if 0 <= y < h and 0 <= x < w:
-                    stdscr.addnstr(y, x, str(s), max(0, w - x - 1), a)
+                n = w - x - 1
+                if 0 <= y < h and 0 <= x < w and n > 0:      # n=0 at the last column makes
+                    try:                                     # curses raise ERR — guard + catch
+                        stdscr.addnstr(y, x, str(s), n, a)
+                    except curses.error:
+                        pass
 
-            put(0, 0, " gflib-build — setup wizard", curses.A_BOLD)
-            put(1, 0, " [↑↓/Tab] move   [space] toggle   [←→] move cursor / step / cycle   "
-                      "type to edit   [Esc] cancel", curses.A_DIM)
-            row = 3
+            put(0, 0, " Google Fonts library build — Configuration", curses.A_BOLD)
+            put(0, max(0, w - 18), "first-time setup", curses.A_DIM)
+            tx = 1                                     # the dashboard tab bar (config active now)
+            for i, lbl in enumerate(("1 config", "2 overview", "3 cohorts", "4 failures", "5 stats")):
+                put(2, tx, f" {lbl} ", curses.A_REVERSE if i == 0 else curses.A_DIM)
+                tx += len(lbl) + 3
+            put(2, max(tx + 2, w - 26), "(others appear after ▶ Start)", curses.A_DIM)
+            put(3, 0, " set up your build, then ▶ Start   [↑↓/Tab]move  [space]toggle  "
+                      "[←→]cursor/step/cycle  type to edit  [Esc]cancel", curses.A_DIM)
+            row = 5
             for f in vis:
                 act = active == f["key"]
                 if f["type"] == "bool":
@@ -2665,7 +2676,7 @@ def setup_wizard(spec, plan_fn):
                 active = nav[(ai + 1) % len(nav)]
             elif active in buttons:
                 if ch in (10, 13, ord(" ")):
-                    return typed() if active == "Start" else None
+                    return typed() if active == buttons[0] else None
             else:
                 f = by_key[active]
                 t = f["type"]
@@ -2717,10 +2728,10 @@ def setup_wizard(spec, plan_fn):
     return curses.wrapper(form)
 
 
-def setup_wizard_plain(steps, gf_path, archive, build_dir, args) -> bool:
+def config_screen_plain(steps, gf_path, archive, build_dir, args) -> bool:
     """Fallback plain-terminal confirmation (used if curses is unavailable)."""
     e = sys.stderr
-    print("\n=== gflib-build setup ===", file=e)
+    print("\n=== gflib-build configuration ===", file=e)
     for i, (title, detail) in enumerate(steps, 1):
         print(f"  {i}. {title}: {detail}", file=e)
     if gf_path:
@@ -2756,9 +2767,9 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--no-populate-archive", dest="populate_archive", action="store_false",
                     help="do not pre-populate the archive (missing repos fail unless --mirror-missing)")
     ap.add_argument("--yes", "-y", action="store_true",
-                    help="skip the setup wizard (non-interactive bootstrap with current settings)")
+                    help="skip the Configuration screen (non-interactive bootstrap with current settings)")
     ap.add_argument("--wizard", action="store_true",
-                    help="always show the interactive setup wizard (even when nothing needs bootstrapping)")
+                    help="always show the Configuration screen (even when nothing needs bootstrapping)")
     ap.add_argument("--backend", choices=["auto", "fontc", "fontmake", "both"], default="auto",
                     help="auto = fontc first, fall back to fontmake (the migration default); "
                          "fontc/fontmake = that compiler only; both = build with each and compare "
@@ -2914,7 +2925,7 @@ def main():
     if args.populate_archive:
         steps.append(("populate archive", f"mirror missing upstream repos into {archive}"))
 
-    # ---- interactive ncurses setup wizard (editable, pre-populated fields) ----
+    # ---- first-run Configuration tab (editable ncurses form; no separate "wizard") ----
     if (steps or args.wizard) and not args.yes and not read_only:
         if not sys.stdin.isatty():
             sys.exit("missing prerequisites (google/fonts clone and/or archive). Re-run with "
@@ -2967,9 +2978,9 @@ def main():
                                               if v.get("use_timeout") else "none (stop manually)"))
             return lines
         try:
-            edited = setup_wizard(spec, plan_fn)
+            edited = config_screen(spec, plan_fn)
         except Exception:                               # curses unusable → plain confirm
-            edited = {} if setup_wizard_plain(steps, gf, archive, build_dir, args) else None
+            edited = {} if config_screen_plain(steps, gf, archive, build_dir, args) else None
         if edited is None:
             sys.exit("aborted.")
         if edited:                                      # apply the user's edits

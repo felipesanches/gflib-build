@@ -19,19 +19,21 @@ backend; [`docs/cohort-map.md`](docs/cohort-map.md) is the generated full-librar
 
 ## Quick start — zero to built
 
-With no existing data, a single command bootstraps everything. It runs a **setup wizard**
-first (confirms before any heavy step), then drives the whole pipeline live in the TUI:
+With no existing data, a single command bootstraps everything. On first run it opens the
+**Configuration tab** (there is no separate "wizard") to set up your build, then drives the
+whole pipeline live in the TUI:
 
 ```sh
 python3 gflib_build.py            # uses ./gflib-data/ for everything
 ```
 
-The wizard is an **interactive ncurses form** with the settings pre-populated to their
-defaults — you edit any field, watch the live "Plan" update, then choose **Start**:
+The Configuration tab is an **interactive ncurses form** with the settings pre-populated to
+their current values — you edit any field, watch the live "Plan" update, then **▶ Start**:
 
 ```
- gflib-build — setup wizard
- [↑↓/Tab] move   [space] toggle   [←→] move cursor / step / cycle   type to edit   [Esc] cancel
+ Google Fonts library build — Configuration                       first-time setup
+  1 config   2 overview   3 cohorts   4 failures   5 stats   (others appear after ▶ Start)
+ set up your build, then ▶ Start   [↑↓/Tab]move  [space]toggle  [←→]cursor/step/cycle  …
 
  ▸ worklist source              ‹ metadata ›
    google/fonts clone           gflib-data/google-fonts
@@ -60,8 +62,9 @@ type for finer/other values. Conditional fields appear as relevant — ticking *
 per-build timeout** reveals a seconds field (unticked = builds never time out, stop them in
 the UI); the **fontc** binary is auto-detected, and if missing the form offers *build fontc
 from source* or lets you type a path; the **repo archive** is auto-detected too. Navigate to
-**Start** and press Enter (or `Esc`/Cancel). Then it runs the phases — **clone → populate
-archive → generate cohorts → build** — live. `--yes` skips the wizard, `--wizard` forces it.
+**▶ Start build** and press Enter (or `Esc`/Cancel). Then it runs the pipeline — **clone →
+populate archive + build (streaming)** — live, landing on the Configuration tab. `--yes` skips
+the Configuration screen, `--wizard` forces it; `C` returns to it from the live dashboard.
 
 > Cloning google/fonts is a few GB; mirroring all upstream repos can be tens of GB and take
 > a long time. Sources are read-only and **archives are never deleted**.
@@ -111,9 +114,10 @@ intent so nothing is lost as the tool evolves.
     archive** of upstream repos (building one from scratch if none exists), generate the
     cohorts, and build them all — so any user can bootstrap the whole process. All of it
     shown live on an ncurses UI the user can observe and **navigate** as the data updates.
-16. **Setup-wizard mode.** It must **ask the user before** doing those heavy things
-    (cloning, mirroring) — a setup wizard, not silent.
-17. **The wizard is an editable ncurses form** with fields pre-populated with the default
+16. **Configuration screen.** It must **ask the user before** doing those heavy things
+    (cloning, mirroring) — via the Configuration tab, not silent. (No separate "wizard": the
+    first-run setup screen *is* the Configuration tab.)
+17. **The Configuration screen is an editable ncurses form** with fields pre-populated with the default
     settings that the user can edit and then move on. Specifically: text fields render a
     movable cursor; a *build timeout* checkbox reveals a seconds field only when ticked
     (otherwise builds never time out — the user can still stop them in the UI); *percent of
@@ -164,6 +168,9 @@ intent so nothing is lost as the tool evolves.
     to the persisted config so it never shows a list of `None`).
 35. **`--reset` completely cleans the system** — deletes all built assets + virtual environments
     (the whole build dir); the repo archive is NEVER touched (strict append-only policy).
+36. **No separate wizard — the Configuration tab is the setup.** First-run setup is the
+    Configuration tab itself (dashboard chrome, all fields editable, ▶ Start), and the same tab
+    in the live dashboard does live edits. One config interface, not two.
 
 ---
 
