@@ -1329,6 +1329,21 @@ fn run_builder(
         orch = "gftools.builder";
     }
     log_line(log_path, &format!("===== {} (backend={}) =====", orch, backend));
+    // gftools.builder shells out to fontmake / ninja / gftools / ttfautohint BY NAME, so the chosen
+    // interpreter's bin/ MUST be on PATH (running venv/bin/python does not by itself activate the
+    // venv). Use the venv bin = the python's parent dir WITHOUT resolving symlinks (canonicalize would
+    // follow venv/bin/python → the system /usr/bin and miss fontmake). The python path is absolute.
+    let bindir = {
+        let p = Path::new(python);
+        if p.is_absolute() { p.parent().map(|d| d.to_path_buf()) } else { None }
+    };
+    if let Some(b) = bindir {
+        let path = match std::env::var("PATH") {
+            Ok(p) => format!("{}:{}", b.display(), p),
+            Err(_) => b.display().to_string(),
+        };
+        cmd.env("PATH", path);
+    }
     cmd.current_dir(work)
         .env("SOURCE_DATE_EPOCH", "0")
         .stdout(Stdio::from(logf))

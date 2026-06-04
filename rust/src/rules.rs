@@ -49,7 +49,12 @@ pub fn run_pre_build(
     if cmds.is_empty() {
         return Ok(());
     }
-    let bindir = Path::new(python).canonicalize().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    // venv bin = python's parent WITHOUT resolving symlinks (canonicalize would follow the
+    // venv/bin/python symlink to the system /usr/bin and miss the pinned fontmake/gftools/python)
+    let bindir = {
+        let p = Path::new(python);
+        if p.is_absolute() { p.parent().map(|d| d.to_path_buf()) } else { None }
+    };
     let path_env = match (bindir, std::env::var("PATH").ok()) {
         (Some(b), Some(p)) => format!("{}:{}", b.display(), p),
         (Some(b), None) => b.display().to_string(),
