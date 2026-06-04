@@ -531,6 +531,38 @@ mod tests {
         assert_eq!(relax_requirements(&lines, &relaxed)[0].split_whitespace().next().unwrap(), "gftools");
     }
     #[test]
+    fn reuses_a_venv_with_a_matching_marker() {
+        // The drop-in property: a venv whose .gflib-installed marker matches the requirements is
+        // returned as-is — never rebuilt. (Proven offline: no real `python -m venv` / pip needed.)
+        let bd = std::env::temp_dir().join(format!("_vmreuse_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bd);
+        let basereq = bd.join("base.txt");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(&basereq, "wheel\n").unwrap();
+        // pre-stage a "ready" base venv: a dummy bin/python + the correct marker hash
+        let vdir = bd.join("venvs").join("base");
+        std::fs::create_dir_all(vdir.join("bin")).unwrap();
+        let dummy_py = vdir.join("bin").join("python");
+        std::fs::write(&dummy_py, "#!/bin/sh\n").unwrap();
+        let want = sha_hex("sha256sum", "wheel"); // base cohort, requested = ["wheel"], no override
+        std::fs::write(vdir.join(".gflib-installed"), format!("{}\n", &want[..want.len().min(16)])).unwrap();
+
+        let vm = VenvManager::new(&bd, "python3", Some(basereq));
+        // on_install is a "starting" notification (called before create() regardless of reuse). The
+        // real reuse signal: create() returns early WITHOUT rmtree, so the dummy file is untouched.
+        let (py, key, err) = vm.get_python("", |_| {});
+        assert_eq!(key, "base");
+        assert!(err.is_empty(), "reuse should not error: {}", err);
+        assert_eq!(py, dummy_py.to_string_lossy(), "must return the existing venv's python");
+        assert_eq!(
+            std::fs::read_to_string(&dummy_py).unwrap(),
+            "#!/bin/sh\n",
+            "the existing venv must be left intact (a rebuild would rmtree + recreate it)"
+        );
+        let _ = std::fs::remove_dir_all(&bd);
+    }
+
+    #[test]
     fn parsers() {
         assert!(parse_unsatisfiable("ERROR: No matching distribution found for compreffor==0.5.0")
             .contains("compreffor"));
