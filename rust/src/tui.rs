@@ -12,6 +12,8 @@ use crate::util::{human, hms};
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::{cursor, queue, terminal};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::{Stdout, Write};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,15 +23,256 @@ const TABS: [&str; 8] = [
     "config", "overview", "queue", "cohorts", "archive", "built", "failures", "stats",
 ];
 
-// The live-editable config fields (R5): ←/→ adjusts the selected one and applies it to the running
-// build via control.json (the same channel the web UI uses). Mirrors the Python config tab's live set.
-const CONFIG_FIELDS: [&str; 5] = ["jobs", "percent", "backend", "compare", "paused"];
-const BACKENDS: [&str; 4] = ["auto", "fontc", "fontmake", "both"];
+const SOURCE_CHOICES: [&str; 2] = ["metadata", "archive"];
+const BACKEND_CHOICES: [&str; 4] = ["auto", "fontc", "fontmake", "both"];
 
-/// Outcome of the TUI loop: the user quit, or pressed C to reconfigure (re-show setup).
+// ---- the unified Configuration tab: a full schema editor used for BOTH live editing and first-run
+// setup — a faithful port of CONFIG_SCHEMA + the _cfg_* helpers in gflib_build.py. ----
+#[derive(Clone)]
+enum CfgKind {
+    Choice(&'static [&'static str]),
+    Path,
+    Bool,
+    Step { step: f64, min: f64, max: f64 },
+}
+
+#[derive(Clone)]
+struct CfgField {
+    key: &'static str,
+    label: &'static str,
+    kind: CfgKind,
+    live: bool,            // can change on a running build (else needs a restart: C)
+    value: String,         // choice name / path or text / stepnum text (unused for Bool)
+    bval: bool,            // Bool value
+    caret: usize,          // text-edit caret (path / text / stepnum)
+}
+
+/// The schema in display order — (key, label, kind, live). Mirrors Python's CONFIG_SCHEMA.
+fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
+    vec![
+        ("source", "worklist source", CfgKind::Choice(&SOURCE_CHOICES), false),
+        ("google_fonts", "google/fonts clone", CfgKind::Path, false),
+        ("archive", "repo archive", CfgKind::Path, false),
+        ("build_dir", "build output dir", CfgKind::Path, false),
+        ("backend", "build backend", CfgKind::Choice(&BACKEND_CHOICES), true),
+        ("fontc_bin", "fontc binary", CfgKind::Path, false),
+        ("build_fontc", "build fontc from source (if none)", CfgKind::Bool, false),
+        ("jobs", "parallel jobs", CfgKind::Step { step: 1.0, min: 1.0, max: 256.0 }, true),
+        ("percent", "percent of library", CfgKind::Step { step: 5.0, min: 1.0, max: 100.0 }, true),
+        ("timeout", "per-build timeout (0=off)", CfgKind::Step { step: 30.0, min: 0.0, max: 100000.0 }, true),
+        ("populate_archive", "populate archive (fetch repos)", CfgKind::Bool, true),
+        ("manage_venvs", "cohort venvs", CfgKind::Bool, false),
+        ("retry_failed", "retry ALL failed (incl. genuine errors)", CfgKind::Bool, false),
+        ("compare", "compare to shipped", CfgKind::Bool, true),
+    ]
+}
+
+/// Python `{:g}` — trim a float to the shortest exact decimal (no trailing .0 for integers).
+fn fmt_g(x: f64) -> String {
+    if x == x.trunc() && x.abs() < 1e15 {
+        format!("{}", x as i64)
+    } else {
+        let s = format!("{}", x);
+        s
+    }
+}
+
+/// Build editable field descriptors from a config map (port of `_cfg_init_fields`).
+fn cfg_init_fields(cfg: &BTreeMap<String, Value>) -> Vec<CfgField> {
+    cfg_schema().into_iter().map(|(key, label, kind, live)| {
+        let v = cfg.get(key);
+        let (value, bval) = match &kind {
+            CfgKind::Bool => (String::new(), v.and_then(|x| x.as_bool()).unwrap_or(false)),
+            CfgKind::Choice(ch) => {
+                let s = v.and_then(|x| x.as_str()).unwrap_or("");
+                (if ch.contains(&s) { s.to_string() } else { ch[0].to_string() }, false)
+            }
+            CfgKind::Step { .. } | CfgKind::Path => {
+                let mut s = match v {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Number(n)) => {
+                        if let Some(i) = n.as_i64() { i.to_string() }
+                        else if let Some(f) = n.as_f64() { fmt_g(f) }
+                        else { n.to_string() }
+                    }
+                    _ => String::new(),
+                };
+                if key == "timeout" && s.is_empty() {
+                    s = "0".into();
+                }
+                if matches!(kind, CfgKind::Path) && !s.is_empty() {
+                    s = display_path(&s);
+                }
+                (s, false)
+            }
+        };
+        let caret = value.chars().count();
+        CfgField { key, label, kind, live, value, bval, caret }
+    }).collect()
+}
+
+/// Show a path relative to the cwd when it lives under it (port of `_display_path`).
+fn display_path(p: &str) -> String {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let abs = std::path::Path::new(p);
+    if let Ok(rel) = abs.strip_prefix(&cwd) {
+        return rel.display().to_string();
+    }
+    p.to_string()
+}
+
+/// The typed config from the current field values (port of `_cfg_typed`; timeout 0 → null).
+fn cfg_typed(fields: &[CfgField]) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for f in fields {
+        let v = match &f.kind {
+            CfgKind::Bool => json!(f.bval),
+            CfgKind::Choice(_) => json!(f.value),
+            CfgKind::Step { .. } => {
+                let x: f64 = f.value.trim().parse().unwrap_or(0.0);
+                if x == x.trunc() { json!(x as i64) } else { json!(x) }
+            }
+            CfgKind::Path => json!(f.value),
+        };
+        out.insert(f.key.to_string(), v);
+    }
+    if matches!(out.get("timeout"), Some(t) if t.as_i64() == Some(0) || t.as_f64() == Some(0.0)) {
+        out.insert("timeout".into(), Value::Null);
+    }
+    out
+}
+
+/// Field visibility (port of the schema `show_if` predicates).
+fn cfg_show(key: &str, vals: &BTreeMap<String, Value>) -> bool {
+    let s = |k: &str| vals.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    match key {
+        "google_fonts" => s("source") == "metadata",
+        "fontc_bin" => s("backend") != "fontmake",
+        "build_fontc" => s("backend") != "fontmake" && s("fontc_bin").is_empty(),
+        "compare" => s("source") == "metadata",
+        _ => true,
+    }
+}
+
+/// Indices (into `fields`) of the currently-visible fields (port of `_cfg_visible`).
+fn cfg_visible(fields: &[CfgField]) -> Vec<usize> {
+    let vals = cfg_typed(fields);
+    (0..fields.len()).filter(|&i| cfg_show(fields[i].key, &vals)).collect()
+}
+
+/// Edit one field from a keypress (port of `_cfg_field_key`). Returns true on Enter (advance).
+fn cfg_field_key(f: &mut CfgField, code: KeyCode) -> bool {
+    let charcount = |s: &str| s.chars().count();
+    let del_at = |s: &str, i: usize| -> String { // remove the char before index i
+        s.chars().take(i.saturating_sub(1)).chain(s.chars().skip(i)).collect()
+    };
+    match &f.kind {
+        CfgKind::Bool => {
+            if matches!(code, KeyCode::Char(' ') | KeyCode::Enter) {
+                f.bval = !f.bval;
+            }
+            false
+        }
+        CfgKind::Choice(ch) => {
+            let ci = ch.iter().position(|c| *c == f.value).unwrap_or(0);
+            match code {
+                KeyCode::Char(' ') | KeyCode::Right => { f.value = ch[(ci + 1) % ch.len()].to_string(); false }
+                KeyCode::Left => { f.value = ch[(ci + ch.len() - 1) % ch.len()].to_string(); false }
+                KeyCode::Enter => true,
+                _ => false,
+            }
+        }
+        CfgKind::Step { step, min, max } => match code {
+            KeyCode::Left | KeyCode::Right => {
+                let dir = if code == KeyCode::Right { 1.0 } else { -1.0 };
+                let x: f64 = f.value.trim().parse().unwrap_or(0.0);
+                f.value = fmt_g((x + step * dir).clamp(*min, *max));
+                f.caret = charcount(&f.value);
+                false
+            }
+            KeyCode::Backspace => {
+                if f.caret > 0 { f.value = del_at(&f.value, f.caret); f.caret -= 1; }
+                false
+            }
+            KeyCode::Home => { f.caret = 0; false }
+            KeyCode::End => { f.caret = charcount(&f.value); false }
+            KeyCode::Enter => true,
+            KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
+                let mut v: Vec<char> = f.value.chars().collect();
+                v.insert(f.caret.min(v.len()), c);
+                f.value = v.into_iter().collect();
+                f.caret += 1;
+                false
+            }
+            _ => false,
+        },
+        CfgKind::Path => match code {
+            KeyCode::Left => { f.caret = f.caret.saturating_sub(1); false }
+            KeyCode::Right => { f.caret = (f.caret + 1).min(charcount(&f.value)); false }
+            KeyCode::Home => { f.caret = 0; false }
+            KeyCode::End => { f.caret = charcount(&f.value); false }
+            KeyCode::Backspace => {
+                if f.caret > 0 { f.value = del_at(&f.value, f.caret); f.caret -= 1; }
+                false
+            }
+            KeyCode::Enter => true,
+            KeyCode::Char(c) if (c as u32) >= 32 => {
+                let mut v: Vec<char> = f.value.chars().collect();
+                v.insert(f.caret.min(v.len()), c);
+                f.value = v.into_iter().collect();
+                f.caret += 1;
+                false
+            }
+            _ => false,
+        },
+    }
+}
+
+/// The action button labels for the config tab (setup: launch/cancel; live: apply).
+fn cfg_actions(setup: bool) -> &'static [&'static str] {
+    if setup {
+        &["▶ Start build", "Cancel"]
+    } else {
+        &["✓ apply changes"]
+    }
+}
+
+/// Live 'apply': write the changed live-editable fields to control.json (port of `_cfg_apply_live`).
+/// Only the keys the Rust daemon honours live (backend/jobs/percent/compare) are forwarded.
+fn cfg_apply_live(fields: &[CfgField], snap: &Snapshot, src: &dyn Source) {
+    let new = cfg_typed(fields);
+    let cur = &snap.config;
+    let changed = |k: &str| new.get(k) != cur.get(k);
+    let mut set = ControlSet::default();
+    if changed("backend") {
+        if let Some(b) = new.get("backend").and_then(|v| v.as_str()) {
+            set.backend = Some(b.to_string());
+        }
+    }
+    if changed("jobs") {
+        if let Some(j) = new.get("jobs").and_then(|v| v.as_i64()) {
+            set.jobs = Some(j.max(1) as usize);
+        }
+    }
+    if changed("percent") {
+        if let Some(p) = new.get("percent").and_then(|v| v.as_f64()) {
+            set.percent = Some(p);
+        }
+    }
+    if changed("compare") {
+        if let Some(c) = new.get("compare").and_then(|v| v.as_bool()) {
+            set.compare = Some(c);
+        }
+    }
+    src.control(&set);
+}
+
+/// Outcome of the TUI loop: the user quit, pressed C to reconfigure, or (in first-run setup) chose
+/// ▶ Start build — which returns the typed config the caller should launch the build with.
 pub enum TuiResult {
     Quit,
     Reconfigure,
+    StartBuild(BTreeMap<String, Value>),
 }
 
 struct Ui {
@@ -40,6 +283,9 @@ struct Ui {
     sel_key: Option<String>, // the SELECTED item's identity (stable selection: cursor follows it)
     detail_lines: Vec<String>, // detail content captured ONCE when the overlay opens (no per-frame I/O)
     dscroll: usize,          // scroll offset within the detail overlay
+    setup: bool,             // first-run setup wizard (config locked, ▶ Start build / Cancel actions)
+    cfg_fields: Vec<CfgField>, // the editable Configuration fields (built once from the config)
+    cfg_active: usize,       // selected config field, or an action-button index past the fields
 }
 
 /// Number of sections on a tab (archive/config are single custom views → 1).
@@ -54,22 +300,37 @@ fn section_count(snap: &Snapshot, tab: usize) -> usize {
 /// selection (the cursor tracks the item, not the row index, as lists reorder live).
 fn list_keys(snap: &Snapshot, tab: usize, section: usize) -> Vec<String> {
     match TABS[tab] {
-        "config" => CONFIG_FIELDS.iter().map(|s| s.to_string()).collect(),
+        "config" => Vec::new(), // the config tab manages its own cursor (cfg_active), not ui.sel
         "archive" => snap.archive.pending.clone(),
         _ => sections_for(snap, tab).get(section).map(|s| s.keys.clone()).unwrap_or_default(),
     }
 }
 
 pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
+    run_mode(source, false)
+}
+
+/// Run the dashboard. `setup` = first-run wizard: lock to the config tab, disable Tab switching, and
+/// offer ▶ Start build / Cancel (returns the typed config on Start).
+pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResult> {
     let mut out = std::io::stdout();
     terminal::enable_raw_mode()?;
     queue!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
     out.flush()?;
 
-    let mut ui = Ui { tab: 1, section: 0, sel: 0, detail: false, sel_key: None, detail_lines: Vec::new(), dscroll: 0 };
+    // in setup the only view is config; a live monitor lands on overview
+    let mut ui = Ui {
+        tab: if setup { 0 } else { 1 },
+        section: 0, sel: 0, detail: false, sel_key: None, detail_lines: Vec::new(), dscroll: 0,
+        setup, cfg_fields: Vec::new(), cfg_active: 0,
+    };
     let mut prev: Option<Screen> = None;
     let res = loop {
         let snap = source.snapshot();
+        // build the editable config fields ONCE, from the first snapshot that carries a config
+        if ui.cfg_fields.is_empty() && !snap.config.is_empty() {
+            ui.cfg_fields = cfg_init_fields(&snap.config);
+        }
         // clamp the focused section to what this tab actually has (tabs differ in section count)
         let nsec = section_count(&snap, ui.tab);
         if ui.section >= nsec {
@@ -98,99 +359,78 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
                 if k.kind != event::KeyEventKind::Press && k.kind != event::KeyEventKind::Repeat {
                     continue;
                 }
+                let on_config = TABS[ui.tab] == "config";
+                // typing into a path/text field captures q / C / Space so they don't quit/reconfigure
+                let text_active = on_config && !ui.detail && config_text_active(&ui);
+
+                // --- global keys (Python order: Esc, q, C, Tab/BackTab) ---
                 match k.code {
-                    KeyCode::Char('q') => break TuiResult::Quit,
-                    KeyCode::Char('c') | KeyCode::Char('C') => break TuiResult::Reconfigure,
-                    KeyCode::Tab => {
+                    KeyCode::Esc => {
+                        if ui.detail { ui.detail = false; } else { break TuiResult::Quit; }
+                        continue;
+                    }
+                    KeyCode::Char('q') | KeyCode::Char('Q') if !text_active => break TuiResult::Quit,
+                    KeyCode::Char('c') | KeyCode::Char('C') if !text_active && !ui.setup => break TuiResult::Reconfigure,
+                    KeyCode::Tab if !ui.setup => {
                         ui.tab = (ui.tab + 1) % TABS.len();
-                        ui.section = 0;
-                        ui.sel = 0;
-                        ui.sel_key = None;
-                        ui.detail = false;
+                        ui.section = 0; ui.sel = 0; ui.sel_key = None; ui.detail = false; ui.cfg_active = 0;
+                        continue;
                     }
-                    KeyCode::BackTab => {
+                    KeyCode::BackTab if !ui.setup => {
                         ui.tab = (ui.tab + TABS.len() - 1) % TABS.len();
-                        ui.section = 0;
-                        ui.sel = 0;
-                        ui.sel_key = None;
-                        ui.detail = false;
+                        ui.section = 0; ui.sel = 0; ui.sel_key = None; ui.detail = false; ui.cfg_active = 0;
+                        continue;
                     }
+                    _ => {}
+                }
+
+                // --- detail overlay (consumes navigation) ---
+                if ui.detail {
+                    match k.code {
+                        KeyCode::Up => ui.dscroll = ui.dscroll.saturating_sub(1),
+                        KeyCode::Down => ui.dscroll = (ui.dscroll + 1).min(ui.detail_lines.len().saturating_sub(1)),
+                        KeyCode::Enter | KeyCode::Backspace | KeyCode::Left => ui.detail = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // --- the unified Configuration editor ---
+                if on_config {
+                    if let Some(r) = handle_config_key(&mut ui, k.code, &snap, &*source) {
+                        break r;
+                    }
+                    continue;
+                }
+
+                // --- other tabs: sections + items ---
+                match k.code {
                     KeyCode::Up => {
-                        if ui.detail {
-                            ui.dscroll = ui.dscroll.saturating_sub(1); // scroll the overlay
-                        } else {
-                            if ui.sel > 0 {
-                                ui.sel -= 1;
-                            }
-                            ui.sel_key = list_keys(&snap, ui.tab, ui.section).get(ui.sel).cloned();
-                        }
+                        if ui.sel > 0 { ui.sel -= 1; }
+                        ui.sel_key = list_keys(&snap, ui.tab, ui.section).get(ui.sel).cloned();
                     }
                     KeyCode::Down => {
-                        if ui.detail {
-                            ui.dscroll = (ui.dscroll + 1).min(ui.detail_lines.len().saturating_sub(1));
-                        } else {
-                            ui.sel = (ui.sel + 1).min(list_keys(&snap, ui.tab, ui.section).len().saturating_sub(1));
-                            ui.sel_key = list_keys(&snap, ui.tab, ui.section).get(ui.sel).cloned();
-                        }
+                        ui.sel = (ui.sel + 1).min(list_keys(&snap, ui.tab, ui.section).len().saturating_sub(1));
+                        ui.sel_key = list_keys(&snap, ui.tab, ui.section).get(ui.sel).cloned();
                     }
                     KeyCode::Left => {
-                        if ui.detail {
-                            ui.detail = false; // ← closes the detail overlay (matches Python)
-                        } else if TABS[ui.tab] == "config" {
-                            adjust_config(&snap, ui.sel, -1, &*source);
-                        } else if section_count(&snap, ui.tab) > 1 {
-                            ui.section = (ui.section + section_count(&snap, ui.tab) - 1) % section_count(&snap, ui.tab);
-                            ui.sel = 0;
-                            ui.sel_key = None;
-                        }
+                        let n = section_count(&snap, ui.tab);
+                        if n > 1 { ui.section = (ui.section + n - 1) % n; ui.sel = 0; ui.sel_key = None; }
                     }
                     KeyCode::Right => {
-                        if ui.detail {
-                            // no-op
-                        } else if TABS[ui.tab] == "config" {
-                            adjust_config(&snap, ui.sel, 1, &*source);
-                        } else if section_count(&snap, ui.tab) > 1 {
-                            ui.section = (ui.section + 1) % section_count(&snap, ui.tab);
-                            ui.sel = 0;
-                            ui.sel_key = None;
-                        }
+                        let n = section_count(&snap, ui.tab);
+                        if n > 1 { ui.section = (ui.section + 1) % n; ui.sel = 0; ui.sel_key = None; }
                     }
-                    KeyCode::Char(' ') => {
-                        if !ui.detail && TABS[ui.tab] == "config" {
-                            adjust_config(&snap, ui.sel, 1, &*source); // space toggles bools / steps
-                        }
-                    }
-                    KeyCode::Enter | KeyCode::Backspace => {
-                        if ui.detail {
-                            ui.detail = false; // ↵/⌫ close the overlay
-                        } else if k.code == KeyCode::Enter {
-                            // capture the detail ONCE (reads the log-file tail here, not every frame)
-                            ui.detail_lines = build_detail(&snap, ui.tab, ui.section, ui.sel, &source.build_dir());
-                            if !ui.detail_lines.is_empty() {
-                                ui.dscroll = 0;
-                                ui.detail = true;
-                            }
-                        }
-                    }
-                    KeyCode::Esc => {
-                        if ui.detail {
-                            ui.detail = false;
-                        } else {
-                            break TuiResult::Quit; // Python: Esc with no open detail cancels/quits
-                        }
+                    KeyCode::Enter => {
+                        ui.detail_lines = build_detail(&snap, ui.tab, ui.section, ui.sel, &source.build_dir());
+                        if !ui.detail_lines.is_empty() { ui.dscroll = 0; ui.detail = true; }
                     }
                     KeyCode::Char('p') | KeyCode::Char('P') => {
-                        source.control(&ControlSet {
-                            paused: Some(!snap.paused),
-                            ..Default::default()
-                        });
+                        source.control(&ControlSet { paused: Some(!snap.paused), ..Default::default() });
                     }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
                         if let Some(slug) = selected_slug(&snap, ui.tab, ui.section, ui.sel) {
-                            source.control(&ControlSet {
-                                retry: Some(vec![slug]),
-                                ..Default::default()
-                            });
+                            source.control(&ControlSet { retry: Some(vec![slug]), ..Default::default() });
                         }
                     }
                     _ => {}
@@ -205,32 +445,60 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
     Ok(res)
 }
 
-/// Read the selected config field, adjust it by `delta` (or toggle a bool / cycle a choice), and
-/// apply it live to the running build via control.json.
-fn adjust_config(snap: &Snapshot, field: usize, delta: i64, src: &dyn Source) {
-    let cf = &snap.config;
-    let getf = |k: &str| cf.get(k).and_then(|v| v.as_f64());
-    let gets = |k: &str| cf.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let getb = |k: &str| cf.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
-    let mut set = ControlSet::default();
-    match CONFIG_FIELDS.get(field).copied().unwrap_or("") {
-        "jobs" => set.jobs = Some(((snap.jobs as i64 + delta).max(1)) as usize),
-        "percent" => {
-            let cur = getf("percent").unwrap_or(snap.config.get("percent").and_then(|v| v.as_f64()).unwrap_or(100.0));
-            set.percent = Some((cur + delta as f64 * 5.0).clamp(0.0, 100.0));
-        }
-        "backend" => {
-            let cur = gets("backend");
-            let i = BACKENDS.iter().position(|b| *b == cur).unwrap_or(0) as i64;
-            let n = BACKENDS.len() as i64;
-            let ni = ((i + delta) % n + n) % n;
-            set.backend = Some(BACKENDS[ni as usize].to_string());
-        }
-        "compare" => set.compare = Some(!getb("compare")),
-        "paused" => set.paused = Some(!snap.paused),
-        _ => {}
+/// True when the active config field is an editable path/text field — so q/C/Space type into it.
+fn config_text_active(ui: &Ui) -> bool {
+    let vis = cfg_visible(&ui.cfg_fields);
+    if ui.cfg_active >= vis.len() {
+        return false; // an action button
     }
-    src.control(&set);
+    let f = &ui.cfg_fields[vis[ui.cfg_active]];
+    let editable = ui.setup || f.live;
+    editable && matches!(f.kind, CfgKind::Path)
+}
+
+/// Handle a keypress on the Configuration tab. Returns Some(result) when the loop should end
+/// (▶ Start build → StartBuild, Cancel → Quit). Mirrors the Python config-tab handler.
+fn handle_config_key(ui: &mut Ui, code: KeyCode, snap: &Snapshot, src: &dyn Source) -> Option<TuiResult> {
+    let vis = cfg_visible(&ui.cfg_fields);
+    let actions = cfg_actions(ui.setup);
+    let nav_n = vis.len() + actions.len();
+    if nav_n == 0 {
+        return None;
+    }
+    ui.cfg_active = ui.cfg_active.min(nav_n - 1);
+    match code {
+        KeyCode::Up => {
+            ui.cfg_active = (ui.cfg_active + nav_n - 1) % nav_n;
+            None
+        }
+        KeyCode::Down => {
+            ui.cfg_active = (ui.cfg_active + 1) % nav_n;
+            None
+        }
+        _ if ui.cfg_active >= vis.len() => {
+            // an action button: Enter/Space activate it
+            if matches!(code, KeyCode::Enter | KeyCode::Char(' ')) {
+                let which = actions[ui.cfg_active - vis.len()];
+                if which == "Cancel" {
+                    return Some(TuiResult::Quit);
+                }
+                if ui.setup {
+                    return Some(TuiResult::StartBuild(cfg_typed(&ui.cfg_fields))); // ▶ Start build
+                }
+                cfg_apply_live(&ui.cfg_fields, snap, src); // ✓ apply changes → control.json
+            }
+            None
+        }
+        _ => {
+            // edit the selected field (only if editable: setup, or a live field on a running build)
+            let fi = vis[ui.cfg_active];
+            let editable = ui.setup || ui.cfg_fields[fi].live;
+            if editable && cfg_field_key(&mut ui.cfg_fields[fi], code) {
+                ui.cfg_active = (ui.cfg_active + 1) % nav_n; // Enter advances to the next field
+            }
+            None
+        }
+    }
 }
 
 /// The slug to retry on [R] — only the focused section's selected family, and only for the sections
@@ -551,30 +819,43 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
         if snap.paused { " [PAUSED]" } else { "" }
     );
     put(scr, 0, 0, &title, Color::White, w);
-    put(scr, 0, w.saturating_sub(24), &format!("elapsed {}", hms(snap.elapsed)), Color::White, w);
 
-    let bld = snap.disk_build_total;
-    let arc = snap.disk_archive_total;
-    // Always spell out both components — no ambiguous "(build dir)".
-    let disk = if snap.disk_archive_nested {
-        format!("disk used {} (build + nested archive, all included)", human(bld))
+    // first-run setup: no disk/progress rows — just a one-line instruction (the config tab is below)
+    let pre_build = ui.setup || snap.pre_build;
+    if pre_build {
+        put(scr, 0, w.saturating_sub(18), "first-time setup", Color::DarkGrey, w);
+        put(scr, 1, 0, " configure your build below, then navigate to ▶ Start build", Color::Cyan, w);
     } else {
-        format!("disk used {} (build {} + archive {})", human(bld + arc), human(bld), human(arc))
-    };
-    put(
-        scr,
-        1,
-        0,
-        &format!(
-            " {}  free {}  jobs {}  cohorts {}  fontc {}/fontmake {}",
-            disk, human(snap.disk_free), snap.jobs, snap.cohorts.len(),
-            snap.backends.fontc, snap.backends.fontmake
-        ),
-        Color::Cyan,
-        w,
-    );
+        put(scr, 0, w.saturating_sub(24), &format!("elapsed {}", hms(snap.elapsed)), Color::White, w);
+        let bld = snap.disk_build_total;
+        let arc = snap.disk_archive_total;
+        // Always spell out both components — no ambiguous "(build dir)".
+        let disk = if snap.disk_archive_nested {
+            format!("disk used {} (build + nested archive, all included)", human(bld))
+        } else {
+            format!("disk used {} (build {} + archive {})", human(bld + arc), human(bld), human(arc))
+        };
+        put(
+            scr,
+            1,
+            0,
+            &format!(
+                " {}  free {}  jobs {}  cohorts {}  fontc {}/fontmake {}",
+                disk, human(snap.disk_free), snap.jobs, snap.cohorts.len(),
+                snap.backends.fontc, snap.backends.fontmake
+            ),
+            Color::Cyan,
+            w,
+        );
+        render_progress(scr, snap, w);
+    }
 
-    // ---- phase + progress (row 2/3) — faithful port of the Python progress bar ----
+    // ---- tab bar (row 4) — active tab in reverse video, inactive dim, + switch hint ----
+    render_tabbar_body(scr, snap, ui, w, h);
+}
+
+/// The phase line + segmented progress bar (rows 2/3). Extracted so the setup wizard can omit it.
+fn render_progress(scr: &mut Screen, snap: &Snapshot, w: u16) {
     // The bar measures progress over the IN-SCOPE worklist (built + failed + queued + building =
     // total − skipped). 'skipped' = NOT selected this run (outside the % sample / --only); counting
     // it as done made the bar read ~100% even when most of the library was never attempted.
@@ -627,7 +908,10 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
     }
     // bold centred label overlaid on the bar
     put(scr, 3, (barw as u16 / 2).max(2), &bar_label, Color::White, w);
+}
 
+/// The tab bar (row 4) + pinned now-building + per-tab body + status panel + footer + detail overlay.
+fn render_tabbar_body(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16) {
     // ---- tab bar (row 4) — active tab in reverse video, inactive dim, + switch hint ----
     let mut x = 1u16;
     for name in TABS.iter() {
@@ -673,7 +957,7 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
     let avail = sep_row.saturating_sub(row);
     match TABS[ui.tab] {
         "archive" => render_archive(scr, snap, row, avail, w),
-        "config" => render_config(scr, snap, ui.sel, row, w),
+        "config" => render_config(scr, snap, ui, row, sep_row, w),
         _ => draw_sections(scr, &sections_for(snap, ui.tab), row, avail, w, ui.section, ui.sel),
     }
 
@@ -688,10 +972,12 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
     // ---- footer (mode-dependent, matching the Python help strings) ----
     let footer = if ui.detail {
         " [esc/←/↵] back to list   [↑↓] scroll"
+    } else if ui.setup {
+        " [↑↓] field   [←→/space] edit   navigate to ▶ Start build and press ↵   [esc] cancel"
     } else if TABS[ui.tab] == "config" {
-        " [Tab/⇧Tab]tabs  [↑↓]field  [←→]change  [space]toggle  [C]onfig  [q]uit"
+        " [↑↓]field  [←→/space]edit  [↵]next/apply  [Tab/⇧Tab]tabs  [C]restart  [q]uit"
     } else {
-        " [Tab/⇧Tab]tabs  [↑↓]item  [↵]details  [p]ause  [R]etry  [C]onfig  [q]uit"
+        " [Tab/⇧Tab]tabs  [↑↓]item  [←→]section  [↵]details  [p]ause  [R]etry  [C]onfig  [q]uit"
     };
     put(scr, footer_row, 0, footer, Color::DarkGrey, w);
 
@@ -809,57 +1095,104 @@ fn trunc(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { s.chars().take(n.saturating_sub(1)).collect::<String>() + "…" }
 }
 
-fn render_config(scr: &mut Screen, snap: &Snapshot, sel: usize, top: u16, w: u16) {
+/// The unified Configuration tab — a faithful port of the Python `view == "config"` renderer: a
+/// scrollable list of visible schema fields (label + value + change/restart tag), an action-button
+/// row, then the auto-relaxed-deps and applied-live-changes sections.
+fn render_config(scr: &mut Screen, snap: &Snapshot, ui: &Ui, top: u16, bottom: u16, w: u16) {
+    const VC: u16 = 36; // value column
+    let pre_build = ui.setup || snap.pre_build;
     let mut row = top;
-    put(scr, row, 0, " Configuration — ↑/↓ pick a field · ←/→ change it (applied live)", Color::Cyan, w);
-    row += 2;
-    let cf = &snap.config;
-    let val = |k: &str| -> String {
-        match cf.get(k) {
-            Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
-            Some(v) if v.is_boolean() => if v.as_bool().unwrap_or(false) { "[x] yes".into() } else { "[ ] no".into() },
-            Some(v) if v.is_f64() => format!("{}", v.as_f64().unwrap_or(0.0)),
-            Some(v) => v.to_string(),
-            None => String::new(),
-        }
+    let title = if pre_build {
+        " Configuration — set up your build "
+    } else {
+        " Configuration — edit settings (live where possible) "
     };
-    // editable live fields first (selected one highlighted with ‹ › / ▸)
-    for (i, f) in CONFIG_FIELDS.iter().enumerate() {
-        let v = if *f == "jobs" { snap.jobs.to_string() }
-                else if *f == "paused" { if snap.paused { "[x] yes".into() } else { "[ ] no".into() } }
-                else { val(f) };
-        let active = i == sel;
-        let marker = if active { "▸ " } else { "  " };
-        let shown = if active { format!("‹ {} ›", v) } else { v };
-        let color = if active { Color::Yellow } else { Color::Grey };
-        put(scr, row, 0, &format!("{}{:<14} {}", marker, f, shown), color, w);
+    let mut hdr = title.to_string();
+    while hdr.chars().count() < (w as usize).saturating_sub(1) {
+        hdr.push('-');
+    }
+    put(scr, row, 0, &hdr, Color::White, w);
+    row += 1;
+
+    let vis = cfg_visible(&ui.cfg_fields);
+    let actions = cfg_actions(ui.setup);
+    let cf = &snap.config;
+    let vals = cfg_typed(&ui.cfg_fields);
+
+    // scroll the fields if they'd overflow into the reserved panel rows (keep the active one visible)
+    let mut field_budget = bottom.saturating_sub(row + 2).max(1) as usize;
+    let mut fstart = 0usize;
+    if vis.len() > field_budget {
+        let afield = ui.cfg_active.min(vis.len().saturating_sub(1));
+        fstart = afield.saturating_sub(field_budget.saturating_sub(1)).min(vis.len() - field_budget);
+        if fstart > 0 {
+            put(scr, row, 1, &format!("  ↑ {} more", fstart), Color::DarkGrey, w);
+            row += 1;
+            field_budget -= 1;
+        }
+    }
+    for idx in fstart..vis.len().min(fstart + field_budget) {
+        let f = &ui.cfg_fields[vis[idx]];
+        let active = ui.cfg_active == idx;
+        let editable = ui.setup || f.live;
+        let valstr = match &f.kind {
+            CfgKind::Bool => if f.bval { "[x] yes".to_string() } else { "[ ] no".to_string() },
+            CfgKind::Choice(_) => format!("‹ {} ›", f.value),
+            _ => f.value.clone(),
+        };
+        let mut tag = String::new();
+        if !pre_build {
+            if f.live && vals.get(f.key) != cf.get(f.key) {
+                tag = "  *changed".into();
+            } else if !f.live {
+                tag = "  (restart: C)".into();
+            }
+        }
+        let lab_color = if active { Color::White } else if editable { Color::Grey } else { Color::DarkGrey };
+        put(scr, row, 1, &format!("{}{}", if active { "▸ " } else { "  " }, f.label), lab_color, w);
+        put_rev(scr, row, VC, &format!("{}{}", valstr, tag), if editable { Color::Yellow } else { Color::DarkGrey }, active);
+        // a visible block caret on an active editable text/number field
+        if active && editable && matches!(f.kind, CfgKind::Path | CfgKind::Step { .. }) {
+            let cx = VC + f.caret.min(f.value.chars().count()) as u16;
+            let ch = f.value.chars().nth(f.caret).unwrap_or(' ');
+            put_rev(scr, row, cx, &ch.to_string(), Color::White, true);
+        }
         row += 1;
     }
-    row += 1;
-    // the rest of the config (read-only paths/source), for context
-    put(scr, row, 0, " (paths — restart to change)", Color::DarkGrey, w);
-    row += 1;
-    for k in ["source", "build_dir", "archive", "manage_venvs"] {
-        if cf.contains_key(k) {
-            put(scr, row, 1, &format!("{:<14} {}", k, val(k)), Color::DarkGrey, w);
+    if vis.len() > fstart + field_budget {
+        put(scr, row, 1, &format!("  ↓ {} more", vis.len() - fstart - field_budget), Color::DarkGrey, w);
+        row += 1;
+    }
+
+    // action button(s): ▶ Start build / Cancel (setup) or ✓ apply changes (live)
+    let brow = (row + 1).min(bottom.saturating_sub(1));
+    let mut bx = 2u16;
+    for (ai, lbl) in actions.iter().enumerate() {
+        let active = ui.cfg_active == vis.len() + ai;
+        let s = format!(" {} ", lbl);
+        put_rev(scr, brow, bx, &s, Color::White, active);
+        bx += s.chars().count() as u16 + 4;
+    }
+    row = brow + 2;
+    if !snap.dep_relaxations.is_empty() && row < bottom.saturating_sub(1) {
+        let mut h = " auto-fixed dependencies (no manual pinning needed) ".to_string();
+        while h.chars().count() < (w as usize).saturating_sub(1) { h.push('-'); }
+        put(scr, row, 0, &h, Color::White, w);
+        row += 1;
+        for l in &snap.dep_relaxations {
+            if row >= bottom.saturating_sub(1) { break; }
+            put(scr, row, 1, l, Color::Yellow, w);
             row += 1;
         }
     }
-    if !snap.dep_relaxations.is_empty() {
+    if !snap.control_log.is_empty() && row < bottom.saturating_sub(1) {
+        let mut h = " applied live changes ".to_string();
+        while h.chars().count() < (w as usize).saturating_sub(1) { h.push('-'); }
+        put(scr, row, 0, &h, Color::White, w);
         row += 1;
-        put(scr, row, 0, " Dependency relaxations / overrides", Color::Cyan, w);
-        row += 1;
-        for l in snap.dep_relaxations.iter().take(4) {
-            put(scr, row, 1, l, Color::Grey, w);
-            row += 1;
-        }
-    }
-    if !snap.control_log.is_empty() {
-        row += 1;
-        put(scr, row, 0, " Recent live changes", Color::Cyan, w);
-        row += 1;
-        for l in snap.control_log.iter().rev().take(4) {
-            put(scr, row, 1, l, Color::Grey, w);
+        for l in snap.control_log.iter().rev() {
+            if row >= bottom.saturating_sub(1) { break; }
+            put(scr, row, 1, l, Color::Green, w);
             row += 1;
         }
     }
@@ -868,11 +1201,20 @@ fn render_config(scr: &mut Screen, snap: &Snapshot, sel: usize, top: u16, w: u16
 /// Per-field help text for the config tab status panel — mirrors the Python FIELD_HELP map.
 fn field_help(key: &str) -> &str {
     match key {
+        "source" => "where the worklist comes from: google/fonts METADATA, or every mirror in the archive",
+        "google_fonts" => "path to a google/fonts clone (cloned shallow if absent)",
+        "archive" => "the bare-mirror repo archive (append-only; never deleted)",
+        "build_dir" => "where all build assets go (out/ venvs/ logs/) — never inside a repo",
+        "backend" => "auto = fontc first then fall back to fontmake · fontc/fontmake = that one · both = build & compare",
+        "fontc_bin" => "path to the fontc (Rust) binary",
+        "build_fontc" => "no fontc binary? build it from source with cargo",
         "jobs" => "how many families build in parallel",
         "percent" => "build only this % of the library (evenly-spaced sample); raise it live to build more",
-        "backend" => "auto = fontc first then fall back to fontmake · fontc/fontmake = that one · both = build & compare",
+        "timeout" => "per-build timeout in seconds (0 = never time out)",
+        "populate_archive" => "mirror any missing upstream repos into the archive while building",
+        "manage_venvs" => "create & share one venv per dependency cohort",
+        "retry_failed" => "also re-attempt families that failed with genuine build errors (fixable causes — broken venvs, transient fetches — are always retried)",
         "compare" => "sha256-compare each built font to the shipped one (metadata source only)",
-        "paused" => "pause / resume the worker pool",
         _ => "edit with ←/→ or type",
     }
 }
@@ -885,8 +1227,19 @@ fn focus_info(snap: &Snapshot, ui: &Ui) -> Vec<String> {
     // config + archive are single custom views (no sections) — keep their dedicated info
     match TABS[ui.tab] {
         "config" => {
-            let f = CONFIG_FIELDS.get(sel).copied().unwrap_or("");
-            return vec![format!(" {} — {}", f, field_help(f))];
+            let vis = cfg_visible(&ui.cfg_fields);
+            if let Some(&fi) = vis.get(ui.cfg_active) {
+                let f = &ui.cfg_fields[fi];
+                return vec![format!(" {} — {}", f.label, field_help(f.key))];
+            }
+            let ai = ui.cfg_active.saturating_sub(vis.len());
+            let help = match cfg_actions(ui.setup).get(ai).copied().unwrap_or("") {
+                "▶ Start build" => "▶ launch the build with these settings",
+                "Cancel" => "discard and exit — nothing is built",
+                "✓ apply changes" => "apply the edited live settings to the running build now",
+                _ => "",
+            };
+            return vec![format!(" {}", help)];
         }
         "archive" => {
             return snap.archive.pending.get(sel)
@@ -1136,20 +1489,7 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, build_d
                 o.push("This upstream repo is not yet in the archive; it will be cloned (append-only) when --mirror-missing is on.".into());
             }
         }
-        "config" => {
-            let f = CONFIG_FIELDS.get(sel).copied().unwrap_or("");
-            o.push(format!("Setting: {}", f));
-            o.push(String::new());
-            o.push(match f {
-                "jobs" => "Number of parallel build workers. ←/→ to change; applied live to the running build.",
-                "percent" => "Build an evenly-spaced P% sample of the library. Raising it live enqueues the newly-included families.",
-                "backend" => "Compiler: auto (fontc-first, fontmake fallback) · fontc · fontmake · both (build with each and compare).",
-                "compare" => "sha256-compare the built fonts to the shipped binaries (metadata mode only).",
-                "paused" => "Pause / resume the worker pool.",
-                _ => "",
-            }.to_string());
-        }
-        _ => {} // phase-timing (dview "") and anything else: no detail overlay
+        _ => {} // config (edits in place, no overlay), phase-timing (dview ""), etc: no detail
     }
     o
 }

@@ -1167,6 +1167,7 @@ impl Orchestrator {
             control_log: sh.control_log.clone(),
             dep_relaxations: self.venvs.as_ref().map(|v| v.relaxations()).unwrap_or_default(),
             config_path: self.cfg.data_dir.join("gflib-build.config").to_string_lossy().to_string(),
+            pre_build: false, // a live build is never the setup wizard
             done,
             daemon_alive: true,
         }

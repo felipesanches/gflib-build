@@ -95,8 +95,29 @@ fn run_build(mut cfg: config::Config) {
         );
         return run_attach(&cfg);
     }
-    config::save_config(&cfg);
     let ui = pick_frontend(&cfg.ui);
+
+    // ---- first-run setup wizard: the editable config tab, pre-build (launch on ▶ Start build).
+    //      Triggered by --setup/--wizard or a missing google/fonts clone (metadata mode), when
+    //      interactive and not --yes — mirroring the Python first-run flow. ----
+    let need_gf = cfg.source == "metadata"
+        && !cfg.google_fonts.as_ref().map(|p| p.join("ofl").is_dir()).unwrap_or(false);
+    if (cfg.wizard || need_gf) && !cfg.yes && ui == "curses" && std::io::stdin().is_terminal() {
+        let setup_src: Arc<dyn Source> =
+            monitor::SetupState::new(config::config_map(&cfg), cfg.build_dir.clone());
+        match tui::run_mode(setup_src, true) {
+            Ok(tui::TuiResult::StartBuild(m)) => config::apply_setup_map(&mut cfg, &m),
+            _ => {
+                eprintln!("aborted.");
+                return;
+            }
+        }
+        if cfg.fontc_bin.is_none() {
+            cfg.fontc_bin = discover::detect_fontc(); // the wizard may have cleared a stale path
+        }
+    }
+
+    config::save_config(&cfg);
 
     // Detach by default for the interactive curses UI (quit the monitor, build keeps running);
     // --detach forces it for any UI; --no-detach keeps curses in the foreground. daemonize() MUST
@@ -406,6 +427,7 @@ UI:
   --web-port <PORT>             port for --ui web (default 8765)
 
 LIFECYCLE:
+  --setup / --wizard            open the editable Configuration tab pre-build; launch on ▶ Start build
   --list                        print the buildable worklist and exit
   --cohorts-report              preview the dependency-cohort grouping (read-only) and exit
   --attach                      attach a read-only monitor to a build at --build-dir

@@ -228,6 +228,7 @@ pub struct Snapshot {
     #[serde(default)] pub control_log: Vec<String>,
     #[serde(default)] pub dep_relaxations: Vec<String>, // auto-relaxed pins / forced overrides (R2)
     #[serde(default)] pub config_path: String,
+    #[serde(default)] pub pre_build: bool, // first-run setup wizard (config tab is the only view)
     #[serde(default)] pub done: bool,
     #[serde(default)] pub daemon_alive: bool,
 }

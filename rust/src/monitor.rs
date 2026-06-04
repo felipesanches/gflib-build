@@ -9,9 +9,42 @@
 use crate::build::Orchestrator;
 use crate::model::{ControlSet, Snapshot};
 use crate::persist;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+
+/// A static `Source` for the first-run setup wizard: it has no build, just the initial config the
+/// config tab edits. The TUI renders it in `pre_build` mode and returns the edited config to launch.
+pub struct SetupState {
+    config: BTreeMap<String, serde_json::Value>,
+    build_dir: PathBuf,
+}
+
+impl SetupState {
+    pub fn new(config: BTreeMap<String, serde_json::Value>, build_dir: PathBuf) -> Arc<Self> {
+        Arc::new(SetupState { config, build_dir })
+    }
+}
+
+impl Source for SetupState {
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            config: self.config.clone(),
+            phase: "config".into(),
+            pre_build: true,
+            daemon_alive: true,
+            ..Default::default()
+        }
+    }
+    fn build_dir(&self) -> PathBuf {
+        self.build_dir.clone()
+    }
+    fn is_live(&self) -> bool {
+        false
+    }
+    fn control(&self, _set: &ControlSet) {}
+}
 
 /// Something a frontend can render + send live controls to.
 #[allow(dead_code)] // build_dir()/request_stop() are part of the stable Source API; not all callers use them yet

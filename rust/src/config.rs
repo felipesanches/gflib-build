@@ -37,6 +37,7 @@ pub struct Config {
     pub web_port: u16,
     pub ui: String,            // auto | curses | plain | json | none | web
     pub yes: bool,
+    pub wizard: bool,          // force the first-run setup wizard (the editable config tab pre-build)
     pub detach: bool,          // run the build in a detached background daemon
     pub no_detach: bool,       // force foreground even for curses (which detaches by default)
 }
@@ -74,6 +75,7 @@ impl Default for Config {
             web_port: 8765,
             ui: "auto".into(),
             yes: false,
+            wizard: false,
             detach: false,
             no_detach: false,
         }
@@ -176,6 +178,7 @@ pub fn parse(args: &[String]) -> Parsed {
             "--web-port" => cfg.web_port = next(&mut i, a).parse().unwrap_or(8765),
             "--ui" => cfg.ui = next(&mut i, a),
             "--yes" | "-y" => cfg.yes = true,
+            "--setup" | "--wizard" => cfg.wizard = true,
             "--detach" => cfg.detach = true,
             "--no-detach" => cfg.no_detach = true,
             "--list" => mode = Mode::List,
@@ -249,19 +252,51 @@ pub fn save_config(cfg: &Config) {
     }
 }
 
-/// A small config map for embedding in the snapshot (what the config tab/web show).
+/// The full config map for the snapshot — one entry per CONFIG_SCHEMA field, so the config tab (and
+/// the setup wizard, which reuses this) can show and edit every setting.
 pub fn config_map(cfg: &Config) -> BTreeMap<String, serde_json::Value> {
     use serde_json::json;
     let mut m = BTreeMap::new();
+    m.insert("source".into(), json!(cfg.source));
+    m.insert("google_fonts".into(), json!(cfg.google_fonts.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()));
+    m.insert("archive".into(), json!(cfg.archive.to_string_lossy()));
+    m.insert("build_dir".into(), json!(cfg.build_dir.to_string_lossy()));
+    m.insert("backend".into(), json!(cfg.backend));
+    m.insert("fontc_bin".into(), json!(cfg.fontc_bin.clone().unwrap_or_default()));
+    m.insert("build_fontc".into(), json!(false));
     m.insert("jobs".into(), json!(cfg.jobs));
     m.insert("percent".into(), json!(cfg.percent));
-    m.insert("backend".into(), json!(cfg.backend));
-    m.insert("source".into(), json!(cfg.source));
-    m.insert("build_dir".into(), json!(cfg.build_dir.to_string_lossy()));
-    m.insert("archive".into(), json!(cfg.archive.to_string_lossy()));
-    m.insert("compare".into(), json!(cfg.compare));
+    // store as null when unset, matching the editor's "0 → no timeout" convention (so the config tab
+    // doesn't flag an unset timeout as *changed)
+    m.insert("timeout".into(), cfg.timeout.map(|t| json!(t)).unwrap_or(serde_json::Value::Null));
+    m.insert("populate_archive".into(), json!(cfg.populate_archive));
     m.insert("manage_venvs".into(), json!(cfg.manage_venvs));
+    m.insert("retry_failed".into(), json!(cfg.retry_failed));
+    m.insert("compare".into(), json!(cfg.compare));
     m
+}
+
+/// Apply the typed config the setup wizard returned (▶ Start build) back onto the Config, mirroring
+/// how the Python tool maps the edited fields onto `args` before launching the build.
+pub fn apply_setup_map(cfg: &mut Config, m: &BTreeMap<String, serde_json::Value>) {
+    use serde_json::Value;
+    let s = |k: &str| -> Option<String> { m.get(k).and_then(|v| v.as_str()).map(|s| s.to_string()) };
+    if let Some(v) = s("source") { cfg.source = v; }
+    cfg.google_fonts = s("google_fonts").filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(v) = s("archive").filter(|v| !v.is_empty()) { cfg.archive = PathBuf::from(v); }
+    if let Some(v) = s("build_dir").filter(|v| !v.is_empty()) { cfg.build_dir = PathBuf::from(v); }
+    if let Some(v) = s("backend") { cfg.backend = v; }
+    cfg.fontc_bin = s("fontc_bin").filter(|v| !v.is_empty());
+    if let Some(j) = m.get("jobs").and_then(|v| v.as_i64()) { cfg.jobs = j.max(1) as usize; }
+    if let Some(p) = m.get("percent").and_then(|v| v.as_f64()) { cfg.percent = p; }
+    cfg.timeout = match m.get("timeout") {
+        Some(Value::Null) | None => None,
+        Some(v) => v.as_u64().filter(|&t| t > 0),
+    };
+    if let Some(b) = m.get("populate_archive").and_then(|v| v.as_bool()) { cfg.populate_archive = b; }
+    if let Some(b) = m.get("manage_venvs").and_then(|v| v.as_bool()) { cfg.manage_venvs = b; }
+    if let Some(b) = m.get("retry_failed").and_then(|v| v.as_bool()) { cfg.retry_failed = b; }
+    cfg.compare = m.get("compare").and_then(|v| v.as_bool()).unwrap_or(false) && cfg.source == "metadata";
 }
 
 #[cfg(test)]
