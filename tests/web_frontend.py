@@ -124,4 +124,28 @@ c.close()
 assert b"200" in resp and b"ok" in resp, ("server must respond to negative Content-Length, not hang", resp[:80])
 print("negative Content-Length -> quick response, no hung thread")
 
+# 4) MonitorState.snapshot() is called CONCURRENTLY by the ThreadingTCPServer (one thread/request)
+#    AND the render loop — it must be thread-safe (cache fields are guarded by self.lock).
+import threading
+ms = g.MonitorState(build_dir)
+errs = []
+
+
+def hammer():
+    try:
+        for _ in range(300):
+            s = ms.snapshot()
+            assert "counts" in s and "daemon_alive" in s
+    except Exception as e:
+        errs.append(repr(e))
+
+
+ts = [threading.Thread(target=hammer) for _ in range(8)]
+for t in ts:
+    t.start()
+for t in ts:
+    t.join()
+assert not errs, errs
+print("MonitorState.snapshot() thread-safe under 8 concurrent callers")
+
 print("\nWEB-FRONTEND OK")

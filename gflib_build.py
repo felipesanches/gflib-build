@@ -2973,8 +2973,10 @@ class CursesFrontend(Frontend):
                 # waiting families in priority order, tagged by WHY they're queued:
                 # new (never built) · retry (after a failure) · rebuild (of a prior success)
                 kcol = {"new": GREEN, "retry": YEL, "rebuild": CYAN}
-                return [("Queued — priority order (variable + larger families first)",
-                         snap.get("queued_list", []),
+                ql = snap.get("queued_list", [])
+                nq = snap.get("counts", {}).get("queued", len(ql))
+                return [("Queued — priority order (variable + larger families first)"
+                         + (f" — {nq} total" if len(ql) < nq else ""), ql,
                          lambda e: [("  %-8s " % e.get("kind", "new"), kcol.get(e.get("kind"), 0)),
                                     (e["slug"], 0)],
                          lambda e: kcol.get(e.get("kind"), 0), "queue")]
@@ -3005,7 +3007,10 @@ class CursesFrontend(Frontend):
                                             (f"{c['cat']:<24}", CYAN),
                                             (" " + c['hint'], curses.A_DIM)],
                                  lambda c: CYAN, "failcat"))
-                secs.append(("Failures — newest first (current)", snap.get("failures_recent", []),
+                fr = snap.get("failures_recent", [])
+                nf = snap.get("counts", {}).get("failed", len(fr))
+                secs.append(("Failures — newest first (current)" + (f" — {nf} total" if len(fr) < nf else ""),
+                             fr,
                              # family slug (default) + error (dim) so the slug reads clearly
                              lambda f: [(f"{f['slug']:<34} ", RED), (f['error'], RED | curses.A_DIM)],
                              lambda f: RED, "failures"))
@@ -3603,7 +3608,8 @@ const TAB_RENDER={
    '<span class="g s">'+E(x.slug)+'</span><span class="meta">'+E(x.backend||'')+'  '+human(x.bytes)+'  '+E(x.compare||'')+'</span>'))),
  failures:()=>{let h=card('Failures by cause',rows(snap.fail_categories||[],x=>frow('cat:'+x.cat,
     '<span class="c" style="width:40px;text-align:right">'+x.count+'</span><span class="y" style="width:200px">'+E(x.cat)+'</span><span class="meta d s">'+E(x.hint)+'</span>')));
-  h+=card('Failures — newest first ('+(snap.counts.failed||0)+', current)',rows((snap.failures_recent||[]).slice(0,200),x=>frow(x.slug,
+  const fr=snap.failures_recent||[],fc=snap.counts.failed||0;
+  h+=card('Failures — newest first ('+fc+' total'+(fr.length<fc?', showing '+fr.length:'')+', current)',rows(fr.slice(0,200),x=>frow(x.slug,
     '<span class="r s">'+E(x.slug)+'</span><span class="meta d">'+E(x.error)+'</span>')));
   const fh=snap.failure_history||[];
   if(fh.length)h+=card('Failure history (persistent — survives restarts & re-attempts)',rows(fh,x=>frow('h:'+E(x.slug)+(x.ts||0),
@@ -4023,26 +4029,28 @@ class MonitorState:
     def snapshot(self) -> dict:
         # The render loop calls this ~4×/s; re-PARSE the (tens-of-KB) status.json only when it
         # actually changes (mtime) — re-reading+parsing it every frame is a real source of UI
-        # latency, especially on virtiofs. A 2 s ceiling bounds staleness if mtime is cached stale.
+        # latency, especially on virtiofs. A 1 s ceiling bounds staleness if mtime is cached stale.
+        # Guarded by self.lock because the web server (ThreadingTCPServer) calls this CONCURRENTLY.
         path = self.build_dir / "status.json"
         now = time.time()
-        try:
-            mt = path.stat().st_mtime
-        except OSError:
-            mt = -1.0
-        if self._snap_cache is None or mt != self._snap_mtime or (now - self._snap_parsed_at) > 2.0:
+        with self.lock:
             try:
-                self._snap_cache = json.loads(path.read_text())
-                self._snap_mtime = mt
-            except Exception:
-                if self._snap_cache is None:
-                    self._snap_cache = dict(self._EMPTY)
-            self._snap_parsed_at = now
-        if now - self._pid_checked > 1.0:            # the pidfile check is also a syscall — throttle it
-            self._pid_alive = read_daemon_pid(self.build_dir) is not None
-            self._pid_checked = now
-        snap = dict(self._snap_cache)                # shallow copy so daemon_alive can't poison the cache
-        snap["daemon_alive"] = self._pid_alive
+                mt = path.stat().st_mtime
+            except OSError:
+                mt = -1.0
+            if self._snap_cache is None or mt != self._snap_mtime or (now - self._snap_parsed_at) > 1.0:
+                try:
+                    self._snap_cache = json.loads(path.read_text())
+                    self._snap_mtime = mt
+                except Exception:
+                    if self._snap_cache is None:
+                        self._snap_cache = dict(self._EMPTY)
+                self._snap_parsed_at = now
+            if now - self._pid_checked > 1.0:        # the pidfile check is also a syscall — throttle it
+                self._pid_alive = read_daemon_pid(self.build_dir) is not None
+                self._pid_checked = now
+            snap = dict(self._snap_cache)            # shallow copy so daemon_alive can't poison the cache
+            snap["daemon_alive"] = self._pid_alive
         return snap
 
     def all_done(self) -> bool:
