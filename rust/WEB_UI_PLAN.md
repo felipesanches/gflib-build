@@ -132,7 +132,9 @@ Charts that need *change over time*, not just the current snapshot.
    (traversal-safe) feeds the log tail; the config form edits the live keys (backend/jobs/percent/
    compare) via `/api/control`. Also: cohort family names are now coloured by build status in BOTH
    UIs. Verified by an adversarial review workflow (0 confirmed bugs).
-4. **W4 = Part D1** (client-side timeseries) and **Part C4–C6** (tables/links/export).
+4. **W4 = Part D1 + C4/C6** ✅ **DONE (2026-06-05, commit af8366b).** Client-side timeseries
+   (build-progress / disk / throughput line charts on overview), a filter box on the list tabs, and
+   ⬇ JSON / ⬇ CSV export. Deep links (C5) already shipped in W1.
 5. **W5 = Part E** (polish) and, if wanted, **Part D2** (daemon history).
 
 **Out of scope by design:** the first-run **setup wizard** stays TUI/CLI-only (the web UI is a
