@@ -106,8 +106,10 @@ and failure; `--list` / `--attach` / `--stop` / `--reset`.
   into shared venvs (`--manage-venvs`). The Rust port currently builds with a single interpreter
   (`--build-python`, the common default path). Cohort fields exist in the schema but aren't populated.
 - **`--backend both` comparison.** The order is honoured but the sha256 vs-table isn't computed yet.
-- **Archive populate / mirror pre-warmer.** Discovery reads existing mirrors; it does not yet clone
-  missing repos (`--mirror-missing`) or run the live archive-population view.
+- **Archive populate / mirror pre-warmer.** ✅ ported: `--mirror-missing` clones missing repos, and a
+  concurrent pre-warmer proactively mirrors the whole worklist (de-duped) into the archive, populating
+  the live archive view (cloning-now / queued / recently-added / unreachable). Build workers and the
+  pre-warmer share the per-repo clone lock so nothing is cloned twice.
 - **`build_rules.json` pre-build scripts.** Not yet executed.
 - **True detach/daemonize.** A live build runs in the foreground; quitting the TUI stops it (the
   Python tool double-forks a lingering daemon). Monitoring an *external* daemon already works via
