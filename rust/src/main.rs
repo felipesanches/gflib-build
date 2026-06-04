@@ -35,6 +35,7 @@ fn main() {
         Mode::List => run_list(&cfg),
         Mode::Stop => run_stop(&cfg),
         Mode::Reset => run_reset(&cfg),
+        Mode::CohortsReport => run_cohorts_report(&cfg),
         Mode::Attach => run_attach(&cfg),
         Mode::Build => run_build(cfg),
     }
@@ -208,6 +209,72 @@ fn run_list(cfg: &config::Config) {
     );
 }
 
+fn run_cohorts_report(cfg: &config::Config) {
+    // Read-only preview of the dependency-cohort grouping: scan each family's requirements via
+    // `git show` on the mirror (no extraction, no builds, archives untouched). Ported from Python.
+    let mut cfg = cfg.clone();
+    if !cfg.archive.is_dir() {
+        if let Some(a) = discover::detect_archive(&cfg.data_dir) {
+            cfg.archive = std::path::PathBuf::from(a);
+        }
+    }
+    let (fams, _total, _skipped) = match cfg.source.as_str() {
+        "archive" => discover::discover_archive(&cfg.archive, &cfg.archive_rev, cfg.jobs, None),
+        _ => match &cfg.google_fonts {
+            Some(gf) => discover::discover_metadata(gf),
+            None => {
+                eprintln!("--cohorts-report with --source metadata needs --google-fonts");
+                return;
+            }
+        },
+    };
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut sigs: BTreeMap<String, String> = BTreeMap::new();
+    for f in &fams {
+        let mp = build::mirror_path(&cfg.archive, &f.url);
+        let (cohort, sig) = if !mp.is_dir() {
+            ("(mirror-absent)".to_string(), String::new())
+        } else {
+            let req = venv::read_requirements_from_mirror(&mp, &f.commit);
+            (venv::cohort_key_for(&req), venv::normalize_requirements(&req))
+        };
+        groups.entry(cohort.clone()).or_default().push(f.slug.clone());
+        sigs.entry(cohort).or_insert(sig);
+    }
+    let real = groups.keys().filter(|k| *k != "base" && *k != "(mirror-absent)").count();
+    println!(
+        "Cohort report: {} repos scanned -> {} distinct dependency cohort(s), plus 'base' and any mirror-absent.\n",
+        fams.len(), real
+    );
+    let mut ordered: Vec<_> = groups.iter().collect();
+    ordered.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    for (cohort, slugs) in &ordered {
+        let label = match cohort.as_str() {
+            "base" => "base — no requirements file".to_string(),
+            "(mirror-absent)" => "mirror absent — not scanned".to_string(),
+            other => other.to_string(),
+        };
+        println!("== {}  ·  {} families ==", label, slugs.len());
+        if let Some(sig) = sigs.get(*cohort) {
+            for line in sig.lines().take(6) {
+                println!("    {}", line);
+            }
+        }
+        let shown: Vec<&str> = slugs.iter().take(8).map(|s| s.as_str()).collect();
+        println!("    {}{}\n", shown.join(", "), if slugs.len() > 8 { ", …" } else { "" });
+    }
+    // write cohorts.json next to the build dir
+    let _ = std::fs::create_dir_all(&cfg.build_dir);
+    let out: BTreeMap<&String, &Vec<String>> = groups.iter().collect();
+    if let Ok(txt) = serde_json::to_string_pretty(&out) {
+        let p = cfg.build_dir.join("cohorts.json");
+        if std::fs::write(&p, txt).is_ok() {
+            eprintln!("wrote {}", p.display());
+        }
+    }
+}
+
 fn run_reset(cfg: &config::Config) {
     // delete the whole build dir; NEVER touch the archive (append-only policy)
     let bd = &cfg.build_dir;
@@ -327,6 +394,7 @@ UI:
 
 LIFECYCLE:
   --list                        print the buildable worklist and exit
+  --cohorts-report              preview the dependency-cohort grouping (read-only) and exit
   --attach                      attach a read-only monitor to a build at --build-dir
   --detach / --no-detach        run the build in a background daemon (default for curses) / force fg
   --stop                        signal a build daemon at --build-dir to stop (graceful)

@@ -88,6 +88,7 @@ pub enum Mode {
     Stop,
     List,
     Reset,
+    CohortsReport,
     Help,
 }
 
@@ -178,6 +179,7 @@ pub fn parse(args: &[String]) -> Parsed {
             "--detach" => cfg.detach = true,
             "--no-detach" => cfg.no_detach = true,
             "--list" => mode = Mode::List,
+            "--cohorts-report" => mode = Mode::CohortsReport,
             "--attach" => mode = Mode::Attach,
             "--stop" => mode = Mode::Stop,
             "--reset" => mode = Mode::Reset,
