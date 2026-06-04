@@ -75,6 +75,17 @@ fn run_build(mut cfg: config::Config) {
             }
         }
     }
+    // auto-detect the base toolchain requirements (so --manage-venvs reuses the same venvs the
+    // Python tool built — the cohort marker hashes the base lines, so the file content must match)
+    if cfg.manage_venvs && cfg.base_requirements.is_none() {
+        for c in ["requirements-build.txt", "../requirements-build.txt"] {
+            let p = std::path::PathBuf::from(c);
+            if p.is_file() {
+                cfg.base_requirements = Some(p);
+                break;
+            }
+        }
+    }
     // if a daemon is already running here, just attach a monitor (don't start a second build)
     if let Some(pid) = persist::read_daemon_pid(&cfg.build_dir) {
         eprintln!(

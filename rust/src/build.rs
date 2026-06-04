@@ -361,6 +361,82 @@ impl Orchestrator {
         })
     }
 
+    /// Run ONE backend end-to-end into `dest` (extract → pre-build → preclean → config → build →
+    /// collect). Returns (ok, err, found, bytes). Used by the --backend both path.
+    #[allow(clippy::too_many_arguments)]
+    fn run_backend_into(
+        &self, slug: &str, fam: &Family, backend: &str, dest: &Path, work: &Path, mirror: &Path,
+        python: &str, log_path: &Path,
+    ) -> (bool, String, BTreeMap<String, PathBuf>, u64) {
+        if let Err(e) = extract_tree(mirror, &fam.commit, work, EXTRACT_TIMEOUT, log_path) {
+            return (false, e, BTreeMap::new(), 0);
+        }
+        if let Some(cmds) = self.build_rules.get(slug) {
+            if let Err(e) = crate::rules::run_pre_build(work, python, cmds, log_path, self.cfg.timeout) {
+                return (false, e, BTreeMap::new(), 0);
+            }
+        }
+        preclean_outputs(work);
+        let (cfg_path, _label) = match resolve_config(self.cfg.google_fonts.as_deref(), fam, work) {
+            Ok(v) => v,
+            Err(e) => return (false, e, BTreeMap::new(), 0),
+        };
+        let t0 = now();
+        if let Err(e) = run_builder(python, &cfg_path, work, log_path, self.cfg.timeout, backend,
+                                    self.cfg.fontc_bin.as_deref(), self.cfg.builder3_bin.as_deref()) {
+            return (false, format!("{}: {}", backend, e), BTreeMap::new(), 0);
+        }
+        let (bytes, found, extras) = collect_outputs(work, dest, &fam.shipped_fonts, t0);
+        if !fam.shipped_fonts.is_empty() && found.is_empty() {
+            let err = if extras.is_empty() {
+                format!("{}: produced no expected font files", backend)
+            } else {
+                format!("{}: output name mismatch — got {:?}", backend, &extras[..extras.len().min(3)])
+            };
+            return (false, err, found, bytes);
+        }
+        (true, String::new(), found, bytes)
+    }
+
+    /// --backend both: build fontc + fontmake separately, compare, record vs/fontc_ok/fontmake_ok.
+    #[allow(clippy::too_many_arguments)]
+    fn build_both(
+        &self, slug: &str, fam: &Family, work: &Path, out_dir: &Path, mirror: &Path, python: &str,
+        builder: &str, bver: &str, log_path: &Path,
+    ) {
+        let fcver = self.compiler_version("fontc", python);
+        let mcver = self.compiler_version("fontmake", python);
+        self.set_result(slug, |r| {
+            r.backend = "both".into();
+            r.compiler_version = format!("{}  +  {}", fcver, mcver);
+            r.builder = builder.into();
+            r.builder_version = bver.into();
+        });
+        let (fok, ferr, fbuilt, fbytes) =
+            self.run_backend_into(slug, fam, "fontc", &out_dir.join("fontc"), work, mirror, python, log_path);
+        let (mok, merr, mbuilt, mbytes) =
+            self.run_backend_into(slug, fam, "fontmake", &out_dir.join("fontmake"), work, mirror, python, log_path);
+        if !fok && !mok {
+            let msg = format!("both backends failed — fontc: {} || fontmake: {}",
+                &ferr[..ferr.len().min(120)], &merr[..merr.len().min(120)]);
+            let (cause, _) = crate::classify::categorize_failure(&msg);
+            self.fail(slug, cause, &msg);
+            return;
+        }
+        let vs = if fok && mok { compare_backends(&fbuilt, &mbuilt, &fam.shipped_fonts) } else { String::new() };
+        let bytes = if fok { fbytes } else { mbytes };
+        log_line(log_path, &format!("DONE both: fontc={} fontmake={} vs={}",
+            if fok { "ok" } else { "FAIL" }, if mok { "ok" } else { "FAIL" }, if vs.is_empty() { "-" } else { &vs }));
+        self.set_result(slug, |r| {
+            r.status = "built".into();
+            r.ended = now();
+            r.out_bytes = bytes;
+            r.compare = vs.clone();
+            r.note = String::new();
+        });
+        self.emit("built", slug, serde_json::json!({"backend":"both","bytes":bytes,"vs":vs}));
+    }
+
     /// Record a family's cohort assignment into the live cohort map (R2 — populates the cohorts view).
     fn note_cohort(&self, slug: &str, cohort: &str, req_text: &str) {
         let mut sh = self.shared.lock().unwrap();
@@ -461,6 +537,15 @@ impl Orchestrator {
         let order = self.backend_order();
         let builder = self.builder_name();
         let bver = self.builder_version(&builder, &python);
+
+        // --backend both (fontc_crater-style): build with BOTH compilers into separate dirs and
+        // compare their outputs. Branches away from the single-backend loop below.
+        if self.shared.lock().unwrap().backend == "both" {
+            self.build_both(slug, &fam, &work, &out_dir, &mirror, &python, &builder, &bver, &log_path);
+            cleanup(&work, self.cfg.keep_work);
+            return;
+        }
+
         let mut last_err = String::new();
         let mut fontc_err = String::new();
         let mut built_any = false;
@@ -1309,6 +1394,37 @@ fn collect_outputs(
 fn cleanup(work: &Path, keep: bool) {
     if !keep {
         let _ = std::fs::remove_dir_all(work);
+    }
+}
+
+/// Compare fontc vs fontmake outputs (--backend both): identical / differ / "" if no comparable pair.
+/// sha256-level (a table-tag diff is a future refinement — would need fontTools in the build python).
+fn compare_backends(
+    fontc: &BTreeMap<String, PathBuf>,
+    fontmake: &BTreeMap<String, PathBuf>,
+    shipped: &[String],
+) -> String {
+    let names: Vec<String> = if !shipped.is_empty() {
+        shipped.to_vec()
+    } else {
+        fontc.keys().filter(|k| fontmake.contains_key(*k)).cloned().collect()
+    };
+    let mut any = false;
+    let mut differ = false;
+    for n in &names {
+        if let (Some(a), Some(b)) = (fontc.get(n), fontmake.get(n)) {
+            any = true;
+            if sha256_file(a) != sha256_file(b) {
+                differ = true;
+            }
+        }
+    }
+    if !any {
+        String::new()
+    } else if differ {
+        "differ".into()
+    } else {
+        "identical".into()
     }
 }
 
