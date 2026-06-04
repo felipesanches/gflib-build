@@ -61,6 +61,14 @@ fn handle(mut stream: TcpStream, source: Arc<dyn Source>) -> std::io::Result<()>
             let body = read_log_tail(&source.build_dir(), &slug, n);
             respond(&mut stream, 200, "text/plain; charset=utf-8", body.as_bytes())
         }
+        ("GET", p) if p.starts_with("/api/fontspector") => {
+            // one family's full fontspector result: /api/fontspector?slug=ofl/foo
+            let slug = query_param(p, "slug").unwrap_or_default();
+            let path = crate::persist::fontspector_dir(&source.build_dir())
+                .join(format!("{}.json", slug.replace('/', "__")));
+            let body = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
+            respond(&mut stream, 200, "application/json", body.as_bytes())
+        }
         ("POST", "/api/control") => {
             // body may be partially read already; gather the rest up to content_len
             let body = read_body(&req, &mut stream, content_len);
@@ -239,7 +247,10 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  /* W4: filter box + export toolbar */
  .toolbar{margin:6px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
  #filter{background:var(--line);color:#fff;border:1px solid #334155;border-radius:4px;padding:2px 8px;font:inherit;width:240px}
- .tbtn{font-size:11px}
+ .tbtn{font-size:11px}.tbtn.on{background:#334155;color:#fff}
+ /* fontspector QA panel */
+ .fsbar{display:inline-flex;width:150px;height:11px;border-radius:3px;overflow:hidden;background:var(--line);vertical-align:middle;margin:0 8px}
+ .fsg{height:100%}.bval2{font-size:11px}.fsexp{padding:1px 0 6px 12px}
 </style></head><body>
 <div id="hdr"></div>
 <div id="bar"></div>
@@ -251,7 +262,10 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
 <script>
 let snap={}, tab='overview';
 // tab order MUST match the TUI's VIEWS
-const TABS=['config','overview','queue','cohorts','archive','built','failures','stats'];
+const TABS=['config','overview','queue','cohorts','archive','built','failures','stats','fontspector'];
+// fontspector status → colour class (FAIL/FATAL/ERROR red · WARN yellow · PASS green · SKIP/INFO grey)
+function fsCls(s){return {PASS:'g',WARN:'y',FAIL:'r',FATAL:'r',ERROR:'r'}[s]||'muted'}
+function fsColor(s){return {PASS:'#22c55e',WARN:'#eab308',FAIL:'#ef4444',FATAL:'#b91c1c',ERROR:'#ef4444',SKIP:'#475569',INFO:'#64748b'}[s]||'#475569'}
 const TASK_MARK={done:'✅',failed:'❌',running:'🔄',skipped:'➖',pending:'⏳'};
 const TASK_CLS={done:'g',failed:'r',running:'y',skipped:'muted',pending:'gr'};
 // the full CONFIG_SCHEMA (display order), mirroring the TUI
@@ -352,6 +366,40 @@ function archiveView(){const a=snap.archive||{};
  return h+g;
 }
 
+// ---- fontspector QA breakdown (panel A: families · panel B: checks-across-families) ----
+let fsTab='checks';
+function setFsTab(t){fsTab=t;render()}
+// a small stacked PASS/WARN/FAIL/SKIP bar for a counts object
+function fsBar(c){const o=['pass','warn','fail','fatal','error','skip','info'];const tot=o.reduce((a,k)=>a+(c[k]||0),0)||1;
+ const seg=(k,col)=>(c[k]||0)?'<span class="fsg" style="width:'+(100*(c[k]||0)/tot)+'%;background:'+col+'" title="'+k+' '+(c[k]||0)+'"></span>':'';
+ return '<span class="fsbar">'+seg('pass','#22c55e')+seg('info','#64748b')+seg('skip','#475569')+seg('warn','#eab308')+seg('fail','#ef4444')+seg('fatal','#b91c1c')+seg('error','#ef4444')+'</span>';}
+function fsCount(c){const f=(c.fail||0)+(c.fatal||0)+(c.error||0);return (f?'<span class="r">'+f+' fail</span> · ':'')+(c.warn?'<span class="y">'+c.warn+' warn</span> · ':'')+'<span class="g">'+(c.pass||0)+' pass</span>'+((c.skip||0)?' · <span class="muted">'+c.skip+' skip</span>':'');}
+function fsView(){const fs=snap.fontspector;
+ if(!fs)return '<div class="sec">fontspector QA</div><div class="ln muted">No QA results yet. Run a pass:  gflib-build --fontspector  (then refresh).</div>';
+ const t=fs.total||{},when=fs.ts?new Date(fs.ts*1000).toLocaleString():'';
+ // outcome donut over the grand totals
+ const sl=[{label:'pass',value:t.pass||0,color:'#22c55e'},{label:'warn',value:t.warn||0,color:'#eab308'},{label:'fail',value:(t.fail||0)+(t.fatal||0),color:'#ef4444'},{label:'error',value:t.error||0,color:'#b91c1c'},{label:'skip',value:t.skip||0,color:'#475569'},{label:'info',value:t.info||0,color:'#64748b'}];
+ let h='<div class="chartrow">'+chartCard(E(fs.version)+' · profile '+E(fs.profile)+' · '+fs.families_checked+' families · '+when,'<div class="dwrap">'+donut(sl,52)+legend(sl)+'</div>')+'</div>';
+ h+='<div class="toolbar"><button class="tbtn'+(fsTab=='checks'?' on':'')+'" onclick="setFsTab(\'checks\')">by check (across families)</button> '+
+   '<button class="tbtn'+(fsTab=='families'?' on':'')+'" onclick="setFsTab(\'families\')">by family</button></div>';
+ if(fsTab=='checks'){
+  const checks=filterList(fs.per_check||[],['id','title']);
+  h+='<div class="sec">Checks — most failures first ('+checks.length+')</div>';
+  h+=checks.map((c,i)=>'<div class="ln clk" onclick="toggleFsCheck('+i+')"><span class="w">'+E(L(c.id,40))+'</span> '+fsBar(c.counts)+' <span class="bval2">'+fsCount(c.counts)+'</span></div>'+
+    '<div id="fsck'+i+'" style="display:none" class="fsexp">'+
+     (c.fail_families&&c.fail_families.length?'<div class="ln r">  FAIL: '+c.fail_families.map(s=>fsFamLink(s)).join(', ')+'</div>':'')+
+     (c.warn_families&&c.warn_families.length?'<div class="ln y">  WARN: '+c.warn_families.map(s=>fsFamLink(s)).join(', ')+'</div>':'')+
+     '<div class="ln muted">  '+E(c.title)+'</div></div>').join('');
+ } else {
+  const fams=filterList(fs.per_family||[],['slug']);
+  h+='<div class="sec">Families — worst status first ('+fams.length+')</div>';
+  h+=fams.map(f=>'<div class="ln clk" onclick="openDetail(\'fsfamily\',\''+E(f.slug)+'\')"><span class="'+fsCls(f.worst)+'">'+E(L(f.slug,40))+'</span> '+fsBar(f.counts)+' <span class="bval2">'+fsCount(f.counts)+'</span></div>').join('');
+ }
+ return h;
+}
+function fsFamLink(slug){return '<span class="clk c" onclick="event.stopPropagation();openDetail(\'fsfamily\',\''+E(slug)+'\')">'+E(slug)+'</span>'}
+function toggleFsCheck(i){const e=document.getElementById('fsck'+i);if(e)e.style.display=e.style.display=='none'?'block':'none'}
+
 function showIf(k,cf){const s=x=>(cf[x]==null?'':''+cf[x]);
  if(k=='google_fonts')return s('source')=='metadata';
  if(k=='fontc_bin')return s('backend')!='fontmake';
@@ -412,7 +460,7 @@ function render(){
  //      the user is typing in the filter (the 1.5s poll would otherwise steal focus) ----
  const fEl=document.getElementById('filter');
  if(!(fEl&&document.activeElement===fEl)){
-  const listTab=['overview','queue','cohorts','built','failures'].includes(tab);
+  const listTab=['overview','queue','cohorts','built','failures','fontspector'].includes(tab);
   document.getElementById('ctl').innerHTML=
     '<button onclick="ctl({paused:true})"'+(snap.paused?' disabled':'')+'>pause</button> '+
     '<button onclick="ctl({paused:false})"'+(snap.paused?'':' disabled')+'>resume</button>'+
@@ -430,6 +478,7 @@ function render(){
  let body=charts(tab);
  if(tab=='config')body+=cfgView();
  else if(tab=='archive')body+=archiveView();
+ else if(tab=='fontspector')body+=fsView();
  else{body+=(tab=='stats'?statsPrefix():'')+sections(tab).map(renderSec).join('');}
  document.getElementById('body').innerHTML=body;
 }
@@ -526,8 +575,23 @@ function openDetail(kind,id){
   lines=['cause: '+h.cause,'provenance: '+prov(h),'rebuild: gflib-build --only '+h.slug+' --rebuild --yes','','error:','  '+(h.error||'')];
  } else if(kind=='task'){const t=findBy(snap.tasks,'key',id);if(!t)return;title='Pipeline task: '+t.name;
   lines=['status: '+t.status];if(t.total)lines.push('progress: '+t.done+'/'+t.total);if(t.elapsed)lines.push('elapsed: '+hms(t.elapsed));if(t.detail)lines.push('detail: '+t.detail);
+ } else if(kind=='fsfamily'){openFsFamily(id);return;
  } else return;
  showDetail(title,lines,slug);
+}
+// panel A detail: fetch a family's full fontspector result and list every check, worst-first
+function openFsFamily(slug){
+ const el=document.getElementById('detail');
+ el.innerHTML='<div class="dhead">QA: '+E(slug)+'<span class="dclose" onclick="closeDetail()">✕ close</span></div><div id="fsfd" class="muted">loading…</div>';
+ el.style.display='block';
+ fetch('/api/fontspector?slug='+encodeURIComponent(slug)).then(r=>r.json()).then(d=>{
+  const b=document.getElementById('fsfd');if(!b)return;
+  if(!d.checks){b.textContent='(no QA result for this family — run gflib-build --fontspector)';return;}
+  const ord={ERROR:6,FATAL:5,FAIL:4,WARN:3,INFO:2,PASS:1,SKIP:0};
+  const checks=d.checks.slice().sort((a,b)=>(ord[b.status]||0)-(ord[a.status]||0));
+  b.innerHTML='<div class="muted" style="margin:4px 0 8px">'+E(d.fontspector_version||'')+' · '+fsCount(d.counts||{})+'</div>'+
+   checks.map(c=>'<div class="ln"><span class="'+fsCls(c.status)+'">'+(''+c.status).padEnd(6)+'</span> <span class="gr">'+E(c.id)+'</span>  <span class="muted">'+E(c.title)+'</span></div>').join('');
+ }).catch(()=>{const b=document.getElementById('fsfd');if(b)b.textContent='(failed to load)'});
 }
 function showDetail(title,lines,slug){
  let h='<div class="dhead">'+E(title)+'<span class="dclose" onclick="closeDetail()">✕ close</span></div><pre class="dbody">'+lines.map(E).join('\n')+'</pre>';

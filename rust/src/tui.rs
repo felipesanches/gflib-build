@@ -18,10 +18,28 @@ use std::io::{Stdout, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-// Tab order MUST match the Python CursesFrontend.VIEWS tuple exactly (Tab/Shift-Tab cycle order).
-const TABS: [&str; 8] = [
-    "config", "overview", "queue", "cohorts", "archive", "built", "failures", "stats",
+// Tab order MUST match the web UI's TABS (a user switching between the terminal and the browser
+// sees the same tabs in the same order).
+const TABS: [&str; 9] = [
+    "config", "overview", "queue", "cohorts", "archive", "built", "failures", "stats", "fontspector",
 ];
+
+/// Colour for a fontspector status: FAIL/FATAL/ERROR red · WARN yellow · PASS green · else grey.
+fn fs_color(status: &str) -> Color {
+    match status {
+        "PASS" => Color::Green,
+        "WARN" => Color::Yellow,
+        "FAIL" | "FATAL" | "ERROR" => Color::Red,
+        _ => Color::DarkGrey,
+    }
+}
+
+/// Severity rank for sorting fontspector statuses worst-first.
+fn sev_rank(s: &str) -> u8 {
+    match s {
+        "SKIP" => 0, "PASS" => 1, "INFO" => 2, "WARN" => 3, "FAIL" => 4, "FATAL" => 5, "ERROR" => 6, _ => 1,
+    }
+}
 
 const SOURCE_CHOICES: [&str; 2] = ["metadata", "archive"];
 const BACKEND_CHOICES: [&str; 4] = ["auto", "fontc", "fontmake", "both"];
@@ -761,6 +779,42 @@ fn sections_for(snap: &Snapshot, tab: usize) -> Vec<SectionR> {
                 SectionR { title: "Operation timing".into(), dview: "stats", rows: orows, keys: ops.iter().map(|(k, _)| k.clone()).collect() },
             ]
         }
+        "fontspector" => match &snap.fontspector {
+            None => vec![SectionR {
+                title: "fontspector QA — no results yet (run: gflib-build --fontspector)".into(),
+                dview: "", rows: Vec::new(), keys: Vec::new(),
+            }],
+            Some(fs) => {
+                // panel B: a check across all families (most failures first)
+                let crows = fs.per_check.iter().map(|c| {
+                    let f = c.counts.fail + c.counts.fatal + c.counts.error;
+                    let sc = if f > 0 { Color::Red } else if c.counts.warn > 0 { Color::Yellow } else { Color::Green };
+                    vec![
+                        (format!("{:>4} fail {:>4} warn  ", f, c.counts.warn), sc),
+                        (head(&c.id, 48), Color::White),
+                    ]
+                }).collect();
+                // panel A: per family (worst status first)
+                let frows = fs.per_family.iter().map(|f| {
+                    let fc = f.counts.fail + f.counts.fatal + f.counts.error;
+                    vec![
+                        (format!("{:<6} ", f.worst), fs_color(&f.worst)),
+                        (format!("{:<42} ", head(&f.slug, 42)), Color::Grey),
+                        (format!("{} fail · {} warn · {} pass", fc, f.counts.warn, f.counts.pass), Color::DarkGrey),
+                    ]
+                }).collect();
+                vec![
+                    SectionR {
+                        title: format!("Checks — most failures first  [{} · profile {} · {} families]", fs.version, fs.profile, fs.families_checked),
+                        dview: "fscheck", rows: crows, keys: fs.per_check.iter().map(|c| c.id.clone()).collect(),
+                    },
+                    SectionR {
+                        title: "Families — worst status first".into(),
+                        dview: "fsfamily", rows: frows, keys: fs.per_family.iter().map(|f| f.slug.clone()).collect(),
+                    },
+                ]
+            }
+        },
         _ => Vec::new(),
     }
 }
@@ -1353,6 +1407,14 @@ fn focus_info(snap: &Snapshot, ui: &Ui) -> Vec<String> {
             ops.sort_by(|a, b| b.1.total.partial_cmp(&a.1.total).unwrap_or(std::cmp::Ordering::Equal));
             ops.get(sel).map(|(op, s)| vec![format!(" {}: total {:.1}s · n {} · mean {:.2}s · max {:.1}s", op, s.total, s.count, s.mean, s.max)]).unwrap_or_default()
         }
+        "fscheck" => snap.fontspector.as_ref().and_then(|fs| fs.per_check.get(sel)).map(|c| {
+            let f = c.counts.fail + c.counts.fatal + c.counts.error;
+            vec![format!(" {} — {}", c.id, c.title), format!("   {} fail · {} warn · {} pass · {} skip  (↵ for the affected families)", f, c.counts.warn, c.counts.pass, c.counts.skip)]
+        }).unwrap_or_default(),
+        "fsfamily" => snap.fontspector.as_ref().and_then(|fs| fs.per_family.get(sel)).map(|f| {
+            let fc = f.counts.fail + f.counts.fatal + f.counts.error;
+            vec![format!(" {}  [{}]", f.slug, f.worst), format!("   {} fail · {} warn · {} pass  (↵ for every check)", fc, f.counts.warn, f.counts.pass)]
+        }).unwrap_or_default(),
         _ => vec![],
     }
 }
@@ -1544,6 +1606,49 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, build_d
                 o.push(format!("Queued to mirror: {}", repo));
                 o.push(String::new());
                 o.push("This upstream repo is not yet in the archive; it will be cloned (append-only) when --mirror-missing is on.".into());
+            }
+        }
+        "fscheck" => {
+            if let Some(c) = snap.fontspector.as_ref().and_then(|fs| fs.per_check.get(sel)) {
+                let f = c.counts.fail + c.counts.fatal + c.counts.error;
+                o.push(format!("Check: {}", c.id));
+                o.push(format!("title: {}", c.title));
+                o.push(format!("results: {} fail · {} warn · {} pass · {} skip · {} info", f, c.counts.warn, c.counts.pass, c.counts.skip, c.counts.info));
+                o.push(String::new());
+                o.push("FAIL families:".into());
+                if c.fail_families.is_empty() { o.push("  (none)".into()); }
+                for s in &c.fail_families { o.push(format!("  {}", s)); }
+                o.push(String::new());
+                o.push("WARN families:".into());
+                if c.warn_families.is_empty() { o.push("  (none)".into()); }
+                for s in &c.warn_families { o.push(format!("  {}", s)); }
+            }
+        }
+        "fsfamily" => {
+            if let Some(fam) = snap.fontspector.as_ref().and_then(|fs| fs.per_family.get(sel)) {
+                o.push(format!("Family QA: {}", fam.slug));
+                // read the family's full result for the per-check list (severity-sorted)
+                let path = build_dir.join("fontspector").join(format!("{}.json", fam.slug.replace('/', "__")));
+                let parsed = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+                if let Some(v) = parsed {
+                    o.push(format!("fontspector: {}", v.get("fontspector_version").and_then(|x| x.as_str()).unwrap_or("?")));
+                    let fc = fam.counts.fail + fam.counts.fatal + fam.counts.error;
+                    o.push(format!("results: {} fail · {} warn · {} pass · {} skip", fc, fam.counts.warn, fam.counts.pass, fam.counts.skip));
+                    o.push(String::new());
+                    o.push("checks (worst first):".into());
+                    let mut checks: Vec<(&str, &str, &str)> = v.get("checks").and_then(|c| c.as_array()).into_iter().flatten()
+                        .map(|c| (
+                            c.get("status").and_then(|x| x.as_str()).unwrap_or(""),
+                            c.get("id").and_then(|x| x.as_str()).unwrap_or(""),
+                            c.get("title").and_then(|x| x.as_str()).unwrap_or(""),
+                        )).collect();
+                    checks.sort_by(|a, b| sev_rank(b.0).cmp(&sev_rank(a.0)).then(a.1.cmp(b.1)));
+                    for (st, id, title) in checks {
+                        o.push(format!("  {:<6} {}  —  {}", st, id, title));
+                    }
+                } else {
+                    o.push("(no stored result — run gflib-build --fontspector)".into());
+                }
             }
         }
         _ => {} // config (edits in place, no overlay), phase-timing (dview ""), etc: no detail
