@@ -54,6 +54,13 @@ fn handle(mut stream: TcpStream, source: Arc<dyn Source>) -> std::io::Result<()>
             let body = serde_json::to_vec(&snap).unwrap_or_else(|_| b"{}".to_vec());
             respond(&mut stream, 200, "application/json", &body)
         }
+        ("GET", p) if p.starts_with("/api/log") => {
+            // tail of a family's per-build log: /api/log?slug=ofl/foo&n=200
+            let slug = query_param(p, "slug").unwrap_or_default();
+            let n = query_param(p, "n").and_then(|s| s.parse::<usize>().ok()).unwrap_or(200).min(5000);
+            let body = read_log_tail(&source.build_dir(), &slug, n);
+            respond(&mut stream, 200, "text/plain; charset=utf-8", body.as_bytes())
+        }
         ("POST", "/api/control") => {
             // body may be partially read already; gather the rest up to content_len
             let body = read_body(&req, &mut stream, content_len);
@@ -92,6 +99,65 @@ fn apply_control(source: &Arc<dyn Source>, body: &str) -> bool {
     };
     source.control(&set);
     true
+}
+
+/// Extract a query-string parameter from a request path (`/api/log?slug=…&n=…`), URL-decoded.
+fn query_param(path: &str, key: &str) -> Option<String> {
+    let q = path.split('?').nth(1)?;
+    for kv in q.split('&') {
+        let mut it = kv.splitn(2, '=');
+        if it.next() == Some(key) {
+            return Some(urldecode(it.next().unwrap_or("")));
+        }
+    }
+    None
+}
+
+fn urldecode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                let h = |c: u8| (c as char).to_digit(16);
+                if let (Some(a), Some(c)) = (h(b[i + 1]), h(b[i + 2])) {
+                    out.push((a * 16 + c) as u8);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// Last `n` lines of a family's per-build log. `slug.replace('/', "__")` leaves no path separator, so
+/// the read can't escape `build_dir/logs/` (no traversal).
+fn read_log_tail(build_dir: &std::path::Path, slug: &str, n: usize) -> String {
+    if slug.is_empty() {
+        return "(no slug)".into();
+    }
+    let path = build_dir.join("logs").join(format!("{}.log", slug.replace('/', "__")));
+    match std::fs::read_to_string(&path) {
+        Ok(t) => {
+            let lines: Vec<&str> = t.lines().collect();
+            let start = lines.len().saturating_sub(n);
+            let tail = lines[start..].join("\n");
+            if tail.is_empty() { "(log is empty)".into() } else { tail }
+        }
+        Err(_) => "(no log yet)".into(),
+    }
 }
 
 fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> std::io::Result<()> {
@@ -161,6 +227,15 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  .legend{font-size:11px;color:var(--gr)}
  .legend span{display:inline-block;margin:2px 10px 0 0}
  .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:middle}
+ .clk{cursor:pointer}.clk:hover{background:#16202f}
+ /* detail panel + config form */
+ #detail{display:none;position:fixed;top:0;right:0;width:46%;max-width:780px;height:100%;overflow:auto;background:#0d121c;border-left:1px solid var(--line);box-shadow:-8px 0 24px rgba(0,0,0,.5);padding:12px 14px;z-index:50}
+ .dhead{color:#fff;font-weight:600;border-bottom:1px solid var(--line);padding-bottom:6px;margin-bottom:8px}
+ .dclose{float:right;cursor:pointer;color:var(--muted);font-weight:400}
+ .dbody{white-space:pre-wrap;word-break:break-word;font:inherit;margin:0;color:var(--gr)}
+ .dlog{margin-top:10px;border-top:1px solid var(--line);padding-top:8px}
+ .cfg input,.cfg select{background:var(--line);color:#fff;border:1px solid #334155;border-radius:4px;padding:1px 5px;font:inherit}
+ .cfg input[type=number]{width:74px}
 </style></head><body>
 <div id="hdr"></div>
 <div id="bar"></div>
@@ -168,6 +243,7 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
 <div class="ctl" id="ctl"></div>
 <div id="pin"></div>
 <div id="body"></div>
+<div id="detail"></div>
 <script>
 let snap={}, tab='overview';
 // tab order MUST match the TUI's VIEWS
@@ -202,33 +278,36 @@ function ctl(set){fetch('/api/control',{method:'POST',headers:{'Content-Type':'a
 function setTab(t){tab=t;location.hash=t;render()}
 async function poll(){try{snap=await (await fetch('/api/status')).json()}catch(e){}render()}
 
-// --- a row = array of [text, colour-class] segments; rt = optional retry slug ---
-function R(segs,rt){
- let h='<div class="ln">'+segs.map(s=>'<span class="'+s[1]+'">'+E(s[0])+'</span>').join('');
- if(rt) h+='<button class="rb" onclick="ctl({retry:[\''+E(rt)+'\']})" title="retry this family">↻ retry</button>';
+// --- a row = {segs:[[text,class]…], rt?:retry-slug, det?:[kind,id]}; det makes it click-to-detail ---
+let DET=[];
+function R(row){
+ let cls='ln',oc='';
+ if(row.det){DET.push(row.det);cls='ln clk';oc=' onclick="openDetailIdx('+(DET.length-1)+')"';}
+ let h='<div class="'+cls+'"'+oc+'>'+row.segs.map(s=>'<span class="'+s[1]+'">'+E(s[0])+'</span>').join('');
+ if(row.rt) h+='<button class="rb" onclick="event.stopPropagation();ctl({retry:[\''+E(row.rt)+'\']})" title="retry this family">↻ retry</button>';
  return h+'</div>';
 }
 function secHdr(title,n){return '<div class="sec">'+E(title)+' ('+n+')</div>'}
-function renderSec(s){return secHdr(s.title,s.rows.length)+(s.rows.length?s.rows.map(r=>R(r.segs,r.rt)).join(''):'<div class="ln muted">(none)</div>')}
+function renderSec(s){return secHdr(s.title,s.rows.length)+(s.rows.length?s.rows.map(R).join(''):'<div class="ln muted">(none)</div>')}
 
-// --- per-row builders (formats + colours match the TUI exactly) ---
+// --- per-row builders (formats + colours match the TUI exactly; det = click-to-detail) ---
 function taskRow(t){const m=TASK_MARK[t.status]||'?',cl=TASK_CLS[t.status]||'gr';
  const prog=t.total?(t.done+'/'+t.total):'',el=t.elapsed?hms(t.elapsed):'';
- return {segs:[[m+' '+L(t.name,26)+' '+L(prog,11)+Rp(el,8)+'  '+(t.detail||''),cl]]}}
-function failRow(f){return {segs:[[L(f.slug,34)+' ','r'],[f.error||'','dr']],rt:f.slug}}
-function qRow(q){const kc={retry:'y',rebuild:'c'}[q.kind]||'g';return {segs:[['  '+L(q.kind,8)+' ',kc],[q.slug||'','gr']],rt:q.slug}}
+ return {segs:[[m+' '+L(t.name,26)+' '+L(prog,11)+Rp(el,8)+'  '+(t.detail||''),cl]],det:['task',t.key]}}
+function failRow(f){return {segs:[[L(f.slug,34)+' ','r'],[f.error||'','dr']],rt:f.slug,det:['failed',f.slug]}}
+function qRow(q){const kc={retry:'y',rebuild:'c'}[q.kind]||'g';return {segs:[['  '+L(q.kind,8)+' ',kc],[q.slug||'','gr']],rt:q.slug,det:['queue',q.slug]}}
 // cohort member colour by build status: built=green, failed=red, building=yellow, else grey
 function famCls(st){return {built:'g',failed:'r',building:'y'}[st]||'muted'}
 function cohortRow(c){const segs=[[c.cached?'● ':'○ ',c.cached?'g':'muted'],[Rp(c.count,4)+'  '+L(c.key,14)+' ',c.key=='base'?'w':'c']];
  const f=c.families||[];if(!f.length)segs.push(['(no families yet)','muted']);else f.forEach((m,i)=>{if(i)segs.push([' | ','c']);segs.push([m.name,famCls(m.status)])});
- return {segs,coh:c.key}}
+ return {segs,det:['cohort',c.key]}}
 function builtRow(b){const comp=b.compiler_version||b.backend||'';
- return {segs:[[L(b.slug,32)+' ','g'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9)+'  '+(b.compare||''),'gr']],rt:b.slug}}
-function failcatRow(c){return {segs:[[Rp(c.count,4)+'  ','w'],[L(c.cat,24),'c'],[' '+(c.hint||''),'muted']]}}
-function histRow(h){return {segs:[[L(h.cause,20)+' ','y'],[h.slug||'','gr']],rt:h.slug}}
+ return {segs:[[L(b.slug,32)+' ','g'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9)+'  '+(b.compare||''),'gr']],rt:b.slug,det:['built',b.slug]}}
+function failcatRow(c){return {segs:[[Rp(c.count,4)+'  ','w'],[L(c.cat,24),'c'],[' '+(c.hint||''),'muted']],det:['failcat',c.cat]}}
+function histRow(h){return {segs:[[L(h.cause,20)+' ','y'],[h.slug||'','gr']],rt:h.slug,det:['history',h.slug]}}
 function phaseRow(kv){return {segs:[[L(kv[0],12)+' '+hms(kv[1]),'gr']]}}
 function opRow(kv){const s=kv[1];return {segs:[[L(kv[0],10)+' total '+Rp((s.total||0).toFixed(1),9)+'  n '+Rp(s.count||0,5)+'  mean '+Rp((s.mean||0).toFixed(2),7)+'  max '+Rp((s.max||0).toFixed(1),7),'c']]}}
-function buildingRow(b){const note=b.note||b.backend||'';return {segs:[['w'+Rp(b.worker,2)+' '+L(b.slug,34)+' '+Rp(hms(b.dur),8)+'  '+note,'y']]}}
+function buildingRow(b){const note=b.note||b.backend||'';return {segs:[['w'+Rp(b.worker,2)+' '+L(b.slug,34)+' '+Rp(hms(b.dur),8)+'  '+note,'y']],det:['building',b.slug]}}
 
 function sections(t){
  if(t=='overview')return [{title:'Pipeline',rows:(snap.tasks||[]).map(taskRow)},{title:'Recent failures',rows:(snap.failures_recent||[]).map(failRow)}];
@@ -276,16 +355,25 @@ function showIf(k,cf){const s=x=>(cf[x]==null?'':''+cf[x]);
  if(k=='compare')return s('source')=='metadata';
  return true}
 const CHOICES={source:['metadata','archive'],backend:['auto','fontc','fontmake','both']};
+// the keys the daemon actually honours live (same set as the TUI's cfg_apply_live) → editable form controls
+const LIVE_APPLY={backend:1,jobs:1,percent:1,compare:1};
 function cfgView(){const cf=snap.config||{};
  let h='<div class="sec">Configuration — edit settings (live where possible)</div><table class="cfg">';
  SCHEMA.filter(f=>showIf(f.k,cf)).forEach(f=>{
-  let v=cf[f.k],val;
-  if(f.t=='bool')val=v?'[x] yes':'[ ] no';
-  else if(f.t=='choice'){const ch=CHOICES[f.k]||[];val='‹ '+(ch.includes(v)?v:(ch[0]||''))+' ›';}
-  else val=(v==null?(f.k=='timeout'?'0':''):''+v);
-  // read-only display: non-live fields are tagged (restart: C); live fields show no tag (no edits yet)
-  const tag=(!f.live)?'<span class="muted">  (restart: C)</span>':'';
-  h+='<tr><td class="w">'+E(f.l)+'</td><td class="'+(f.live?'y':'muted')+'">'+E(val)+tag+'</td></tr>';
+  let v=cf[f.k],cell;
+  if(LIVE_APPLY[f.k]){
+   // an editable form control that posts the change straight to control.json
+   if(f.t=='choice'){const ch=CHOICES[f.k]||[];cell='<select onchange="ctl({'+f.k+':this.value})">'+ch.map(o=>'<option'+(o==v?' selected':'')+'>'+E(o)+'</option>').join('')+'</select>';}
+   else if(f.t=='bool')cell='<input type="checkbox"'+(v?' checked':'')+' onchange="ctl({'+f.k+':this.checked})">';
+   else cell='<input type="number"'+(f.k=='percent'?' min="1" max="100"':' min="1"')+' value="'+E(v==null?'':v)+'" onchange="ctl({'+f.k+':+this.value})"> <span class="muted">(live)</span>';
+  } else {
+   let val;
+   if(f.t=='bool')val=v?'[x] yes':'[ ] no';
+   else if(f.t=='choice'){const ch=CHOICES[f.k]||[];val='‹ '+(ch.includes(v)?v:(ch[0]||''))+' ›';}
+   else val=(v==null?(f.k=='timeout'?'0':''):''+v);
+   cell='<span class="muted">'+E(val)+'  (restart: C)</span>';
+  }
+  h+='<tr><td class="w">'+E(f.l)+'</td><td>'+cell+'</td></tr>';
  });
  h+='</table>';
  const dr=snap.dep_relaxations||[];
@@ -298,6 +386,7 @@ function cfgView(){const cf=snap.config||{};
 function render(){
  const c=snap.counts||{};
  const pre=snap.pre_build;
+ DET=[]; // reset the click-to-detail index map for this frame
  // ---- header (rows 0/1) ----
  let hdr='<div class="t"> Google Fonts library build'+(snap.paused?' [PAUSED]':'')+
    (pre?'<span class="right muted">first-time setup</span>':'<span class="right w">elapsed '+hms(snap.elapsed)+'</span>')+'</div>';
@@ -323,7 +412,7 @@ function render(){
  // ---- pinned now-building (every tab) ----
  const bl=snap.building||[];let pin='';
  if(bl.length&&!pre){const cap=Math.min(bl.length,5);
-  pin='<div class="pin"><div class="sec">▶ Now building ('+bl.length+')</div>'+bl.slice(0,cap).map(b=>R(buildingRow(b).segs)).join('')+
+  pin='<div class="pin"><div class="sec">▶ Now building ('+bl.length+')</div>'+bl.slice(0,cap).map(b=>R(buildingRow(b))).join('')+
    (bl.length>cap?'<div class="ln muted">  … (+'+(bl.length-cap)+' more)</div>':'')+'</div>';}
  document.getElementById('pin').innerHTML=pin;
  // ---- body per tab: charts (web-only) first, then the same content as the TUI ----
@@ -355,6 +444,43 @@ function barHTML(){const c=snap.counts||{},ph=snap.phase;
   '<div class="barlbl">'+done+'/'+inscope+' attempted ('+pct+'%)'+skip+'</div></div>';
 }
 function phaseLabel(ph){return {init:'starting…',clone_gf:'cloning google/fonts',build_fontc:'building fontc from source',discover:'discovering worklist',archive:'populating archive (mirroring repos)',cohorts:'scanning dependency cohorts',build:'building',done:'done'}[ph]||ph||''}
+
+// ---- click-to-detail panel (mirrors the TUI build_detail; log tail via /api/log) ----
+function findBy(arr,k,v){return (arr||[]).find(x=>x[k]==v)}
+function openDetailIdx(n){const d=DET[n];if(d)openDetail(d[0],d[1])}
+function openDetail(kind,id){
+ let lines=[],slug=null,title='';
+ if(kind=='cohort'){const c=findBy(snap.cohorts,'key',id);if(!c)return;title='Cohort: '+c.key;
+  const ty=s=>c.families.filter(f=>f.status==s).length;
+  lines=['families: '+c.count,'status: '+ty('built')+' built · '+ty('failed')+' failed · '+ty('building')+' building · '+(c.families.length-ty('built')-ty('failed')-ty('building'))+' queued','','family names (with build status):'];
+  (c.families.length?c.families:[{name:'(none assigned yet)',status:''}]).forEach(f=>lines.push('  '+f.name+(f.status?' ['+f.status+']':'')));
+  lines.push('','requirements:');(c.requirements?c.requirements.split('\n'):['(none — the base cohort has no requirements file)']).forEach(r=>lines.push('  '+r));
+ } else if(kind=='built'){const b=findBy(snap.built_recent,'slug',id);if(!b)return;slug=id;title='Built: '+b.slug;
+  lines=['backend: '+(b.backend||'?'),'output size: '+human(b.bytes),'vs shipped: '+(b.compare||'(not compared)'),'provenance: '+prov(b),'rebuild: gflib-build --only '+b.slug+' --rebuild --yes'];
+ } else if(kind=='failed'){const f=findBy(snap.failures_recent,'slug',id);if(!f)return;slug=id;title='Failed: '+f.slug;
+  lines=['provenance: '+prov(f),'rebuild: gflib-build --only '+f.slug+' --rebuild --yes','','error:','  '+(f.error||'')];
+ } else if(kind=='building'){const b=findBy(snap.building,'slug',id);if(!b)return;slug=id;title='Building: '+b.slug;
+  lines=['worker: '+b.worker,'elapsed: '+hms(b.dur),'step: '+(b.note||b.backend||'(starting)')];
+ } else if(kind=='queue'){const q=findBy(snap.queued_list,'slug',id);if(!q)return;title='Queued family: '+q.slug;
+  const why={retry:'Re-attempt after a previous build FAILURE (its cause may now be fixable).',rebuild:'Rebuild of a family that already built successfully (forced by --rebuild or [R]).'}[q.kind]||'A fresh target — this family has never been built.';
+  lines=['kind: '+q.kind,'',why];
+ } else if(kind=='failcat'){const c=findBy(snap.fail_categories,'cat',id);if(!c)return;title='Failure cause: '+c.cat;
+  lines=['families affected: '+c.count,'','affected families:'];(c.families&&c.families.length?c.families:['(none)']).forEach(s=>lines.push('  '+s));lines.push('','what to do:','  '+(c.hint||''));
+ } else if(kind=='history'){const h=findBy(snap.failure_history,'slug',id);if(!h)return;slug=id;title='Failed (history): '+h.slug;
+  lines=['cause: '+h.cause,'provenance: '+prov(h),'rebuild: gflib-build --only '+h.slug+' --rebuild --yes','','error:','  '+(h.error||'')];
+ } else if(kind=='task'){const t=findBy(snap.tasks,'key',id);if(!t)return;title='Pipeline task: '+t.name;
+  lines=['status: '+t.status];if(t.total)lines.push('progress: '+t.done+'/'+t.total);if(t.elapsed)lines.push('elapsed: '+hms(t.elapsed));if(t.detail)lines.push('detail: '+t.detail);
+ } else return;
+ showDetail(title,lines,slug);
+}
+function showDetail(title,lines,slug){
+ let h='<div class="dhead">'+E(title)+'<span class="dclose" onclick="closeDetail()">✕ close</span></div><pre class="dbody">'+lines.map(E).join('\n')+'</pre>';
+ if(slug)h+='<div class="dlog"><div class="muted">log tail (last 200 lines):</div><pre id="dlogbody" class="dbody muted">loading…</pre></div>';
+ const el=document.getElementById('detail');el.innerHTML=h;el.style.display='block';
+ if(slug)fetch('/api/log?slug='+encodeURIComponent(slug)+'&n=200').then(r=>r.text()).then(t=>{const b=document.getElementById('dlogbody');if(b)b.textContent=t}).catch(()=>{});
+}
+function closeDetail(){const el=document.getElementById('detail');el.style.display='none';el.innerHTML=''}
+addEventListener('keydown',e=>{if(e.key=='Escape')closeDetail()});
 
 // ---- charts: hand-rolled, dependency-free (CSS-div bars + inline-SVG donuts/rings) ----
 function chartCard(title,inner){return '<div class="chart"><div class="ctitle">'+E(title)+'</div>'+inner+'</div>'}
