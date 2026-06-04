@@ -3424,11 +3424,17 @@ class CursesFrontend(Frontend):
                 pending = av.get("pending", [])
                 added = [e["repo"] for e in recent if e.get("status") == "added"]
                 failed = [e for e in recent if e.get("status") == "failed"]
+                atask = next((t for t in snap.get("tasks", []) if t.get("key") == "archive"), None)
+                arunning = bool(atask and atask.get("status") == "running")
                 put(row, 0, f" Archive — {av.get('total', 0)} repos mirrored on disk ".ljust(w - 1, "-"),
                     curses.A_BOLD); row += 1
                 put(row, 1, f"{len(active)} cloning now   ·   {len(added)} archived in the last 30 min"
                             f"   ·   {av.get('pending_total', 0)} queued   ·   {len(failed)} unreachable",
                     CYAN); row += 1
+                if arunning:                          # the pre-warmer's overall progress this run
+                    put(row, 1, f"mirroring worklist: {atask.get('done', 0)}/{atask.get('total', 0)} "
+                                f"processed  ·  {atask.get('detail', '')}", YEL)
+                row += 1
                 for lx, txt, col in ((1, "● cloning now", YEL), (16, "● recently archived", GREEN),
                                      (38, "● queued next", CYAN)):
                     put(row, lx, txt, col)
@@ -3445,7 +3451,11 @@ class CursesFrontend(Frontend):
                 items = ([(s, YEL) for s in active] + [(s, GREEN) for s in added]
                          + [(s, CYAN) for s in pending])
                 if not items:
-                    put(row, 1, "(archive idle — nothing queued or recently mirrored)", curses.A_DIM)
+                    if arunning:                      # task is mirroring but the live queue is absent
+                        put(row, 1, "mirroring in progress — the live queue/grid appears once you "
+                                    "(re)start the build with this version", curses.A_DIM)
+                    else:
+                        put(row, 1, "(archive idle — nothing queued or recently mirrored)", curses.A_DIM)
                 else:
                     colw = min(38, max(14, max(len(s) for s, _ in items) + 2))
                     cols = max(1, (w - 2) // colw)
@@ -3592,13 +3602,16 @@ const TAB_RENDER={
   return h},
  archive:()=>{const av=snap.archive||{},rec=av.recent||[];
   const added=rec.filter(e=>e.status==='added'),failed=rec.filter(e=>e.status==='failed');
+  const at=(snap.tasks||[]).find(t=>t.key==='archive'),ar=at&&at.status==='running';
   const cell=(s,cls)=>'<span class="acell '+cls+'">'+E(s)+'</span>';
   let grid=(av.active||[]).map(s=>cell(s,'y')).join('')+added.map(e=>cell(e.repo,'g')).join('')+(av.pending||[]).map(s=>cell(s,'c')).join('');
+  let idle=ar?'<span class="d">mirroring in progress — the live queue/grid appears once you (re)start the build with this version</span>':'<span class="d">(archive idle — nothing queued or recently mirrored)</span>';
   let fail=failed.length?'<div class="card"><h3 class="r">Unreachable (recent)</h3><div class="body">'+failed.map(e=>'<div class="row r">✗ '+E(e.repo)+' &nbsp;—&nbsp; <span class="d">'+E(e.reason||'')+'</span></div>').join('')+'</div></div>':'';
   return '<div class="card"><h3>Archive — '+(av.total||0)+' repos mirrored on disk</h3><div class="body">'+
    '<div class="row d">'+((av.active||[]).length)+' cloning now &nbsp;·&nbsp; '+added.length+' archived in the last 30 min &nbsp;·&nbsp; '+(av.pending_total||0)+' queued &nbsp;·&nbsp; '+failed.length+' unreachable</div>'+
+   (ar?'<div class="row y">mirroring worklist: '+(at.done||0)+'/'+(at.total||0)+' processed · '+E(at.detail||'')+'</div>':'')+
    '<div class="row"><span class="y">● cloning now</span> &nbsp; <span class="g">● recently archived</span> &nbsp; <span class="c">● queued next</span></div>'+
-   '<div class="agrid">'+(grid||'<span class="d">(archive idle — nothing queued or recently mirrored)</span>')+'</div></div></div>'+fail},
+   '<div class="agrid">'+(grid||idle)+'</div></div></div>'+fail},
  queue:()=>{const q=snap.queued_list||[];const bc={new:'bg-new',retry:'bg-retry',rebuild:'bg-rebuild'};
   return card('Queued — priority order ('+(snap.counts.queued||0)+(q.length<(snap.counts.queued||0)?', showing '+q.length:'')+')',
    rows(q,x=>frow(x.slug,'<span class="badge '+(bc[x.kind]||'')+'">'+E(x.kind)+'</span><span class="s">'+E(x.slug)+'</span>')))},
