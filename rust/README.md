@@ -112,8 +112,10 @@ and failure; `--list` / `--attach` / `--stop` / `--reset`.
 - **True detach/daemonize.** A live build runs in the foreground; quitting the TUI stops it (the
   Python tool double-forks a lingering daemon). Monitoring an *external* daemon already works via
   `--attach`. The pidfile/`--stop` plumbing is in place for when daemonize lands.
-- **Config tab editing.** The TUI config tab is read-only here; change settings via CLI flags or
-  the web/`control.json` channel.
+- **Config tab editing & setup wizard.** ✅ ported: the TUI config tab is a full CONFIG_SCHEMA
+  editor (14 fields, show_if visibility, live-apply via `control.json`), and `--setup`/`--wizard`
+  (or a missing google/fonts clone) opens it pre-build as the first-run wizard, launching on
+  ▶ Start build.
 - **`--compare`, `--cohorts-report`, `--retry-category` UI**, self-healing dependency relaxation,
   longest-first scheduling: partial or pending.
 
