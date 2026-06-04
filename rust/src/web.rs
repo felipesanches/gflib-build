@@ -236,6 +236,10 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  .dlog{margin-top:10px;border-top:1px solid var(--line);padding-top:8px}
  .cfg input,.cfg select{background:var(--line);color:#fff;border:1px solid #334155;border-radius:4px;padding:1px 5px;font:inherit}
  .cfg input[type=number]{width:74px}
+ /* W4: filter box + export toolbar */
+ .toolbar{margin:6px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+ #filter{background:var(--line);color:#fff;border:1px solid #334155;border-radius:4px;padding:2px 8px;font:inherit;width:240px}
+ .tbtn{font-size:11px}
 </style></head><body>
 <div id="hdr"></div>
 <div id="bar"></div>
@@ -276,7 +280,7 @@ function trunc(s,n){s=(s==null?'':''+s);return s.length>n?s.slice(0,n-1)+'…':s
 function prov(x){const c=x.compiler_version||x.backend||'';return c+(x.builder_version?' · '+x.builder_version:'')}
 function ctl(set){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({set:set})})}
 function setTab(t){tab=t;location.hash=t;render()}
-async function poll(){try{snap=await (await fetch('/api/status')).json()}catch(e){}render()}
+async function poll(){try{snap=await (await fetch('/api/status')).json()}catch(e){}sample();render()}
 
 // --- a row = {segs:[[text,class]…], rt?:retry-slug, det?:[kind,id]}; det makes it click-to-detail ---
 let DET=[];
@@ -310,13 +314,13 @@ function opRow(kv){const s=kv[1];return {segs:[[L(kv[0],10)+' total '+Rp((s.tota
 function buildingRow(b){const note=b.note||b.backend||'';return {segs:[['w'+Rp(b.worker,2)+' '+L(b.slug,34)+' '+Rp(hms(b.dur),8)+'  '+note,'y']],det:['building',b.slug]}}
 
 function sections(t){
- if(t=='overview')return [{title:'Pipeline',rows:(snap.tasks||[]).map(taskRow)},{title:'Recent failures',rows:(snap.failures_recent||[]).map(failRow)}];
- if(t=='queue')return [{title:'Queued — priority order (variable + larger families first)',rows:(snap.queued_list||[]).map(qRow)}];
- if(t=='cohorts')return [{title:'Dependency cohorts  (● = venv cached on disk, reused next run)',rows:(snap.cohorts||[]).map(cohortRow)}];
- if(t=='built')return [{title:'Built — successes  (slug · compiler+version · size · vs-shipped)',rows:(snap.built_recent||[]).map(builtRow)}];
- if(t=='failures'){const s=[];if((snap.fail_categories||[]).length)s.push({title:'Failures by cause',rows:snap.fail_categories.map(failcatRow)});
-  s.push({title:'Failures — newest first (current)',rows:(snap.failures_recent||[]).map(failRow)});
-  if((snap.failure_history||[]).length)s.push({title:'Failure history (persistent — survives restarts & re-attempts)',rows:snap.failure_history.map(histRow)});return s}
+ if(t=='overview')return [{title:'Pipeline',rows:(snap.tasks||[]).map(taskRow)},{title:'Recent failures',rows:filterList(snap.failures_recent,['slug','error']).map(failRow)}];
+ if(t=='queue')return [{title:'Queued — priority order (variable + larger families first)',rows:filterList(snap.queued_list,['slug','kind']).map(qRow)}];
+ if(t=='cohorts')return [{title:'Dependency cohorts  (● = venv cached on disk, reused next run)',rows:filterList(snap.cohorts,['key']).map(cohortRow)}];
+ if(t=='built')return [{title:'Built — successes  (slug · compiler+version · size · vs-shipped)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(builtRow)}];
+ if(t=='failures'){const s=[];if((snap.fail_categories||[]).length)s.push({title:'Failures by cause',rows:filterList(snap.fail_categories,['cat','hint']).map(failcatRow)});
+  s.push({title:'Failures — newest first (current)',rows:filterList(snap.failures_recent,['slug','error']).map(failRow)});
+  if((snap.failure_history||[]).length)s.push({title:'Failure history (persistent — survives restarts & re-attempts)',rows:filterList(snap.failure_history,['slug','cause','error']).map(histRow)});return s}
  if(t=='stats'){const ph=Object.entries(snap.phase_durations||{}).sort((a,b)=>b[1]-a[1]);
   const ops=Object.entries(snap.op_stats||{}).sort((a,b)=>(b[1].total||0)-(a[1].total||0));
   return [{title:'Phase timing',rows:ph.map(phaseRow)},{title:'Operation timing',rows:ops.map(opRow)}]}
@@ -404,11 +408,18 @@ function render(){
  // ---- tabs (row 4) ----
  document.getElementById('tabs').innerHTML=TABS.map(t=>'<span class="tab'+(t==tab?' on':'')+'" onclick="setTab(\''+t+'\')">'+t+'</span>').join('')+
    '<span class="tabhint">click a tab to switch · polling every 1.5s</span>';
- // ---- controls ----
- document.getElementById('ctl').innerHTML=
-   '<button onclick="ctl({paused:true})"'+(snap.paused?' disabled':'')+'>pause</button> '+
-   '<button onclick="ctl({paused:false})"'+(snap.paused?'':' disabled')+'>resume</button>'+
-   '<span class="muted"> &nbsp; hover a family row for a ↻ retry button · live edits go to control.json</span>';
+ // ---- controls + W4 toolbar (filter on list tabs, export everywhere). Don't rebuild the bar while
+ //      the user is typing in the filter (the 1.5s poll would otherwise steal focus) ----
+ const fEl=document.getElementById('filter');
+ if(!(fEl&&document.activeElement===fEl)){
+  const listTab=['overview','queue','cohorts','built','failures'].includes(tab);
+  document.getElementById('ctl').innerHTML=
+    '<button onclick="ctl({paused:true})"'+(snap.paused?' disabled':'')+'>pause</button> '+
+    '<button onclick="ctl({paused:false})"'+(snap.paused?'':' disabled')+'>resume</button>'+
+    (listTab?' <input id="filter" placeholder="filter… (slug / cause)" oninput="setFilter(this.value)" value="'+E(FILTER)+'">':'')+
+    ' <button class="tbtn" onclick="exportJSON()">⬇ JSON</button> <button class="tbtn" onclick="exportCSV()">⬇ CSV (built+failed)</button>'+
+    '<span class="muted"> &nbsp; hover a row for ↻ retry · click a row for details</span>';
+ }
  // ---- pinned now-building (every tab) ----
  const bl=snap.building||[];let pin='';
  if(bl.length&&!pre){const cap=Math.min(bl.length,5);
@@ -444,6 +455,51 @@ function barHTML(){const c=snap.counts||{},ph=snap.phase;
   '<div class="barlbl">'+done+'/'+inscope+' attempted ('+pct+'%)'+skip+'</div></div>';
 }
 function phaseLabel(ph){return {init:'starting…',clone_gf:'cloning google/fonts',build_fontc:'building fontc from source',discover:'discovering worklist',archive:'populating archive (mirroring repos)',cohorts:'scanning dependency cohorts',build:'building',done:'done'}[ph]||ph||''}
+
+// ---- W4: client-side timeseries (accumulated while the page is open; resets on reload) ----
+let HIST=[];
+function sample(){const c=snap.counts||{};const disk=(snap.disk_build_total||0)+(snap.disk_archive_total||0);
+ const s={t:snap.elapsed||0,built:c.built||0,failed:c.failed||0,queued:c.queued||0,building:c.building||0,disk:disk};
+ const last=HIST[HIST.length-1];
+ if(!last||last.t!=s.t||last.built!=s.built||last.failed!=s.failed||last.disk!=s.disk)HIST.push(s);
+ if(HIST.length>800)HIST.shift();
+}
+function lineChart(series,W,H){
+ const all=series.reduce((a,s)=>a.concat(s.pts),[]);
+ if(all.length<2)return '<div class="muted">(collecting samples…)</div>';
+ const xs=all.map(p=>p[0]),ys=all.map(p=>p[1]);
+ const xmin=Math.min.apply(null,xs),xmax=Math.max.apply(null,xs),ymax=Math.max.apply(null,ys.concat([1]));
+ const pad=4,iw=W-2*pad,ih=H-2*pad;
+ const sx=x=>pad+(xmax==xmin?0:(x-xmin)/(xmax-xmin)*iw);
+ const sy=y=>pad+ih-y/ymax*ih;
+ let svg='<svg width="100%" height="'+H+'" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" style="background:#0e1420;border-radius:4px">';
+ series.forEach(s=>{if(s.pts.length<2)return;const d=s.pts.map((p,i)=>(i?'L':'M')+sx(p[0]).toFixed(1)+' '+sy(p[1]).toFixed(1)).join(' ');
+  svg+='<path d="'+d+'" fill="none" stroke="'+s.color+'" stroke-width="1.5"/>';});
+ return svg+'</svg>';
+}
+function trends(){
+ if(HIST.length<2)return chartCard('trends (over time)','<div class="muted">(collecting samples — charts appear as the build runs)</div>');
+ const prog=lineChart([{pts:HIST.map(s=>[s.t,s.built]),color:'#22c55e'},{pts:HIST.map(s=>[s.t,s.failed]),color:'#ef4444'}],400,70);
+ const disk=lineChart([{pts:HIST.map(s=>[s.t,s.disk]),color:'#06b6d4'}],400,70);
+ // throughput: built per minute over the recent window
+ const a=HIST[Math.max(0,HIST.length-40)],b=HIST[HIST.length-1],dt=(b.t-a.t)/60,tp=dt>0?((b.built-a.built)/dt).toFixed(1):'0.0';
+ const last=HIST[HIST.length-1];
+ return chartCard('build progress over time (green=built · red=failed)',prog+'<div class="legend">throughput ~'+tp+' built/min · '+last.built+' built · '+last.failed+' failed</div>')+
+  chartCard('disk usage over time',disk+'<div class="legend">'+human(last.disk)+' total</div>');
+}
+
+// ---- W4: filter + export ----
+let FILTER='';
+function filterList(arr,keys){if(!FILTER)return arr;const q=FILTER.toLowerCase();
+ return (arr||[]).filter(o=>keys.some(k=>(''+(o[k]==null?'':o[k])).toLowerCase().includes(q)))}
+function setFilter(v){FILTER=v;render()}
+function dl(name,type,data){const b=new Blob([data],{type:type}),u=URL.createObjectURL(b),a=document.createElement('a');a.href=u;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(u),1000)}
+function exportJSON(){dl('gflib-status.json','application/json',JSON.stringify(snap,null,1))}
+function exportCSV(){const rows=[['slug','outcome','backend','compiler','bytes','compare','error']];
+ (snap.built_recent||[]).forEach(b=>rows.push([b.slug,'built',b.backend||'',b.compiler_version||'',b.bytes||'',b.compare||'','']));
+ (snap.failures_recent||[]).forEach(f=>rows.push([f.slug,'failed',f.backend||'',f.compiler_version||'','','',(f.error||'').replace(/[\r\n]+/g,' ')]));
+ const csv=rows.map(r=>r.map(c=>'"'+(''+c).replace(/"/g,'""')+'"').join(',')).join('\n');
+ dl('gflib-built-failed.csv','text/csv',csv)}
 
 // ---- click-to-detail panel (mirrors the TUI build_detail; log tail via /api/log) ----
 function findBy(arr,k,v){return (arr||[]).find(x=>x[k]==v)}
@@ -513,7 +569,8 @@ function charts(t){
  if(t=='overview'){
   const sl=[{label:'built',value:c.built||0,color:'#22c55e'},{label:'failed',value:c.failed||0,color:'#ef4444'},{label:'building',value:c.building||0,color:'#06b6d4'},{label:'queued',value:c.queued||0,color:'#eab308'},{label:'skipped',value:c.skipped||0,color:'#475569'}];
   const fc=(snap.fail_categories||[]).slice().sort((a,b)=>b.count-a.count).slice(0,6).map(x=>({label:x.cat,value:x.count,color:'#ef4444'}));
-  return '<div class="chartrow">'+chartCard('outcome','<div class="dwrap">'+donut(sl,52)+legend(sl)+'</div>')+chartCard('top failure causes',barChart(fc))+'</div>';
+  return '<div class="chartrow">'+chartCard('outcome','<div class="dwrap">'+donut(sl,52)+legend(sl)+'</div>')+chartCard('top failure causes',barChart(fc))+'</div>'+
+   '<div class="chartrow">'+trends()+'</div>';
  }
  if(t=='failures'){
   const fc=(snap.fail_categories||[]).slice().sort((a,b)=>b.count-a.count).map(x=>({label:x.cat,value:x.count,color:'#ef4444'}));
