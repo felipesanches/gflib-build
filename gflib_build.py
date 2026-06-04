@@ -100,6 +100,8 @@ class Result:
     retries: int = 0                 # in-build auto-retries spent on a transient failure
     queued_kind: str = ""            # why it's queued: new | retry | rebuild (for the Queue tab)
     compiler_version: str = ""       # M0 provenance: exact version of the compiler that ran/attempted
+    builder: str = ""                # M0: orchestrator — builder2 (gftools.builder) | builder3 (Rust)
+    builder_version: str = ""        # M0: exact version of the build orchestrator that ran/attempted
     error: str = ""
     log: str = ""
     out_bytes: int = 0
@@ -534,6 +536,38 @@ def compiler_version_str(backend: str, python: str, fontc_bin: "Optional[str]") 
     except Exception:
         pass
     return backend
+
+
+def builder_version_str(builder: str, python: str, builder3_bin: "Optional[str]" = None) -> str:
+    """Best-effort EXACT version of the build ORCHESTRATOR — a separate axis from the compiler (M0).
+    Today every build (fontc OR fontmake) runs through the Python `gftools.builder` ("builder2"), so
+    we record the `gftools` package version that drove it — real reproducibility provenance, since the
+    orchestrator's instancing/fixing/packaging affects the output. `gftools-builder3` (the future
+    Rust-native orchestrator) reports its binary `--version` plus the source commit when built from a
+    git checkout, exactly like fontc. Cheap + cached by the caller; never raises."""
+    try:
+        if builder == "builder3" and builder3_bin:
+            r = subprocess.run([builder3_bin, "--version"], capture_output=True, text=True, timeout=30)
+            txt = ((r.stdout or "") + (r.stderr or "")).strip()
+            ver = txt.splitlines()[0].strip() if txt else "builder3 (unknown version)"
+            src = Path(builder3_bin).resolve()        # …/<checkout>/target/release/<bin> → find .git
+            for _ in range(4):
+                src = src.parent
+                if (src / ".git").exists():
+                    g = subprocess.run(["git", "-C", str(src), "rev-parse", "--short", "HEAD"],
+                                       capture_output=True, text=True, timeout=15)
+                    if g.returncode == 0 and g.stdout.strip() and g.stdout.strip() not in ver:
+                        ver += f" (git {g.stdout.strip()})"
+                    break
+            return ver if "builder3" in ver.lower() else f"gftools-builder3 {ver}"
+        # builder2: the gftools package version in the build interpreter that runs gftools.builder
+        r = subprocess.run(
+            [python, "-c", "import importlib.metadata as m; print('gftools-builder2 '+m.version('gftools'))"],
+            capture_output=True, text=True, timeout=30)
+        return r.stdout.strip() or "gftools-builder2 (unknown version)"
+    except Exception:
+        pass
+    return builder or "builder2"
 
 
 def build_fontc_from_source(dest: Path, on_progress: Optional[Callable[[str], None]] = None) -> str:
@@ -1019,8 +1053,13 @@ def run_pre_build(slug: str, work: Path, python: str, rules: dict, log_path: Pat
 
 
 def run_builder(python: str, config_path: Path, work: Path, log_path: Path,
-                timeout: Optional[int], backend: str, fontc_bin: Optional[str]):
-    """`timeout=None` means the build never times out (the user can stop it via the UI)."""
+                timeout: Optional[int], backend: str, fontc_bin: Optional[str],
+                builder3_bin: Optional[str] = None):
+    """`timeout=None` means the build never times out (the user can stop it via the UI).
+
+    Two orchestrators (M0): when `builder3_bin` is given we invoke the Rust-native `gftools-builder3`
+    binary directly (no Python in the loop) — the M5/M7 path; otherwise the Python `gftools.builder`
+    ('builder2') drives the build (fontc via --experimental-fontc, else fontmake)."""
     env = dict(os.environ)
     env["SOURCE_DATE_EPOCH"] = "0"
     # gftools.builder shells out to fontmake / ninja / gftools / ttfautohint BY NAME, so
@@ -1032,12 +1071,17 @@ def run_builder(python: str, config_path: Path, work: Path, log_path: Path,
     python = os.path.abspath(python)
     bindir = os.path.dirname(python)
     env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
-    cmd = [python, "-m", "gftools.builder", str(config_path)]
-    if backend == "fontc":
-        cmd += ["--experimental-fontc", fontc_bin]
+    if builder3_bin:                          # Rust-native orchestrator (provisional CLI: <bin> <config>)
+        cmd = [builder3_bin, str(config_path)]
+        orch = "gftools-builder3"
+    else:
+        cmd = [python, "-m", "gftools.builder", str(config_path)]
+        if backend == "fontc":
+            cmd += ["--experimental-fontc", fontc_bin]
+        orch = "gftools.builder"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "ab") as logf:   # append: the whole pipeline shares one family log
-        logf.write(f"\n===== gftools.builder (backend={backend}) =====\n"
+        logf.write(f"\n===== {orch} (backend={backend}) =====\n"
                    f"# {' '.join(cmd)}\n# cwd={work}\n\n".encode())
         logf.flush()
         try:
@@ -1229,6 +1273,7 @@ class Orchestrator:
         # per-family pre-build commands (build_rules.json) — run before the builder
         self.build_rules = load_build_rules(args.build_rules) if getattr(args, "build_rules", None) else {}
         self._cver_cache: Dict[tuple, str] = {}      # M0: (backend, python) -> exact compiler version
+        self._bver_cache: Dict[tuple, str] = {}      # M0: (builder, python) -> exact orchestrator version
 
         # phase pipeline state (clone_gf → build_fontc → discover → archive → cohorts → build → done)
         self.phase = "init"
@@ -1410,7 +1455,9 @@ class Orchestrator:
         r = self.results.get(slug)
         entry = {"ts": time.time(), "slug": slug, "cause": cause, "error": (msg or "")[:400],
                  "backend": (r.backend if r else "") or "",
-                 "compiler_version": (r.compiler_version if r else "") or ""}   # M0: provenance on failures
+                 "compiler_version": (r.compiler_version if r else "") or "",   # M0: provenance on failures
+                 "builder": (r.builder if r else "") or "",
+                 "builder_version": (r.builder_version if r else "") or ""}
         with self.lock:
             self.failure_history.append(entry)
             del self.failure_history[:-MAX_FAILURE_HISTORY]
@@ -1471,6 +1518,27 @@ class Orchestrator:
         ver = compiler_version_str(backend, python, self.args.fontc_bin)
         with self.lock:
             return self._cver_cache.setdefault(key, ver)
+
+    def _builder_name(self) -> str:
+        """Which orchestrator actually runs the build (M0). TODAY this is always 'builder2' —
+        run_builder invokes `python -m gftools.builder`. This is the SINGLE switch point: when a
+        gftools-builder3 invocation path is added to run_builder, return 'builder3' here (e.g. when
+        self.args.builder3_bin is set) and the whole provenance machinery follows. Recording it now,
+        even though it's constant, means the data distinguishes builder2 from builder3 the moment
+        builder3 is wired — no schema change, no backfill gap."""
+        return "builder3" if getattr(self.args, "builder3_bin", None) else "builder2"
+
+    def _builder_version(self, builder: str, python: str) -> str:
+        """Cached exact orchestrator version (M0) — runs at most once per (builder, venv). Mirrors
+        _compiler_version: the subprocess runs WITHOUT the lock, only the cache read/write is locked
+        (the snapshot reads the cache to summarise the builders in use)."""
+        key = (builder, python)
+        with self.lock:
+            if key in self._bver_cache:
+                return self._bver_cache[key]
+        ver = builder_version_str(builder, python, getattr(self.args, "builder3_bin", None))
+        with self.lock:
+            return self._bver_cache.setdefault(key, ver)
 
     def _record_op(self, slug: str, op: str, dt: float):
         with self.lock:
@@ -1709,12 +1777,14 @@ class Orchestrator:
             # ALL currently-failed families (newest first), not just this session's self.failures —
             # so the list matches the 'failed N' count even after a resume from state.json.
             fails = sorted([{"slug": r.slug, "error": r.error[:300], "log": r.log, "ended": r.ended,
-                             "backend": r.backend, "compiler_version": r.compiler_version}
+                             "backend": r.backend, "compiler_version": r.compiler_version,
+                             "builder": r.builder, "builder_version": r.builder_version}
                             for r in rs if r.status == "failed"],
                            key=lambda f: -f["ended"])[:400]
             built = sorted(([{"slug": r.slug, "backend": r.backend, "bytes": r.out_bytes,
                               "compare": r.compare, "log": r.log, "ended": r.ended,
-                              "compiler_version": r.compiler_version}
+                              "compiler_version": r.compiler_version,
+                              "builder": r.builder, "builder_version": r.builder_version}
                              for r in rs if r.status == "built"]),
                            key=lambda b: -b["ended"])[:200]
         try:
@@ -1766,6 +1836,9 @@ class Orchestrator:
             for (bk_, _py), ver in self._cver_cache.items():
                 if bk_ in ("fontc", "fontmake"):
                     tooling[bk_] = ver
+            builders = {}                                      # M0: orchestrator versions actually used
+            for (bld_, _py), ver in self._bver_cache.items():
+                builders[bld_] = ver
             cohorts_out = [{"key": k, "count": v["count"], "requirements": v["requirements"],
                             "families": v.get("families", []), "cached": k in cached_set}
                            for k, v in cohorts]
@@ -1784,6 +1857,7 @@ class Orchestrator:
             "cohorts": cohorts_out,                  # built under the lock; 'cached' from the off-thread set
             "failure_history": fail_hist,            # persistent; newest first (read under the lock)
             "tooling": tooling,                      # M0: {fontc: version, fontmake: version} in use
+            "builders": builders,                    # M0: {builder2/builder3: version} orchestrators in use
             "op_stats": op_stats, "phase_durations": phase_dur, "migration": migration,
             "tasks": tasks, "archive_recent": archive_recent, "archive": archive_view, "config": config,
             "control_log": control_log,
@@ -1938,10 +2012,14 @@ class Orchestrator:
                 if cerr:
                     return False, cerr, {}, 0, []
                 cver = self._compiler_version(b, python)   # M0: record compiler+version BEFORE the
-                self._set(slug, backend=b, config_used=label, compiler_version=cver)  # build (kept on fail too)
-                flog(f"build[{b}]: {b} {cver} · config={label} — running gftools.builder…")
+                bname = self._builder_name()               # build (kept on fail too) — and the
+                bver = self._builder_version(bname, python)  # orchestrator (builder2/builder3) too
+                self._set(slug, backend=b, config_used=label, compiler_version=cver,
+                          builder=bname, builder_version=bver)
+                flog(f"build[{b}]: {b} {cver} via {bver} · config={label} — running {bname}…")
                 t0 = time.time()
-                bok, berr = run_builder(python, cfg, work, log_path, self.args.timeout, b, self.args.fontc_bin)
+                bok, berr = run_builder(python, cfg, work, log_path, self.args.timeout, b,
+                                        self.args.fontc_bin, getattr(self.args, "builder3_bin", None))
                 self._record_op(slug, "build", time.time() - t0)
                 flog(f"build[{b}]: " + ("OK" if bok else f"FAIL {berr}") + f"  ({time.time() - t0:.0f}s)")
                 if not bok:
@@ -1969,7 +2047,9 @@ class Orchestrator:
                 self._set(slug, status="built", ended=time.time(), backend="both", note="",
                           out_bytes=(fbytes if fok else mbytes), fontc_ok=fok, fontmake_ok=mok,
                           vs=vs, fontc_error=("" if fok else ferr),
-                          compiler_version=self._compiler_version("both", python))   # M0: both versions
+                          compiler_version=self._compiler_version("both", python),   # M0: both versions
+                          builder=self._builder_name(),
+                          builder_version=self._builder_version(self._builder_name(), python))
                 self._emit("built", slug, backend="both", fontc_ok=fok, fontmake_ok=mok, vs=vs,
                            dur=round(self.results[slug].dur(), 1))
             else:
@@ -2777,17 +2857,22 @@ class CursesFrontend(Frontend):
                    "retry": "re-attempt after a previous build failure",
                    "rebuild": "rebuild of a family that already built (--rebuild / [R])"}
             return [f"queued: {item['slug']}  —  {k}", "  " + why.get(k, "")]
+        def _prov(it):                               # "[compiler · builder]" provenance suffix (M0)
+            cv = it.get("compiler_version") or it.get("backend", "")
+            bv = it.get("builder_version") or it.get("builder", "")
+            return " · ".join(p for p in (cv, bv) if p)
         if kind == "failures":
-            cv = item.get("compiler_version") or item.get("backend", "")
-            return [f"{item['slug']}  FAILED" + (f" [{cv}]" if cv else "") + ":",
+            pv = _prov(item)
+            return [f"{item['slug']}  FAILED" + (f" [{pv}]" if pv else "") + ":",
                     "  " + str(item.get("error", ""))]
         if kind == "history":
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(item.get("ts", 0)))
-            cv = item.get("compiler_version") or item.get("backend", "")
+            pv = _prov(item)
             return [f"{item.get('slug', '')}  —  {item.get('cause', '')}"
-                    + (f"  [{cv}]" if cv else "") + f"  ({when})", "  " + str(item.get("error", ""))]
+                    + (f"  [{pv}]" if pv else "") + f"  ({when})", "  " + str(item.get("error", ""))]
         if kind == "built":
-            return [f"{item['slug']} ✓ built with {item.get('compiler_version') or item.get('backend', '?')}"
+            pv = _prov(item) or "?"
+            return [f"{item['slug']} ✓ built with {pv}"
                     f" — {human(item.get('bytes', 0))}, vs shipped: {item.get('compare') or 'not compared'}"]
         if kind == "cohorts":
             reqs = (item.get("requirements") or "").splitlines()
@@ -3505,7 +3590,11 @@ class CursesFrontend(Frontend):
                 tl = snap.get("tooling", {})         # M0: exact compiler versions in use this run
                 if tl:
                     put(row, 1, "compilers in use:  " + "   ".join(f"{k} → {v}" for k, v in tl.items()),
-                        CYAN)
+                        CYAN); row += 1
+                bl = snap.get("builders", {})        # M0: exact orchestrator (builder2/builder3) versions
+                if bl:
+                    put(row, 1, "builders in use:   " + "   ".join(f"{k} → {v}" for k, v in bl.items()),
+                        CYAN); row += 1
                 row += 2
                 draw_sections(row, sections_for(snap, "stats"))
             elif view == "archive":                  # whole-archive total + a queue-oriented grid
@@ -3708,7 +3797,7 @@ const TAB_RENDER={
  cohorts:()=>card('Dependency cohorts  (● = venv cached on disk, reused next run)',rows(snap.cohorts||[],x=>frow(x.key,
    '<span class="'+(x.cached?'g':'d')+'">'+(x.cached?'●':'○')+'</span> <span class="c" style="width:110px">'+x.count+'  '+E(x.key)+'</span><span class="s g">'+(x.families||[]).map(E).join(' <span class="c">|</span> ')+'</span>'))),
  built:()=>card('Built — successes ('+(snap.counts.built||0)+') · slug · compiler+version · size · vs-shipped',rows(snap.built_recent||[],x=>frow(x.slug,
-   '<span class="g s">'+E(x.slug)+'</span><span class="c" style="width:200px">'+E(x.compiler_version||x.backend||'')+'</span><span class="meta">'+human(x.bytes)+'  '+E(x.compare||'')+'</span>'))),
+   '<span class="g s">'+E(x.slug)+'</span><span class="c" style="width:200px">'+E((x.compiler_version||x.backend||'')+(x.builder_version?' · '+x.builder_version:''))+'</span><span class="meta">'+human(x.bytes)+'  '+E(x.compare||'')+'</span>'))),
  failures:()=>{let h=card('Failures by cause',rows(snap.fail_categories||[],x=>frow('cat:'+x.cat,
     '<span class="c" style="width:40px;text-align:right">'+x.count+'</span><span class="y" style="width:200px">'+E(x.cat)+'</span><span class="meta d s">'+E(x.hint)+'</span>')));
   const fr=snap.failures_recent||[],fc=snap.counts.failed||0;
@@ -3718,9 +3807,10 @@ const TAB_RENDER={
   if(fh.length)h+=card('Failure history (persistent — survives restarts & re-attempts)',rows(fh,x=>frow('h:'+E(x.slug)+(x.ts||0),
     '<span class="d" style="width:120px">'+new Date((x.ts||0)*1000).toLocaleString().slice(0,17)+'</span><span class="y" style="width:150px">'+E((x.cause||'').slice(0,20))+'</span><span class="s meta d">'+E(x.error)+'</span>')));
   return h},
- stats:()=>{const o=snap.op_stats||{},p=snap.phase_durations||{},m=snap.migration||{},tl=snap.tooling||{};
+ stats:()=>{const o=snap.op_stats||{},p=snap.phase_durations||{},m=snap.migration||{},tl=snap.tooling||{},bl=snap.builders||{};
   let h='';
   if(Object.keys(tl).length)h+=card('Compilers in use (this run)','<table class="kv">'+Object.keys(tl).map(k=>'<tr><td>'+E(k)+'</td><td>'+E(tl[k])+'</td></tr>').join('')+'</table>');
+  if(Object.keys(bl).length)h+=card('Builders in use (this run)','<table class="kv">'+Object.keys(bl).map(k=>'<tr><td>'+E(k)+'</td><td>'+E(bl[k])+'</td></tr>').join('')+'</table>');
   h+=card('Per-operation timing',rows(Object.keys(o),k=>frow('op:'+k,'<span class="s">'+E(k)+'</span><span class="meta">n='+o[k].count+'  mean '+o[k].mean+'s  max '+o[k].max+'s</span>')));
   h+=card('Phase durations',rows(Object.keys(p),k=>frow('ph:'+k,'<span class="s">'+E(k)+'</span><span class="meta">'+hms(p[k])+'</span>')));
   h+=card('fontc → fontmake migration','<table class="kv">'+Object.keys(m).map(k=>'<tr><td>'+E(k)+'</td><td>'+m[k]+'</td></tr>').join('')+'</table>');return h},
@@ -3734,11 +3824,11 @@ function panel(){
  const bu=(snap.built_recent||[]).find(x=>x.slug===selKey);
  const hh=(snap.failure_history||[]).find(x=>'h:'+x.slug+(x.ts||0)===selKey);
  let body='';
- if(hh)body='<div class="row"><b class="r">'+E(hh.slug)+'</b> <span class="y">'+E(hh.cause)+'</span> <span class="c">'+E(hh.compiler_version||hh.backend||'')+'</span> <span class="d">'+new Date((hh.ts||0)*1000).toLocaleString()+'</span></div><div class="row d" style="white-space:pre-wrap">'+E(hh.error)+'</div>';
- else if(f)body='<div class="row"><b class="r">'+E(selKey)+'</b> <span class="c">'+E(f.compiler_version||f.backend||'')+'</span></div><div class="row d" style="white-space:pre-wrap">'+E(f.error)+'</div>';
+ if(hh)body='<div class="row"><b class="r">'+E(hh.slug)+'</b> <span class="y">'+E(hh.cause)+'</span> <span class="c">'+E((hh.compiler_version||hh.backend||'')+(hh.builder_version?' · '+hh.builder_version:''))+'</span> <span class="d">'+new Date((hh.ts||0)*1000).toLocaleString()+'</span></div><div class="row d" style="white-space:pre-wrap">'+E(hh.error)+'</div>';
+ else if(f)body='<div class="row"><b class="r">'+E(selKey)+'</b> <span class="c">'+E((f.compiler_version||f.backend||'')+(f.builder_version?' · '+f.builder_version:''))+'</span></div><div class="row d" style="white-space:pre-wrap">'+E(f.error)+'</div>';
  else if(q){const why={new:'a fresh target — never built before',retry:'re-attempt after a previous failure',rebuild:'rebuild of a family that already built'};
    body='<div class="row"><b>'+E(selKey)+'</b> <span class="badge bg-'+q.kind+'">'+E(q.kind)+'</span></div><div class="row d">'+E(why[q.kind]||'')+'</div>'}
- else if(bu)body='<div class="row"><b class="g">'+E(selKey)+'</b> <span class="c">'+E(bu.compiler_version||bu.backend||'')+'</span></div><div class="row d">'+human(bu.bytes)+' · vs shipped: '+E(bu.compare||'n/a')+'</div>';
+ else if(bu)body='<div class="row"><b class="g">'+E(selKey)+'</b> <span class="c">'+E((bu.compiler_version||bu.backend||'')+(bu.builder_version?' · '+bu.builder_version:''))+'</span></div><div class="row d">'+human(bu.bytes)+' · vs shipped: '+E(bu.compare||'n/a')+'</div>';
  else body='<div class="row"><b>'+E(selKey)+'</b></div>';
  const canRetry=f||bu||q;
  if(canRetry&&!q)body+='<div class="row"><button data-act="retry">⟳ Retry this family</button></div>';
@@ -4235,6 +4325,10 @@ def build_argparser() -> argparse.ArgumentParser:
                          "fontc/fontmake = that compiler only; both = build with each and compare "
                          "outputs (fontc_crater-style)")
     ap.add_argument("--fontc-bin", default=None, help="path to the fontc (Rust) binary")
+    ap.add_argument("--builder3-bin", dest="builder3_bin", default=None,
+                    help="path to the gftools-builder3 (Rust orchestrator) binary; when set, builds "
+                         "run through builder3 instead of the Python gftools.builder (the M5/M7 path). "
+                         "Recorded per-attempt as the 'builder' alongside the compiler (M0).")
     ap.add_argument("--build-python", default=sys.executable,
                     help="interpreter for builds when --manage-venvs is off")
     ap.add_argument("--manage-venvs", dest="manage_venvs", action="store_true",
