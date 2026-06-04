@@ -57,6 +57,36 @@ fn pick_frontend(ui: &str) -> String {
     }
 }
 
+/// --dry-run / --demo: a fully in-process MOCKUP for demos. Loads a previous session's data and
+/// replays the build (looping) with NO real clone/venv/compile/QA and NO writes to disk — so the
+/// dashboard looks live without any CPU load (keeps a video call's audio/video smooth). View it with
+/// `--ui curses` (default) or `--ui web`; press q to quit.
+fn run_dry_run(cfg: config::Config) {
+    eprintln!(
+        "gflib-build DRY RUN (mockup): replaying {} with no real compilation — nothing is written to disk.",
+        cfg.build_dir.display()
+    );
+    let orch = build::Orchestrator::new(cfg.clone());
+    orch.start();
+    let source: Arc<dyn Source> = orch.clone();
+    match pick_frontend(&cfg.ui).as_str() {
+        "web" => {
+            let _ = web::run(source, cfg.web_port);
+        }
+        "curses" => {
+            if std::io::stdout().is_terminal() {
+                let _ = tui::run(source);
+            } else {
+                run_plain(&source);
+            }
+        }
+        "json" => run_json(&source),
+        "none" => run_none(&source),
+        _ => run_plain(&source),
+    }
+    orch.request_stop();
+}
+
 fn run_build(mut cfg: config::Config) {
     // auto-detect fontc + a pre-existing repo archive if not present
     if cfg.fontc_bin.is_none() {
@@ -87,6 +117,10 @@ fn run_build(mut cfg: config::Config) {
                 break;
             }
         }
+    }
+    // --dry-run MOCKUP: replay the saved session in-process (no daemon, no persistence, no real work)
+    if cfg.dry_run {
+        return run_dry_run(cfg);
     }
     // if a daemon is already running here, just attach a monitor (don't start a second build)
     if let Some(pid) = persist::read_daemon_pid(&cfg.build_dir) {
@@ -429,6 +463,8 @@ UI:
   --web-port <PORT>             port for --ui web (default 8765)
 
 LIFECYCLE:
+  --dry-run / --demo / --mock   MOCKUP: replay a previous session's data live (no real clone/venv/
+                                compile/QA, no disk writes) — a CPU-light demo. View with --ui curses/web.
   --setup / --wizard            open the editable Configuration tab pre-build; launch on ▶ Start build
   --fontspector                 enable async fontspector QA during the build: a pinned release runs
                                 (niced) on each green-built family, results in the 'fontspector' tab.

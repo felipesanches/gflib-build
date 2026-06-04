@@ -86,6 +86,7 @@ pub struct Orchestrator {
     pub all_families: Vec<Family>,  // full discovered list (R6: raising % enqueues more from here)
     pub clone_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>, // per-repo clone lock (--mirror-missing)
     pub qa_bin: Mutex<Option<(PathBuf, String)>>, // resolved fontspector (path, version), lazily set
+    pub dry_playbook: HashMap<String, Res>, // --dry-run: each family's previous outcome to replay
 }
 
 impl Orchestrator {
@@ -123,6 +124,10 @@ impl Orchestrator {
 
         let state = persist::read_state_full(&cfg.build_dir);
         let prior = &state.results;
+        // dry-run MOCKUP: remember each family's previous outcome, then re-queue EVERY family so the
+        // dashboard animates the whole build again — but the worker just replays it (no real work).
+        let dry_playbook: HashMap<String, Res> =
+            if cfg.dry_run { prior.iter().map(|(k, v)| (k.clone(), v.clone())).collect() } else { HashMap::new() };
         let mut results = BTreeMap::new();
         let mut families = BTreeMap::new();
         // (slug, prior_duration) for queued families — sorted longest-first below to shrink the tail
@@ -134,7 +139,9 @@ impl Orchestrator {
             // resume: keep a prior success unless --rebuild; re-queue a failure if the user forces it
             // OR (self-heal, matching Python) its cause is in the AUTO_RETRY set — a fresh attempt can
             // clear a rebuilt venv / retried clone / updated mirror, so the failure hints stay honest.
-            let (status, kind) = match prev {
+            let (status, kind) = if cfg.dry_run {
+                ("queued", "new") // re-queue all for the mockup replay
+            } else { match prev {
                 Some(p) if p.status == "built" && !cfg.rebuild => ("built", ""),
                 Some(p) if p.status == "failed" => {
                     let (cause, _) = crate::classify::categorize_failure(&p.error);
@@ -149,7 +156,7 @@ impl Orchestrator {
                     }
                 }
                 _ => ("queued", "new"),
-            };
+            }};
             let prior_dur = prev
                 .map(|p| (p.ended - p.started).max(0.0))
                 .filter(|d| *d > 0.0)
@@ -231,6 +238,7 @@ impl Orchestrator {
             all_families,
             clone_locks: Mutex::new(HashMap::new()),
             qa_bin: Mutex::new(None),
+            dry_playbook,
         })
     }
 
@@ -238,6 +246,20 @@ impl Orchestrator {
     pub fn start(self: &Arc<Self>) {
         let _ = std::fs::create_dir_all(&self.cfg.build_dir);
         let _ = std::fs::create_dir_all(self.cfg.build_dir.join("logs"));
+        // --dry-run MOCKUP: no real work — show the loaded QA results, replay the build (looping), and
+        // skip the base venv, the archive pre-warmer and real fontspector.
+        if self.cfg.dry_run {
+            // read-only: load the saved QA summary, never WRITE state.json/status.json (so the real
+            // session's durable resume state is preserved). The demo is served in-process (foreground).
+            self.shared.lock().unwrap().fontspector =
+                crate::persist::read_fontspector_summary(&self.cfg.build_dir);
+            let jobs = self.shared.lock().unwrap().jobs;
+            self.ensure_workers(jobs);
+            self.spawn_dry_run_loop();
+            self.spawn_size_thread();
+            self.spawn_control_watcher();
+            return;
+        }
         // Build the base cohort venv up front (on a background thread so it doesn't block startup) —
         // avoids a stampede where every base-cohort worker tries to create it at once. Workers that
         // reach a base-cohort family before it's ready just wait on the per-cohort lock (correct).
@@ -259,6 +281,39 @@ impl Orchestrator {
         self.spawn_status_writer();
         self.spawn_size_thread();
         self.spawn_control_watcher();
+    }
+
+    /// --dry-run: when the replayed build finishes, pause a few seconds (so the 'complete' state shows)
+    /// then re-queue every family and replay again — continuous demo activity, hands-free.
+    fn spawn_dry_run_loop(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        thread::spawn(move || loop {
+            if me.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let idle = {
+                let sh = me.shared.lock().unwrap();
+                sh.queue.is_empty()
+            } && me.active.load(Ordering::Relaxed) == 0;
+            if idle {
+                thread::sleep(Duration::from_secs(6)); // let the 'complete' banner show
+                if me.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mut sh = me.shared.lock().unwrap();
+                let slugs: Vec<String> = sh.results.keys().cloned().collect();
+                for s in slugs {
+                    if let Some(r) = sh.results.get_mut(&s) {
+                        r.status = "queued".into();
+                        r.note = String::new();
+                    }
+                    sh.queue.push_back(s);
+                }
+                drop(sh);
+                me.cond.notify_all();
+            }
+            thread::sleep(Duration::from_millis(800));
+        });
     }
 
     /// Asynchronous fontspector QA (--fontspector): resolve the binary off-thread (may cargo-install),
@@ -502,7 +557,9 @@ impl Orchestrator {
             self.active.fetch_add(1, Ordering::Relaxed);
             self.build_one(&slug, id);
             self.active.fetch_sub(1, Ordering::Relaxed);
-            self.save_state();
+            if !self.cfg.dry_run {
+                self.save_state(); // never persist the mockup replay over the real session's state.json
+            }
         }
     }
 
@@ -728,8 +785,51 @@ impl Orchestrator {
         }
     }
 
+    /// MOCKUP build: no clone/venv/compile — a brief fake "compile", then replay the family's recorded
+    /// outcome so the dashboard animates a whole build with no real CPU load (for demos).
+    fn dry_build_one(&self, slug: &str, worker: usize) {
+        self.emit("started", slug, serde_json::json!({"worker": worker}));
+        self.set_result(slug, |r| r.note = "compiling (dry-run)".into());
+        // a short, deterministic fake duration per family (0.25–1.15 s) — looks live, costs nothing
+        let h = slug.bytes().fold(0u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
+        thread::sleep(Duration::from_millis(250 + h % 900));
+        let pb = self.dry_playbook.get(slug).cloned();
+        if matches!(&pb, Some(p) if p.status == "failed") {
+            let p = pb.unwrap();
+            self.set_result(slug, |r| {
+                r.status = "failed".into();
+                r.ended = now();
+                r.error = p.error.clone();
+                r.backend = p.backend.clone();
+                r.compiler_version = p.compiler_version.clone();
+                r.builder_version = p.builder_version.clone();
+                r.note = String::new();
+            });
+            self.emit("failed", slug, serde_json::json!({"error": "(dry-run replay)"}));
+        } else {
+            let (bytes, backend, compare, cver, bver) = pb.as_ref()
+                .map(|p| (p.out_bytes, p.backend.clone(), p.compare.clone(), p.compiler_version.clone(), p.builder_version.clone()))
+                .unwrap_or((123_456, "fontc".into(), "identical".into(), String::new(), String::new()));
+            self.set_result(slug, |r| {
+                r.status = "built".into();
+                r.ended = now();
+                r.out_bytes = bytes;
+                r.backend = if backend.is_empty() { "fontc".into() } else { backend };
+                r.compare = compare;
+                r.compiler_version = cver;
+                r.builder_version = bver;
+                r.note = String::new();
+            });
+            self.emit("built", slug, serde_json::json!({"backend": "dry-run", "bytes": bytes}));
+        }
+    }
+
     /// Build one family end-to-end. Mirrors the Python `_build` flow (single-backend / auto path).
     fn build_one(&self, slug: &str, _worker: usize) {
+        if self.cfg.dry_run {
+            self.dry_build_one(slug, _worker);
+            return;
+        }
         let fam = {
             let sh = self.shared.lock().unwrap();
             match sh.families.get(slug) {
@@ -1186,6 +1286,9 @@ impl Orchestrator {
     /// Flush the final status + derived reports SYNCHRONOUSLY (so a short foreground run doesn't exit
     /// before the background status-writer thread gets to write them).
     pub fn finalize(&self) {
+        if self.cfg.dry_run {
+            return; // the mockup writes nothing persistent
+        }
         // a final QA aggregate so the summary reflects every per-family result, even if the periodic
         // aggregator's last tick was before the last family finished (or the process exits promptly)
         if self.cfg.fontspector_qa {

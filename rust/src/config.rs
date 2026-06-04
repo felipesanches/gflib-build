@@ -43,6 +43,7 @@ pub struct Config {
     pub fontspector_rerun: bool,            // re-QA families that already have a result (default: skip them)
     pub fontspector_qa: bool,               // SETTING: run QA asynchronously during the build (green families, niced)
     pub yes: bool,
+    pub dry_run: bool,         // MOCKUP: replay a previous session's outcomes (no real clone/venv/compile/QA)
     pub wizard: bool,          // force the first-run setup wizard (the editable config tab pre-build)
     pub detach: bool,          // run the build in a detached background daemon
     pub no_detach: bool,       // force foreground even for curses (which detaches by default)
@@ -86,6 +87,7 @@ impl Default for Config {
             fontspector_rerun: false,
             fontspector_qa: false,
             yes: false,
+            dry_run: false,
             wizard: false,
             detach: false,
             no_detach: false,
@@ -190,6 +192,7 @@ pub fn parse(args: &[String]) -> Parsed {
             "--web-port" => cfg.web_port = next(&mut i, a).parse().unwrap_or(8765),
             "--ui" => cfg.ui = next(&mut i, a),
             "--yes" | "-y" => cfg.yes = true,
+            "--dry-run" | "--demo" | "--mock" => cfg.dry_run = true,
             "--setup" | "--wizard" => cfg.wizard = true,
             "--detach" => cfg.detach = true,
             "--no-detach" => cfg.no_detach = true,
