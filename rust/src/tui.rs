@@ -958,6 +958,12 @@ fn render_tabbar_body(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16
     match TABS[ui.tab] {
         "archive" => render_archive(scr, snap, row, avail, w),
         "config" => render_config(scr, snap, ui, row, sep_row, w),
+        "stats" => {
+            // Python's stats view = a fontc-migration summary, then the timing sections below it
+            let used = render_stats_prefix(scr, snap, row, w);
+            let r2 = row + used;
+            draw_sections(scr, &sections_for(snap, ui.tab), r2, sep_row.saturating_sub(r2), w, ui.section, ui.sel);
+        }
         _ => draw_sections(scr, &sections_for(snap, ui.tab), row, avail, w, ui.section, ui.sel),
     }
 
@@ -1046,6 +1052,40 @@ fn cohort_segments(co: &crate::model::CohortView) -> Vec<(String, Color)> {
         }
     }
     segs
+}
+
+/// The fontc-migration summary that heads the stats tab (port of the Python stats prefix): a counts
+/// line, then the exact compiler/builder versions in use (M0). Returns the number of rows consumed.
+fn render_stats_prefix(scr: &mut Screen, snap: &Snapshot, top: u16, w: u16) -> u16 {
+    let mut row = top;
+    let mut hdr = " fontc migration ".to_string();
+    while hdr.chars().count() < (w as usize).saturating_sub(1) {
+        hdr.push('-');
+    }
+    put(scr, row, 0, &hdr, Color::White, w);
+    row += 1;
+    let g = |k: &str| snap.migration.get(k).copied().unwrap_or(0);
+    let mut line = format!(
+        "fontc {}   fontmake-fallback(blockers) {}   fontmake-only {}",
+        g("fontc"), g("fontmake_fallback"), g("fontmake_only")
+    );
+    if g("both_identical") > 0 || g("both_differ") > 0 {
+        line += &format!("   both id {}/diff {}", g("both_identical"), g("both_differ"));
+    }
+    put(scr, row, 1, &line, Color::Green, w);
+    row += 1;
+    if !snap.tooling.is_empty() {
+        let t: Vec<String> = snap.tooling.iter().map(|(k, v)| format!("{} → {}", k, v)).collect();
+        put(scr, row, 1, &format!("compilers in use:  {}", t.join("   ")), Color::Cyan, w);
+        row += 1;
+    }
+    if !snap.builders.is_empty() {
+        let b: Vec<String> = snap.builders.iter().map(|(k, v)| format!("{} → {}", k, v)).collect();
+        put(scr, row, 1, &format!("builders in use:   {}", b.join("   ")), Color::Cyan, w);
+        row += 1;
+    }
+    row += 2; // blank gap before the timing sections (matches the Python `row += 2`)
+    row - top
 }
 
 fn render_archive(scr: &mut Screen, snap: &Snapshot, top: u16, avail: u16, w: u16) {
