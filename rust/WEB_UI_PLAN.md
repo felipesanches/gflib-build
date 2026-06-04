@@ -118,8 +118,11 @@ Charts that need *change over time*, not just the current snapshot.
 
 ## Suggested sequencing
 
-1. **W1 = Part A** (structural parity with the TUI). Mechanical, low-risk, high value — do first so
-   the two UIs feel like one product. Includes the `PAGE`-splitting refactor.
+1. **W1 = Part A** ✅ **DONE (2026-06-05, commit a4a17d1).** The web page now matches the TUI's tab
+   order, segmented progress bar, sections, cohort family names, archive pre-warmer grid, full config
+   schema, and real controls (no fabricated jobs±). Verified by a spec-extraction workflow + an
+   adversarial review workflow (12 divergences found & fixed). The `PAGE`-splitting refactor was
+   deferred (the page is still one `const` — split it when W2's charts grow it).
 2. **W2 = Part B** (derived charts). Big perceived value, no backend change.
 3. **W3 = Part C1–C3** (detail panel + `/api/log` + config form) — the only backend addition
    (`/api/log`) lands here.
