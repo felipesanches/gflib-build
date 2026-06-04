@@ -1551,22 +1551,78 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, build_d
     o
 }
 
+/// True when `l` looks like a Python exception header (`SomeError: …` / `SomeException: …`).
+fn is_exception(l: &str) -> bool {
+    match l.find(':') {
+        Some(i) => {
+            let head = &l[..i];
+            !head.is_empty()
+                && head.chars().all(|c| c.is_alphanumeric())
+                && (head.ends_with("Error") || head.ends_with("Exception"))
+        }
+        None => false,
+    }
+}
+
+/// Per-line colour for a build-log line in the detail overlay (mirrors the web `logCls`).
+fn log_color(l: &str) -> Color {
+    if let Some(rest) = l.strip_prefix("[+") {
+        let _ = rest;
+        if l.contains("FAIL") {
+            Color::Red
+        } else if l.contains(" ok") || l.ends_with("ok") {
+            Color::Green
+        } else {
+            Color::Cyan
+        }
+    } else if l.starts_with('#') || l.starts_with("=====") || (l.starts_with('[') && l.contains('/')) {
+        Color::Cyan // meta / banners / [N/M] progress
+    } else if l.starts_with("File \"") || (l.contains(['~', '^']) && l.chars().all(|c| matches!(c, '~' | '^' | ' '))) {
+        Color::DarkGrey // traceback frames / caret lines
+    } else if l.contains("Traceback") || l.contains("Command failed") || l.starts_with("FAILED")
+        || l.contains("error[") || l.contains("error:") || l.contains("ERROR") || l.contains("panic")
+        || is_exception(l)
+    {
+        Color::Red
+    } else if l.contains("WARNING") || l.contains("warning:") || l.contains("WARN") {
+        Color::Yellow
+    } else if l.contains("Successfully") || l.contains("PASS") || l.contains(": ok") {
+        Color::Green
+    } else if l.starts_with("INFO:") || l.starts_with("DEBUG:") || l.contains("INFO") {
+        Color::DarkGrey
+    } else {
+        Color::Grey
+    }
+}
+
 fn render_detail(scr: &mut Screen, ui: &Ui, w: u16, h: u16) {
     // full-width overlay covering the body region (like the Python detail overlay), scrollable.
     let top = 5u16;
     let body_top = top + 1;
     let view = h.saturating_sub(body_top + 1).max(1) as usize; // leave the bottom row free
     let inner = (w.saturating_sub(3)).max(10) as usize;
-    // word-wrap the captured logical lines; mark "header:" lines (no leading space + ends with ':')
-    let mut wrapped: Vec<(String, bool)> = Vec::new();
+    // word-wrap the captured logical lines, assigning each a colour: "header:" lines are cyan; lines
+    // after a "log tail" header are syntax-highlighted as build-log output; everything else is white.
+    let mut wrapped: Vec<(String, Color)> = Vec::new();
+    let mut in_log = false;
     for l in &ui.detail_lines {
         if l.is_empty() {
-            wrapped.push((String::new(), false));
+            wrapped.push((String::new(), Color::White));
             continue;
         }
         let is_hdr = !l.starts_with(' ') && l.ends_with(':');
+        if is_hdr {
+            in_log = l.starts_with("log tail");
+        }
+        let color = if is_hdr {
+            Color::Cyan
+        } else if in_log {
+            log_color(l.trim_start())
+        } else {
+            Color::White
+        };
         for wl in wrap_line(l, inner) {
-            wrapped.push((wl, is_hdr));
+            wrapped.push((wl, color));
         }
     }
     let maxscroll = wrapped.len().saturating_sub(view);
@@ -1578,9 +1634,8 @@ fn render_detail(scr: &mut Screen, ui: &Ui, w: u16, h: u16) {
     let hdr = " Details — [Esc/↵] back   [↑↓] scroll ";
     let pad = (w as usize).saturating_sub(hdr.chars().count());
     put(scr, top, 0, &format!("{}{}", hdr, "─".repeat(pad)), Color::Cyan, w);
-    for (i, (wl, is_hdr)) in wrapped.iter().skip(ds).take(view).enumerate() {
-        let color = if *is_hdr { Color::Cyan } else { Color::White };
-        put(scr, body_top + i as u16, 1, wl, color, w);
+    for (i, (wl, color)) in wrapped.iter().skip(ds).take(view).enumerate() {
+        put(scr, body_top + i as u16, 1, wl, *color, w);
     }
     if maxscroll > 0 {
         let pos = format!(" {}–{}/{} ", ds + 1, (ds + view).min(wrapped.len()), wrapped.len());

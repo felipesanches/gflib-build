@@ -531,12 +531,25 @@ function openDetail(kind,id){
 }
 function showDetail(title,lines,slug){
  let h='<div class="dhead">'+E(title)+'<span class="dclose" onclick="closeDetail()">✕ close</span></div><pre class="dbody">'+lines.map(E).join('\n')+'</pre>';
- if(slug)h+='<div class="dlog"><div class="muted">log tail (last 200 lines):</div><pre id="dlogbody" class="dbody muted">loading…</pre></div>';
+ if(slug)h+='<div class="dlog"><div class="muted">log tail (last 200 lines):</div><pre id="dlogbody" class="dbody">loading…</pre></div>';
  const el=document.getElementById('detail');el.innerHTML=h;el.style.display='block';
- if(slug)fetch('/api/log?slug='+encodeURIComponent(slug)+'&n=200').then(r=>r.text()).then(t=>{const b=document.getElementById('dlogbody');if(b)b.textContent=t}).catch(()=>{});
+ if(slug)fetch('/api/log?slug='+encodeURIComponent(slug)+'&n=200').then(r=>r.text()).then(t=>{const b=document.getElementById('dlogbody');if(b)b.innerHTML=hlLog(t)}).catch(()=>{});
 }
 function closeDetail(){const el=document.getElementById('detail');el.style.display='none';el.innerHTML=''}
 addEventListener('keydown',e=>{if(e.key=='Escape')closeDetail()});
+
+// ---- log syntax highlighting (per-line classification of gflib-build's build logs) ----
+function logCls(l){
+ if(/^\[\+/.test(l))return /FAIL/.test(l)?'r':(/\bok\b/.test(l)?'g':'c');     // [+ N.Ns] phase markers
+ if(/^#|^=====|^\[\d+\/\d+\]/.test(l))return 'c';                              // meta / banners / [N/M]
+ if(/^\s*File ".*", line \d+|^\s*[~^]+\s*$/.test(l))return 'muted';            // traceback frames / carets
+ if(/Traceback|Command failed|^FAILED\b|^\s*\w*(Error|Exception):|\berror\[|\berror:|\bERROR\b|\bpanic/.test(l))return 'r';
+ if(/\bWARNING\b|\bwarning:|\bWARN\b/.test(l))return 'y';
+ if(/Successfully|\bPASS\b|:\s*ok\b|✓/.test(l))return 'g';
+ if(/^INFO:|^DEBUG:|\bINFO\b/.test(l))return 'muted';
+ return 'gr';
+}
+function hlLog(t){return t.split('\n').map(l=>'<span class="'+logCls(l)+'">'+E(l)+'</span>').join('\n')}
 
 // ---- charts: hand-rolled, dependency-free (CSS-div bars + inline-SVG donuts/rings) ----
 function chartCard(title,inner){return '<div class="chart"><div class="ctitle">'+E(title)+'</div>'+inner+'</div>'}
