@@ -69,6 +69,7 @@ pub struct Orchestrator {
     pub active: AtomicUsize,
     pub spawned: Mutex<usize>,
     pub venvs: Option<VenvManager>, // cohort venv manager (R2); None unless --manage-venvs
+    pub build_rules: std::collections::HashMap<String, Vec<String>>, // per-family pre-build (R3)
 }
 
 impl Orchestrator {
@@ -185,6 +186,11 @@ impl Orchestrator {
         } else {
             None
         };
+        let build_rules = cfg
+            .build_rules
+            .as_ref()
+            .map(|p| crate::rules::load_build_rules(p))
+            .unwrap_or_default();
         Arc::new(Orchestrator {
             cfg,
             shared: Arc::new(Mutex::new(shared)),
@@ -195,6 +201,7 @@ impl Orchestrator {
             active: AtomicUsize::new(0),
             spawned: Mutex::new(0),
             venvs,
+            build_rules,
         })
     }
 
@@ -404,6 +411,18 @@ impl Orchestrator {
             if let Err(e) = extract_tree(&mirror, &fam.commit, &work, EXTRACT_TIMEOUT, &log_path) {
                 last_err = e;
                 continue;
+            }
+            // registered pre-build commands (generate/pre-compile sources) — run AFTER extraction
+            // (so they survive the per-backend re-extract) and BEFORE the builder. (R3 / parity)
+            if let Some(cmds) = self.build_rules.get(slug) {
+                self.set_result(slug, |r| r.note = "pre-build".into());
+                log_line(&log_path, &format!("pre-build: running {} command(s)…", cmds.len()));
+                if let Err(e) = crate::rules::run_pre_build(&work, &python, cmds, &log_path, self.cfg.timeout) {
+                    last_err = e;
+                    self.set_result(slug, |r| r.note = String::new());
+                    break; // a pre-build failure won't be cured by another backend
+                }
+                self.set_result(slug, |r| r.note = String::new());
             }
             preclean_outputs(&work);
             let (cfg_path, label) = match resolve_config(self.cfg.google_fonts.as_deref(), &fam, &work) {

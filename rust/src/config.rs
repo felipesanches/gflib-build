@@ -20,6 +20,7 @@ pub struct Config {
     pub build_python: String,
     pub base_python: String,            // interpreter used to CREATE cohort venvs
     pub base_requirements: Option<PathBuf>, // pinned base toolchain (gftools/fontmake/…)
+    pub build_rules: Option<PathBuf>,   // per-family pre-build commands (build_rules.json)
     pub manage_venvs: bool,
     pub jobs: usize,
     pub timeout: Option<u64>,
@@ -54,6 +55,7 @@ impl Default for Config {
             build_python: "python3".into(),
             base_python: "python3".into(),
             base_requirements: None,
+            build_rules: None,
             manage_venvs: false,
             jobs: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
             timeout: None,
@@ -148,6 +150,7 @@ pub fn parse(args: &[String]) -> Parsed {
             "--build-python" => cfg.build_python = next(&mut i, a),
             "--base-python" => cfg.base_python = next(&mut i, a),
             "--base-requirements" => cfg.base_requirements = Some(PathBuf::from(next(&mut i, a))),
+            "--build-rules" => cfg.build_rules = Some(PathBuf::from(next(&mut i, a))),
             "--manage-venvs" => cfg.manage_venvs = true,
             "--no-manage-venvs" => cfg.manage_venvs = false,
             "--jobs" => cfg.jobs = next(&mut i, a).parse().unwrap_or(cfg.jobs).max(1),

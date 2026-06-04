@@ -13,6 +13,7 @@ mod model;
 mod monitor;
 mod persist;
 mod provenance;
+mod rules;
 mod tui;
 mod util;
 mod venv;
@@ -59,6 +60,16 @@ fn run_build(mut cfg: config::Config) {
     if !cfg.archive.is_dir() {
         if let Some(a) = discover::detect_archive(&cfg.data_dir) {
             cfg.archive = std::path::PathBuf::from(a);
+        }
+    }
+    // auto-detect build_rules.json (version-controlled next to the tool / in CWD)
+    if cfg.build_rules.is_none() {
+        for c in ["build_rules.json", "../build_rules.json"] {
+            let p = std::path::PathBuf::from(c);
+            if p.is_file() {
+                cfg.build_rules = Some(p);
+                break;
+            }
         }
     }
     // if a daemon is already running here, just attach a monitor (don't start a second build)
