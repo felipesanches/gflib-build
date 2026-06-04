@@ -35,6 +35,8 @@ struct Ui {
     sel: usize,
     detail: bool,
     sel_key: Option<String>, // the SELECTED item's identity (stable selection: cursor follows it)
+    detail_lines: Vec<String>, // detail content captured ONCE when the overlay opens (no per-frame I/O)
+    dscroll: usize,          // scroll offset within the detail overlay
 }
 
 /// The identity (slug/key) of each item in the current tab's list, in display order — used for
@@ -58,7 +60,7 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
     queue!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
     out.flush()?;
 
-    let mut ui = Ui { tab: 1, sel: 0, detail: false, sel_key: None };
+    let mut ui = Ui { tab: 1, sel: 0, detail: false, sel_key: None, detail_lines: Vec::new(), dscroll: 0 };
     let mut prev: Option<Screen> = None;
     let res = loop {
         let snap = source.snapshot();
@@ -101,14 +103,22 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
                         ui.detail = false;
                     }
                     KeyCode::Up => {
-                        if ui.sel > 0 {
-                            ui.sel -= 1;
+                        if ui.detail {
+                            ui.dscroll = ui.dscroll.saturating_sub(1); // scroll the overlay
+                        } else {
+                            if ui.sel > 0 {
+                                ui.sel -= 1;
+                            }
+                            ui.sel_key = list_keys(&snap, ui.tab).get(ui.sel).cloned();
                         }
-                        ui.sel_key = list_keys(&snap, ui.tab).get(ui.sel).cloned();
                     }
                     KeyCode::Down => {
-                        ui.sel = (ui.sel + 1).min(list_len(&snap, ui.tab).saturating_sub(1));
-                        ui.sel_key = list_keys(&snap, ui.tab).get(ui.sel).cloned();
+                        if ui.detail {
+                            ui.dscroll = (ui.dscroll + 1).min(ui.detail_lines.len().saturating_sub(1));
+                        } else {
+                            ui.sel = (ui.sel + 1).min(list_len(&snap, ui.tab).saturating_sub(1));
+                            ui.sel_key = list_keys(&snap, ui.tab).get(ui.sel).cloned();
+                        }
                     }
                     KeyCode::Left => {
                         if TABS[ui.tab] == "config" {
@@ -125,7 +135,16 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
                             adjust_config(&snap, ui.sel, 1, &*source); // space toggles bools / steps
                         }
                     }
-                    KeyCode::Enter => ui.detail = !ui.detail,
+                    KeyCode::Enter => {
+                        if ui.detail {
+                            ui.detail = false;
+                        } else {
+                            // capture the detail ONCE (reads the log-file tail here, not every frame)
+                            ui.detail_lines = build_detail(&snap, ui.tab, ui.sel, &source.build_dir());
+                            ui.dscroll = 0;
+                            ui.detail = true;
+                        }
+                    }
                     KeyCode::Esc => ui.detail = false,
                     KeyCode::Char('p') | KeyCode::Char('P') => {
                         source.control(&ControlSet {
@@ -426,7 +445,7 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui, src: &dyn Source) {
 
     // detail overlay (drawn on top of the back-buffer)
     if ui.detail {
-        render_detail(scr, snap, ui, w, h);
+        render_detail(scr, ui, w, h);
     }
 }
 
@@ -706,46 +725,216 @@ fn status_panel(snap: &Snapshot, ui: &Ui) -> String {
     }
 }
 
-fn render_detail(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16) {
-    let lines: Vec<String> = match TABS[ui.tab] {
-        "failures" => snap
-            .failures_recent
-            .get(ui.sel)
-            .map(|f| {
-                vec![
-                    format!("FAILURE: {}", f.slug),
-                    format!("provenance: {}", prov_str(&f.compiler_version, &f.backend, &f.builder_version)),
-                    format!("log: {}", f.log),
-                    String::new(),
-                    f.error.clone(),
-                ]
-            })
-            .unwrap_or_default(),
-        "built" => snap
-            .built_recent
-            .get(ui.sel)
-            .map(|b| {
-                vec![
-                    format!("BUILT: {}", b.slug),
-                    format!("provenance: {}", prov_str(&b.compiler_version, &b.backend, &b.builder_version)),
-                    format!("size: {}   vs shipped: {}", human(b.bytes), if b.compare.is_empty() { "n/a" } else { &b.compare }),
-                    format!("log: {}", b.log),
-                ]
-            })
-            .unwrap_or_default(),
-        _ => vec!["(no detail for this item)".into()],
-    };
-    let bh = (lines.len() as u16 + 4).min(h.saturating_sub(4));
-    let bw = w.saturating_sub(6);
-    let top = (h - bh) / 2;
-    for r in 0..bh {
-        put(scr, top + r, 2, &" ".repeat(bw as usize), Color::Black, w);
+/// Last `n` lines of a per-family log file (for the failure/built/building detail overlay).
+fn read_log_tail(path: &str, n: usize) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => {
+            let lines: Vec<&str> = t.lines().collect();
+            let start = lines.len().saturating_sub(n);
+            lines[start..].iter().map(|s| s.to_string()).collect()
+        }
+        Err(_) => Vec::new(),
     }
-    put(scr, top, 2, &format!("┌{}┐", "─".repeat(bw as usize - 2)), Color::Cyan, w);
-    for (i, l) in lines.iter().enumerate() {
-        put(scr, top + 1 + i as u16, 4, l, Color::White, w);
+}
+
+/// Word-wrap one logical line to `width` columns, preserving a leading-space indent and hard-breaking
+/// over-long words. So a long error message renders as multiple lines instead of overflowing.
+fn wrap_line(s: &str, width: usize) -> Vec<String> {
+    if width == 0 || s.chars().count() <= width {
+        return vec![s.to_string()];
     }
-    put(scr, top + bh - 1, 2, &format!("└{}┘  [Esc] close", "─".repeat(bw as usize - 2)), Color::Cyan, w);
+    let indent: String = s.chars().take_while(|c| *c == ' ').collect();
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        let candidate = if cur.is_empty() { word.to_string() } else { format!("{} {}", cur, word) };
+        if candidate.chars().count() <= width {
+            cur = candidate;
+        } else {
+            if !cur.is_empty() {
+                out.push(cur);
+            }
+            cur = format!("{}{}", indent, word);
+            while cur.chars().count() > width {
+                out.push(cur.chars().take(width).collect());
+                cur = format!("{}{}", indent, cur.chars().skip(width).collect::<String>().trim_start());
+            }
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Build the full detail content for the selected list item — a faithful port of the Python
+/// `_detail_lines` (incl. reading the per-family log tail). Captured ONCE when the overlay opens.
+fn build_detail(snap: &Snapshot, tab: usize, sel: usize, build_dir: &std::path::Path) -> Vec<String> {
+    let mut o: Vec<String> = Vec::new();
+    let logname = |slug: &str| build_dir.join("logs").join(format!("{}.log", slug.replace('/', "__")));
+    match TABS[tab] {
+        "failures" => {
+            if let Some(f) = snap.failures_recent.get(sel) {
+                o.push(format!("Failed: {}", f.slug));
+                o.push(format!("provenance: {}", prov_str(&f.compiler_version, &f.backend, &f.builder_version)));
+                o.push(format!("rebuild: gflib-build --only {} --rebuild --yes", f.slug));
+                o.push(String::new());
+                o.push("error:".into());
+                o.push(format!("  {}", f.error));
+                o.push(String::new());
+                o.push(format!("log: {}", if f.log.is_empty() { "(none)".into() } else { f.log.clone() }));
+                o.push("log tail:".into());
+                for ln in read_log_tail(&f.log, 120) {
+                    o.push(format!("  {}", ln));
+                }
+            }
+        }
+        "built" => {
+            if let Some(b) = snap.built_recent.get(sel) {
+                o.push(format!("Built: {}", b.slug));
+                o.push(format!("backend: {}", if b.backend.is_empty() { "?" } else { &b.backend }));
+                o.push(format!("output size: {}", human(b.bytes)));
+                o.push(format!("vs shipped: {}", if b.compare.is_empty() { "(not compared)" } else { &b.compare }));
+                o.push(format!("provenance: {}", prov_str(&b.compiler_version, &b.backend, &b.builder_version)));
+                o.push(format!("fonts: {}", build_dir.join("out").join(b.slug.replace('/', "__")).display()));
+                o.push(format!("rebuild: gflib-build --only {} --rebuild --yes", b.slug));
+                if !b.log.is_empty() {
+                    o.push(String::new());
+                    o.push("log tail:".into());
+                    for ln in read_log_tail(&b.log, 60) {
+                        o.push(format!("  {}", ln));
+                    }
+                }
+            }
+        }
+        "queue" => {
+            if let Some(q) = snap.queued_list.get(sel) {
+                o.push(format!("Queued family: {}", q.slug));
+                o.push(format!("kind: {}", q.kind));
+                o.push(String::new());
+                o.push(match q.kind.as_str() {
+                    "retry" => "Re-attempt after a previous build FAILURE (its cause may now be fixable: a rebuilt venv, a retried clone, a code fix, …).",
+                    "rebuild" => "Rebuild of a family that already built successfully — forced by --rebuild or by pressing [R] on a built family.",
+                    _ => "A fresh target — this family has never been built.",
+                }.to_string());
+            }
+        }
+        "cohorts" => {
+            if let Some(c) = snap.cohorts.get(sel) {
+                o.push(format!("Cohort: {}", c.key));
+                o.push(format!("families: {}", c.count));
+                o.push(String::new());
+                o.push("family names:".into());
+                if c.families.is_empty() {
+                    o.push("  (none assigned yet)".into());
+                }
+                for n in &c.families {
+                    o.push(format!("  {}", n));
+                }
+                o.push(String::new());
+                o.push("requirements:".into());
+                if c.requirements.is_empty() {
+                    o.push("  (none — the 'base' cohort has no requirements file)".into());
+                }
+                for r in c.requirements.lines() {
+                    o.push(format!("  {}", r));
+                }
+            }
+        }
+        "stats" => {
+            if let Some(fc) = snap.fail_categories.get(sel) {
+                o.push(format!("Failure cause: {}", fc.cat));
+                o.push(format!("families affected: {}", fc.count));
+                o.push(String::new());
+                o.push("affected families:".into());
+                if fc.families.is_empty() {
+                    o.push("  (none)".into());
+                }
+                for s in &fc.families {
+                    o.push(format!("  {}", s));
+                }
+                o.push(String::new());
+                o.push("what to do:".into());
+                o.push(format!("  {}", fc.hint));
+            }
+        }
+        "overview" => {
+            if let Some(b) = snap.building.get(sel) {
+                let logp = logname(&b.slug);
+                o.push(format!("Building: {}", b.slug));
+                o.push(format!("worker: {}", b.worker));
+                o.push(format!("elapsed: {}", hms(b.dur)));
+                o.push(format!("step: {}", if !b.note.is_empty() { &b.note } else if !b.backend.is_empty() { &b.backend } else { "(starting)" }));
+                o.push(format!("log: {}", logp.display()));
+                o.push("log tail:".into());
+                for ln in read_log_tail(&logp.to_string_lossy(), 60) {
+                    o.push(format!("  {}", ln));
+                }
+            }
+        }
+        "archive" => {
+            if let Some(repo) = snap.archive.pending.get(sel) {
+                o.push(format!("Queued to mirror: {}", repo));
+                o.push(String::new());
+                o.push("This upstream repo is not yet in the archive; it will be cloned (append-only) when --mirror-missing is on.".into());
+            }
+        }
+        "config" => {
+            let f = CONFIG_FIELDS.get(sel).copied().unwrap_or("");
+            o.push(format!("Setting: {}", f));
+            o.push(String::new());
+            o.push(match f {
+                "jobs" => "Number of parallel build workers. ←/→ to change; applied live to the running build.",
+                "percent" => "Build an evenly-spaced P% sample of the library. Raising it live enqueues the newly-included families.",
+                "backend" => "Compiler: auto (fontc-first, fontmake fallback) · fontc · fontmake · both (build with each and compare).",
+                "compare" => "sha256-compare the built fonts to the shipped binaries (metadata mode only).",
+                "paused" => "Pause / resume the worker pool.",
+                _ => "",
+            }.to_string());
+        }
+        _ => o.push("(no detail for this item)".into()),
+    }
+    if o.is_empty() {
+        o.push("(no detail for this item)".into());
+    }
+    o
+}
+
+fn render_detail(scr: &mut Screen, ui: &Ui, w: u16, h: u16) {
+    // full-width overlay covering the body region (like the Python detail overlay), scrollable.
+    let top = 5u16;
+    let body_top = top + 1;
+    let view = h.saturating_sub(body_top + 1).max(1) as usize; // leave the bottom row free
+    let inner = (w.saturating_sub(3)).max(10) as usize;
+    // word-wrap the captured logical lines; mark "header:" lines (no leading space + ends with ':')
+    let mut wrapped: Vec<(String, bool)> = Vec::new();
+    for l in &ui.detail_lines {
+        if l.is_empty() {
+            wrapped.push((String::new(), false));
+            continue;
+        }
+        let is_hdr = !l.starts_with(' ') && l.ends_with(':');
+        for wl in wrap_line(l, inner) {
+            wrapped.push((wl, is_hdr));
+        }
+    }
+    let maxscroll = wrapped.len().saturating_sub(view);
+    let ds = ui.dscroll.min(maxscroll);
+    // clear the overlay region so the body underneath doesn't show through
+    for r in top..h {
+        put(scr, r, 0, &" ".repeat(w as usize), Color::Reset, w);
+    }
+    let hdr = " Details — [Esc/↵] back   [↑↓] scroll ";
+    let pad = (w as usize).saturating_sub(hdr.chars().count());
+    put(scr, top, 0, &format!("{}{}", hdr, "─".repeat(pad)), Color::Cyan, w);
+    for (i, (wl, is_hdr)) in wrapped.iter().skip(ds).take(view).enumerate() {
+        let color = if *is_hdr { Color::Cyan } else { Color::White };
+        put(scr, body_top + i as u16, 1, wl, color, w);
+    }
+    if maxscroll > 0 {
+        let pos = format!(" {}–{}/{} ", ds + 1, (ds + view).min(wrapped.len()), wrapped.len());
+        put(scr, h.saturating_sub(1), w.saturating_sub(pos.len() as u16 + 1), &pos, Color::DarkGrey, w);
+    }
 }
 
 fn prov_str(cver: &str, backend: &str, bver: &str) -> String {
