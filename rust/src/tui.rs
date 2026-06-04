@@ -8,15 +8,16 @@
 use crate::model::{ControlSet, Snapshot};
 use crate::monitor::Source;
 use crate::util::{human, hms};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use crossterm::event::{self, Event, KeyCode};
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::{cursor, queue, terminal};
 use std::io::{Stdout, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
+// Tab order MUST match the Python CursesFrontend.VIEWS tuple exactly (Tab/Shift-Tab cycle order).
 const TABS: [&str; 8] = [
-    "config", "overview", "queue", "cohorts", "built", "failures", "stats", "archive",
+    "config", "overview", "queue", "cohorts", "archive", "built", "failures", "stats",
 ];
 
 // The live-editable config fields (R5): ←/→ adjusts the selected one and applies it to the running
@@ -78,7 +79,7 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
         // draw the whole frame into a back-buffer, then emit only the cells that changed (no flicker)
         let (w, h) = terminal::size().unwrap_or((100, 40));
         let mut scr = Screen::new(w.max(1), h.max(1));
-        render(&mut scr, &snap, &ui, &*source);
+        render(&mut scr, &snap, &ui);
         flush_diff(&mut out, &scr, &prev)?;
         prev = Some(scr);
 
@@ -121,31 +122,39 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
                         }
                     }
                     KeyCode::Left => {
-                        if TABS[ui.tab] == "config" {
+                        if ui.detail {
+                            ui.detail = false; // ← closes the detail overlay (matches Python)
+                        } else if TABS[ui.tab] == "config" {
                             adjust_config(&snap, ui.sel, -1, &*source);
                         }
                     }
                     KeyCode::Right => {
-                        if TABS[ui.tab] == "config" {
+                        if !ui.detail && TABS[ui.tab] == "config" {
                             adjust_config(&snap, ui.sel, 1, &*source);
                         }
                     }
                     KeyCode::Char(' ') => {
-                        if TABS[ui.tab] == "config" {
+                        if !ui.detail && TABS[ui.tab] == "config" {
                             adjust_config(&snap, ui.sel, 1, &*source); // space toggles bools / steps
                         }
                     }
-                    KeyCode::Enter => {
+                    KeyCode::Enter | KeyCode::Backspace => {
                         if ui.detail {
-                            ui.detail = false;
-                        } else {
+                            ui.detail = false; // ↵/⌫ close the overlay
+                        } else if k.code == KeyCode::Enter {
                             // capture the detail ONCE (reads the log-file tail here, not every frame)
                             ui.detail_lines = build_detail(&snap, ui.tab, ui.sel, &source.build_dir());
                             ui.dscroll = 0;
                             ui.detail = true;
                         }
                     }
-                    KeyCode::Esc => ui.detail = false,
+                    KeyCode::Esc => {
+                        if ui.detail {
+                            ui.detail = false;
+                        } else {
+                            break TuiResult::Quit; // Python: Esc with no open detail cancels/quits
+                        }
+                    }
                     KeyCode::Char('p') | KeyCode::Char('P') => {
                         source.control(&ControlSet {
                             paused: Some(!snap.paused),
@@ -160,24 +169,7 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
                             });
                         }
                     }
-                    KeyCode::Char('+') => {
-                        source.control(&ControlSet {
-                            jobs: Some(snap.jobs + 1),
-                            ..Default::default()
-                        });
-                    }
-                    KeyCode::Char('-') => {
-                        source.control(&ControlSet {
-                            jobs: Some(snap.jobs.saturating_sub(1).max(1)),
-                            ..Default::default()
-                        });
-                    }
-                    _ => {
-                        // allow Shift-Tab via modifiers on some terminals
-                        if k.modifiers.contains(KeyModifiers::SHIFT) && k.code == KeyCode::Tab {
-                            ui.tab = (ui.tab + TABS.len() - 1) % TABS.len();
-                        }
-                    }
+                    _ => {}
                 }
             }
         }
@@ -245,10 +237,11 @@ fn selected_slug(snap: &Snapshot, tab: usize, sel: usize) -> Option<String> {
 struct Cell {
     ch: char,
     fg: Color,
+    reverse: bool, // A_REVERSE equivalent (active tab, focused section header, selected row)
 }
 impl Default for Cell {
     fn default() -> Self {
-        Cell { ch: ' ', fg: Color::Reset }
+        Cell { ch: ' ', fg: Color::Reset, reverse: false }
     }
 }
 struct Screen {
@@ -260,7 +253,7 @@ impl Screen {
     fn new(w: u16, h: u16) -> Self {
         Screen { w, h, cells: vec![Cell::default(); (w as usize) * (h as usize)] }
     }
-    fn set(&mut self, row: u16, col: u16, text: &str, fg: Color) {
+    fn set(&mut self, row: u16, col: u16, text: &str, fg: Color, reverse: bool) {
         if row >= self.h {
             return;
         }
@@ -270,7 +263,7 @@ impl Screen {
                 break;
             }
             let idx = (row as usize) * (self.w as usize) + c as usize;
-            self.cells[idx] = Cell { ch, fg };
+            self.cells[idx] = Cell { ch, fg, reverse };
             c += 1;
         }
     }
@@ -278,7 +271,29 @@ impl Screen {
 
 /// Draw `text` at (row,col) into the back-buffer `scr`. (`_w` kept for call-site compatibility.)
 fn put(scr: &mut Screen, row: u16, col: u16, text: &str, color: Color, _w: u16) {
-    scr.set(row, col, text, color);
+    scr.set(row, col, text, color, false);
+}
+
+/// Like `put`, but in reverse video (A_REVERSE) — for the active tab, focused section headers and
+/// the selected row (matching the Python `curses.A_REVERSE` highlight, not a colour swap).
+fn put_rev(scr: &mut Screen, row: u16, col: u16, text: &str, color: Color, reverse: bool) {
+    scr.set(row, col, text, color, reverse);
+}
+
+/// Draw a sequence of coloured `(text, colour)` segments starting at (row,col) — a faithful port of
+/// the Python multi-colour rows (e.g. cohort family names GREEN with CYAN " | " separators). When
+/// `reverse` is set the whole row is drawn in reverse video as a single colour (the selected row).
+fn put_segments(scr: &mut Screen, row: u16, col: u16, segs: &[(String, Color)], reverse: bool) {
+    let mut c = col;
+    if reverse {
+        let joined: String = segs.iter().map(|(t, _)| t.as_str()).collect();
+        scr.set(row, c, &joined, Color::White, true);
+        return;
+    }
+    for (text, color) in segs {
+        scr.set(row, c, text, *color, false);
+        c += text.chars().count() as u16;
+    }
 }
 
 /// Emit only the cells that differ from the previous frame (runs of same colour), so the terminal
@@ -299,36 +314,54 @@ fn flush_diff(out: &mut Stdout, new: &Screen, prev: &Option<Screen>) -> std::io:
                 continue;
             }
             let fg = nc.fg;
+            let rev = nc.reverse;
             let start = col;
             let mut run = String::new();
             while col < new.w {
                 let i = (row as usize) * (new.w as usize) + col as usize;
                 let cc = &new.cells[i];
                 let ch_changed = full || prev.as_ref().map(|p| p.cells.get(i) != Some(cc)).unwrap_or(true);
-                if !ch_changed || cc.fg != fg {
+                if !ch_changed || cc.fg != fg || cc.reverse != rev {
                     break;
                 }
                 run.push(cc.ch);
                 col += 1;
             }
-            queue!(out, cursor::MoveTo(start, row), SetForegroundColor(fg), Print(run), ResetColor)?;
+            queue!(out, cursor::MoveTo(start, row))?;
+            if rev {
+                queue!(out, SetAttribute(Attribute::Reverse))?;
+            }
+            queue!(out, SetForegroundColor(fg), Print(run), SetAttribute(Attribute::Reset), ResetColor)?;
         }
     }
     out.flush()
 }
 
-fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui, src: &dyn Source) {
+/// Humanize a phase id for the header, mirroring the Python `PHASE_LABEL` map.
+fn phase_label(ph: &str) -> &str {
+    match ph {
+        "init" => "starting…",
+        "clone_gf" => "cloning google/fonts",
+        "build_fontc" => "building fontc from source",
+        "discover" => "discovering worklist",
+        "archive" => "populating archive (mirroring repos)",
+        "cohorts" => "scanning dependency cohorts",
+        "build" => "building",
+        "done" => "done",
+        _ => ph,
+    }
+}
+
+fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
     let (w, h) = (scr.w, scr.h);
 
-    // ---- header ----
-    let mode = if src.is_live() { "live" } else if snap.daemon_alive { "monitor" } else { "stopped" };
+    // ---- header (row 0/1) — matches Python exactly: title + [PAUSED], elapsed at w-24 ----
     let title = format!(
-        " Google Fonts library build — Rust port [{}]{}",
-        mode,
-        if snap.paused { "  [PAUSED]" } else { "" }
+        " Google Fonts library build{}",
+        if snap.paused { " [PAUSED]" } else { "" }
     );
     put(scr, 0, 0, &title, Color::White, w);
-    put(scr, 0, w.saturating_sub(18), &format!("elapsed {}", hms(snap.elapsed)), Color::Grey, w);
+    put(scr, 0, w.saturating_sub(24), &format!("elapsed {}", hms(snap.elapsed)), Color::White, w);
 
     let bld = snap.disk_build_total;
     let arc = snap.disk_archive_total;
@@ -343,55 +376,77 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui, src: &dyn Source) {
         1,
         0,
         &format!(
-            " {}  free {}  jobs {}  fontc {}/fontmake {}",
-            disk, human(snap.disk_free), snap.jobs, snap.backends.fontc, snap.backends.fontmake
+            " {}  free {}  jobs {}  cohorts {}  fontc {}/fontmake {}",
+            disk, human(snap.disk_free), snap.jobs, snap.cohorts.len(),
+            snap.backends.fontc, snap.backends.fontmake
         ),
         Color::Cyan,
         w,
     );
 
-    // ---- phase + progress ----
+    // ---- phase + progress (row 2/3) — faithful port of the Python progress bar ----
+    // The bar measures progress over the IN-SCOPE worklist (built + failed + queued + building =
+    // total − skipped). 'skipped' = NOT selected this run (outside the % sample / --only); counting
+    // it as done made the bar read ~100% even when most of the library was never attempted.
     let c = &snap.counts;
-    let processed = c.built + c.failed + c.skipped;
-    let in_scope = processed + c.queued + c.building;
-    let pct = if in_scope > 0 { processed * 100 / in_scope } else { 0 };
-    put(
-        scr,
-        2,
-        0,
-        &format!(
-            " Phase: {}   built {}  failed {}  building {}  queued {}",
-            snap.phase, c.built, c.failed, c.building, c.queued
-        ),
-        Color::Green,
-        w,
-    );
-    // completion banner (R5): when the build is done / the daemon died, say so prominently instead
-    // of leaving the dashboard looking frozen mid-flight.
-    if snap.done && snap.total > 0 {
-        let top = snap.fail_categories.first().map(|f| format!("  ·  top cause: {} ({})", f.cat, f.count)).unwrap_or_default();
-        put(scr, 3, 0, &format!(" ✓ BUILD COMPLETE — built {} · failed {} · skipped {} of {}{}",
-            c.built, c.failed, c.skipped, snap.total, top), Color::Green, w);
-    } else if !src.is_live() && !snap.daemon_alive && snap.total > 0 {
-        put(scr, 3, 0, &format!(" ■ DAEMON STOPPED — built {} · failed {} · queued {} (re-run to resume)",
-            c.built, c.failed, c.queued), Color::Yellow, w);
+    let inscope = c.built + c.failed + c.queued + c.building;
+    let done = c.built + c.failed;
+    let ph = snap.phase.as_str();
+    let plabel = phase_label(ph);
+    let segmented;
+    let frac;
+    let bar_label;
+    if (ph == "archive" || ph == "cohorts") && snap.phase_total > 0 {
+        let (pd, pt) = (snap.phase_done, snap.phase_total);
+        put(scr, 2, 0, &format!(" Phase: {}  {}/{}  {}", plabel, pd, pt, trunc(&snap.phase_label, 30)), Color::Yellow, w);
+        frac = pd as f64 / pt.max(1) as f64;
+        segmented = false;
+        bar_label = format!(" {}/{} {} ({}%) ", pd, pt, plabel, (100.0 * frac) as u64);
     } else {
-        let barw = w.saturating_sub(8) as usize;
-        let fill = barw * pct / 100;
-        let bar: String = std::iter::repeat('#').take(fill).chain(std::iter::repeat('-').take(barw - fill)).collect();
-        put(scr, 3, 0, &format!(" [{}] {:>3}%", bar, pct), Color::Cyan, w);
-    }
-
-    // ---- tab bar ----
-    let mut tabline = String::from(" ");
-    for (i, t) in TABS.iter().enumerate() {
-        if i == ui.tab {
-            tabline.push_str(&format!("[{}] ", t));
-        } else {
-            tabline.push_str(&format!(" {}  ", t));
+        put(scr, 2, 0, &format!(" Phase: {}   built {}  failed {}  building {}  queued {}",
+            plabel, c.built, c.failed, c.building, c.queued), Color::White, w);
+        // skipped = NOT selected this run — surface it with the fix (raise % / drop --only)
+        if c.skipped > 0 {
+            let hint = format!("{} skipped (not selected — raise % to 100 to build them)", c.skipped);
+            put(scr, 2, w.saturating_sub(hint.chars().count() as u16 + 1), &hint, Color::Yellow, w);
         }
+        frac = done as f64 / inscope.max(1) as f64;
+        segmented = true;
+        bar_label = format!(" {}/{} attempted ({}%){} ", done, inscope, (100.0 * frac) as u64,
+            if c.skipped > 0 { format!(" · {} skipped", c.skipped) } else { String::new() });
     }
-    put(scr, 4, 0, &tabline, Color::Yellow, w);
+    if !snap.phase_error.is_empty() {
+        put(scr, 2, w.saturating_sub(30), &format!("ERR {}", trunc(&snap.phase_error, 24)), Color::Red, w);
+    }
+    let barw = (w.saturating_sub(4)).max(10) as usize;
+    if segmented {
+        // colour the IN-SCOPE bar by outcome: built (green) · failed (red) · not-yet-attempted (dim)
+        let base = inscope.max(1);
+        let bw = barw * c.built / base;
+        let fw = barw * c.failed / base;
+        let rest = barw.saturating_sub(bw + fw); // queued + building (not yet attempted)
+        put(scr, 3, 1, "[", Color::White, w);
+        let mut x = 2u16;
+        if bw > 0 { put(scr, 3, x, &"#".repeat(bw), Color::Green, w); x += bw as u16; }
+        if fw > 0 { put(scr, 3, x, &"#".repeat(fw), Color::Red, w); x += fw as u16; }
+        if rest > 0 { put(scr, 3, x, &"-".repeat(rest), Color::DarkGrey, w); x += rest as u16; }
+        put(scr, 3, x, "]", Color::White, w);
+    } else {
+        let fill = (barw as f64 * frac) as usize;
+        put(scr, 3, 1, &format!("[{}{}]", "#".repeat(fill), "-".repeat(barw.saturating_sub(fill))), Color::Cyan, w);
+    }
+    // bold centred label overlaid on the bar
+    put(scr, 3, (barw as u16 / 2).max(2), &bar_label, Color::White, w);
+
+    // ---- tab bar (row 4) — active tab in reverse video, inactive dim, + switch hint ----
+    let mut x = 1u16;
+    for name in TABS.iter() {
+        let label = format!(" {} ", name);
+        let active = *name == TABS[ui.tab];
+        put_rev(scr, 4, x, &label, if active { Color::White } else { Color::DarkGrey }, active);
+        x += label.chars().count() as u16;
+    }
+    put(scr, 4, x.saturating_add(2).max(w.saturating_sub(24)), "[Tab]/[⇧Tab] switch tabs", Color::DarkGrey, w);
 
     // ---- pinned now-building (on every tab) ----
     let body_top = 6u16;
@@ -423,10 +478,7 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui, src: &dyn Source) {
             scr, row, avail, w, ui.sel, "Queue",
             snap.queued_list.iter().map(|q| format!("{:<48} {}", q.slug, q.kind)).collect(),
         ),
-        "cohorts" => render_list_simple(
-            scr, row, avail, w, ui.sel, "Cohorts",
-            snap.cohorts.iter().map(|c| format!("{:<20} {} families", c.key, c.count)).collect(),
-        ),
+        "cohorts" => render_cohorts(scr, snap, row, avail, w, ui.sel),
         "built" => render_built(scr, snap, row, avail, w, ui.sel),
         "failures" => render_failures(scr, snap, row, avail, w, ui.sel),
         "stats" => render_stats(scr, snap, row, avail, w),
@@ -438,10 +490,15 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui, src: &dyn Source) {
     put(scr, panel_row, 0, &"─".repeat(w as usize), Color::DarkGrey, w);
     put(scr, panel_row, 0, &status_panel(snap, ui), Color::White, w);
 
-    // ---- footer ----
-    put(scr, footer_row, 0,
-        " [Tab/⇧Tab]tabs  [↑↓]item  [↵]details  [p]ause  [R]etry  [+/-]jobs  [C]onfig  [q]uit",
-        Color::DarkGrey, w);
+    // ---- footer (mode-dependent, matching the Python help strings) ----
+    let footer = if ui.detail {
+        " [esc/←/↵] back to list   [↑↓] scroll"
+    } else if TABS[ui.tab] == "config" {
+        " [Tab/⇧Tab]tabs  [↑↓]field  [←→]change  [space]toggle  [C]onfig  [q]uit"
+    } else {
+        " [Tab/⇧Tab]tabs  [↑↓]item  [↵]details  [p]ause  [R]etry  [C]onfig  [q]uit"
+    };
+    put(scr, footer_row, 0, footer, Color::DarkGrey, w);
 
     // detail overlay (drawn on top of the back-buffer)
     if ui.detail {
@@ -514,6 +571,48 @@ fn render_list_simple(
         let color = if i == sel { Color::Yellow } else { Color::Grey };
         let marker = if i == sel { "▸ " } else { "  " };
         put(scr, row, 0, &format!("{}{}", marker, it), color, w);
+        row += 1;
+    }
+}
+
+/// The cohort row as coloured segments, mirroring the Python `cohorts` section formatter:
+/// a cached/uncached dot, `count + key` in the cohort colour (CYAN, or default for "base"), then the
+/// family names in GREEN with CYAN " | " separators.
+fn cohort_segments(co: &crate::model::CohortView) -> Vec<(String, Color)> {
+    let mut segs: Vec<(String, Color)> = Vec::new();
+    segs.push((
+        if co.cached { "● ".into() } else { "○ ".into() },
+        if co.cached { Color::Green } else { Color::DarkGrey },
+    ));
+    segs.push((
+        format!("{:>4}  {:<14} ", co.count, co.key),
+        if co.key == "base" { Color::White } else { Color::Cyan },
+    ));
+    if co.families.is_empty() {
+        segs.push(("(no families yet)".into(), Color::Green));
+    } else {
+        for (i, n) in co.families.iter().enumerate() {
+            if i > 0 {
+                segs.push((" | ".into(), Color::Cyan));
+            }
+            segs.push((n.clone(), Color::Green));
+        }
+    }
+    segs
+}
+
+fn render_cohorts(scr: &mut Screen, snap: &Snapshot, top: u16, avail: u16, w: u16, sel: usize) {
+    // section header (reverse-video, dash-filled) like the Python focused section
+    let mut hdr = format!(" ▼ Dependency cohorts  (● = venv cached on disk, reused next run) ({}) ", snap.cohorts.len());
+    while hdr.chars().count() < (w as usize).saturating_sub(1) {
+        hdr.push('-');
+    }
+    put_rev(scr, top, 0, &hdr, Color::White, true);
+    let mut row = top + 1;
+    let view = (avail as usize).saturating_sub(1);
+    let start = scroll_start(sel, view, snap.cohorts.len());
+    for (i, co) in snap.cohorts.iter().enumerate().skip(start).take(view) {
+        put_segments(scr, row, 1, &cohort_segments(co), i == sel);
         row += 1;
     }
 }
