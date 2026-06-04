@@ -147,6 +147,20 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  .pin{background:#1a1505;border:1px solid #3b2f08;border-radius:6px;padding:4px 0;margin:6px 0}
  .pin .sec{background:none;border:none;color:var(--y);margin:2px 0}
  .cfg td{padding:1px 10px 1px 8px;white-space:pre}
+ /* charts (hand-rolled, dependency-free: CSS-div bars + inline-SVG donuts/rings) */
+ .chartrow{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0}
+ .chart{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;flex:1;min-width:250px}
+ .ctitle{color:#fff;font-weight:600;margin-bottom:8px;font-size:12px}
+ .bars{display:flex;flex-direction:column;gap:3px}
+ .brow{display:flex;align-items:center;gap:6px}
+ .blabel{width:36%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--gr);font-size:11px}
+ .btrack{flex:1;background:var(--line);border-radius:3px;height:12px;overflow:hidden}
+ .bfill{display:block;height:100%;border-radius:3px}
+ .bval{width:66px;text-align:right;color:var(--muted);font-size:11px}
+ .dwrap{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+ .legend{font-size:11px;color:var(--gr)}
+ .legend span{display:inline-block;margin:2px 10px 0 0}
+ .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:middle}
 </style></head><body>
 <div id="hdr"></div>
 <div id="bar"></div>
@@ -309,11 +323,11 @@ function render(){
   pin='<div class="pin"><div class="sec">▶ Now building ('+bl.length+')</div>'+bl.slice(0,cap).map(b=>R(buildingRow(b).segs)).join('')+
    (bl.length>cap?'<div class="ln muted">  … (+'+(bl.length-cap)+' more)</div>':'')+'</div>';}
  document.getElementById('pin').innerHTML=pin;
- // ---- body per tab ----
- let body;
- if(tab=='config')body=cfgView();
- else if(tab=='archive')body=archiveView();
- else{body=(tab=='stats'?statsPrefix():'')+sections(tab).map(renderSec).join('');}
+ // ---- body per tab: charts (web-only) first, then the same content as the TUI ----
+ let body=charts(tab);
+ if(tab=='config')body+=cfgView();
+ else if(tab=='archive')body+=archiveView();
+ else{body+=(tab=='stats'?statsPrefix():'')+sections(tab).map(renderSec).join('');}
  document.getElementById('body').innerHTML=body;
 }
 
@@ -338,6 +352,61 @@ function barHTML(){const c=snap.counts||{},ph=snap.phase;
   '<div class="barlbl">'+done+'/'+inscope+' attempted ('+pct+'%)'+skip+'</div></div>';
 }
 function phaseLabel(ph){return {init:'starting…',clone_gf:'cloning google/fonts',build_fontc:'building fontc from source',discover:'discovering worklist',archive:'populating archive (mirroring repos)',cohorts:'scanning dependency cohorts',build:'building',done:'done'}[ph]||ph||''}
+
+// ---- charts: hand-rolled, dependency-free (CSS-div bars + inline-SVG donuts/rings) ----
+function chartCard(title,inner){return '<div class="chart"><div class="ctitle">'+E(title)+'</div>'+inner+'</div>'}
+function barChart(items,unit){
+ if(!items.length)return '<div class="muted">(no data yet)</div>';
+ const max=Math.max.apply(null,items.map(i=>i.value).concat([1]));
+ return '<div class="bars">'+items.map(i=>'<div class="brow"><span class="blabel" title="'+E(i.label)+'">'+E(i.label)+'</span>'+
+  '<span class="btrack"><span class="bfill" style="width:'+(100*i.value/max).toFixed(1)+'%;background:'+i.color+'"></span></span>'+
+  '<span class="bval">'+E(i.disp!=null?i.disp:i.value)+(unit||'')+'</span></div>').join('')+'</div>';
+}
+function donut(slices,cx){
+ const r=cx-9,C=2*Math.PI*r,total=slices.reduce((a,s)=>a+(s.value||0),0)||1;let off=0,arcs='';
+ slices.forEach(s=>{const len=C*(s.value||0)/total;if(len>0){
+  arcs+='<circle cx="'+cx+'" cy="'+cx+'" r="'+r+'" fill="none" stroke="'+s.color+'" stroke-width="13" stroke-dasharray="'+len+' '+(C-len)+'" stroke-dashoffset="'+(-off)+'" transform="rotate(-90 '+cx+' '+cx+')"/>';off+=len;}});
+ if(!arcs)arcs='<circle cx="'+cx+'" cy="'+cx+'" r="'+r+'" fill="none" stroke="#1e293b" stroke-width="13"/>';
+ return '<svg width="'+(cx*2)+'" height="'+(cx*2)+'" viewBox="0 0 '+(cx*2)+' '+(cx*2)+'">'+arcs+'</svg>';
+}
+function ring(done,total,sub){
+ const r=34,C=2*Math.PI*r,frac=total?done/total:0,len=C*frac;
+ return '<svg width="88" height="88" viewBox="0 0 88 88">'+
+  '<circle cx="44" cy="44" r="34" fill="none" stroke="#1e293b" stroke-width="10"/>'+
+  (len>0?'<circle cx="44" cy="44" r="34" fill="none" stroke="#06b6d4" stroke-width="10" stroke-linecap="round" stroke-dasharray="'+len+' '+(C-len)+'" transform="rotate(-90 44 44)"/>':'')+
+  '<text x="44" y="42" text-anchor="middle" fill="#fff" font-size="15" font-weight="600">'+Math.floor(100*frac)+'%</text>'+
+  '<text x="44" y="58" text-anchor="middle" fill="#7c8aa0" font-size="9">'+E(sub||'')+'</text></svg>';
+}
+function legend(slices){return '<div class="legend">'+slices.filter(s=>(s.value||0)>0).map(s=>'<span><i style="background:'+s.color+'"></i>'+E(s.label)+' '+(s.value||0)+'</span>').join('')+'</div>'}
+
+function charts(t){
+ const c=snap.counts||{};
+ if(t=='overview'){
+  const sl=[{label:'built',value:c.built||0,color:'#22c55e'},{label:'failed',value:c.failed||0,color:'#ef4444'},{label:'building',value:c.building||0,color:'#06b6d4'},{label:'queued',value:c.queued||0,color:'#eab308'},{label:'skipped',value:c.skipped||0,color:'#475569'}];
+  const fc=(snap.fail_categories||[]).slice().sort((a,b)=>b.count-a.count).slice(0,6).map(x=>({label:x.cat,value:x.count,color:'#ef4444'}));
+  return '<div class="chartrow">'+chartCard('outcome','<div class="dwrap">'+donut(sl,52)+legend(sl)+'</div>')+chartCard('top failure causes',barChart(fc))+'</div>';
+ }
+ if(t=='failures'){
+  const fc=(snap.fail_categories||[]).slice().sort((a,b)=>b.count-a.count).map(x=>({label:x.cat,value:x.count,color:'#ef4444'}));
+  return fc.length?'<div class="chartrow">'+chartCard('failures by cause',barChart(fc))+'</div>':'';
+ }
+ if(t=='stats'){
+  const ops=Object.entries(snap.op_stats||{}).sort((a,b)=>(b[1].total||0)-(a[1].total||0)).slice(0,8).map(e=>({label:e[0],value:e[1].total||0,color:'#06b6d4',disp:hms(e[1].total||0)}));
+  const m=snap.migration||{};
+  const sl=[{label:'fontc',value:m.fontc||0,color:'#22c55e'},{label:'fontmake-fallback',value:m.fontmake_fallback||0,color:'#eab308'},{label:'fontmake-only',value:m.fontmake_only||0,color:'#ef4444'},{label:'both',value:(m.both_identical||0)+(m.both_differ||0),color:'#06b6d4'}];
+  return '<div class="chartrow">'+chartCard('operation timing (bottlenecks)',barChart(ops))+chartCard('backend mix','<div class="dwrap">'+donut(sl,52)+legend(sl)+'</div>')+'</div>';
+ }
+ if(t=='cohorts'){
+  const co=(snap.cohorts||[]).slice().sort((a,b)=>b.count-a.count).slice(0,12).map(x=>({label:x.key,value:x.count,color:x.cached?'#22c55e':'#475569'}));
+  return co.length?'<div class="chartrow">'+chartCard('cohort sizes (green = venv cached on disk)',barChart(co))+'</div>':'';
+ }
+ if(t=='archive'){
+  const a=snap.archive||{},mir=a.total||0,pend=a.pending_total||0;
+  return '<div class="chartrow">'+chartCard('archive mirroring','<div class="dwrap">'+ring(mir,mir+pend,mir+' / '+(mir+pend))+
+   '<div class="legend"><span><i style="background:#06b6d4"></i>mirrored '+mir+'</span><span><i style="background:#1e293b"></i>queued '+pend+'</span></div></div>')+'</div>';
+ }
+ return '';
+}
 
 addEventListener('hashchange',()=>{const t=location.hash.slice(1);if(TABS.includes(t)){tab=t;render()}});
 if(TABS.includes(location.hash.slice(1)))tab=location.hash.slice(1);
