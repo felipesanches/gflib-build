@@ -67,6 +67,9 @@ Port `VenvManager` (863–1010) + `scan_cohorts` + `relax_requirements`:
   control (shared across cohorts), record the relaxations for the UI; classify too-deep backtracking.
 - read `requirements.txt` from mirrors **read-only** (`git show`), no extraction.
 - wire into `build_one` (replace the single `--build-python` with the cohort's python).
+- **PIN_OVERRIDES** (from the 22h failure assessment): force `compreffor>=0.5.6` + drop the
+  `fontbakery[googlefonts]` extra up front, folded into the readiness hash. Already in the Python
+  tool; must be reproduced here so Rust-built venvs recover the same ~125 families.
 - **Accept:** the dependency-heavy families that fail today build; parity harness shows Rust
   built-count ≈ Python on a dependency-mixed sample; venvs reused across runs (cached marker shown).
 

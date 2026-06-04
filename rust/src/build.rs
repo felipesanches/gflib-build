@@ -1041,7 +1041,17 @@ fn collect_outputs(
     let mut seen = HashSet::new();
     let mut total = 0u64;
 
+    // Scan `work` AND the stray `../fonts` dir: a google/fonts override config.yaml expects to run
+    // from sources/ and writes to `../fonts`, so staged at the work root the builder emits to
+    // work.parent/fonts — outside the per-family tree. The fresh-mtime + shipped-name filters below
+    // keep collecting from the shared dir safe under parallelism. (Parity with the Python fix.)
     let mut stack = vec![work.to_path_buf()];
+    if let Some(parent) = work.parent() {
+        let stray = parent.join("fonts");
+        if stray.is_dir() {
+            stack.push(stray);
+        }
+    }
     let mut fonts = Vec::new();
     while let Some(p) = stack.pop() {
         if let Ok(rd) = std::fs::read_dir(&p) {
@@ -1236,6 +1246,24 @@ mod compare_tests {
         let empty: BTreeMap<String, PathBuf> = BTreeMap::new();
         assert_eq!(compare_to_shipped(&gf, &fam, &empty), "missing");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_outputs_scans_stray_override_fonts_dir() {
+        // an override config.yaml writes to ../fonts (work.parent/fonts) — must be collected
+        let root = std::env::temp_dir().join(format!("_stray_{}", std::process::id()));
+        let work = root.join("work").join("ofl__demo");
+        let stray = root.join("work").join("fonts").join("ttf");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("Demo[wght].ttf"), b"FRESHFONT").unwrap();
+        let out = root.join("out");
+        let since = crate::util::now() - 1.0;
+        let (total, found, _extras) =
+            collect_outputs(&work, &out, &["Demo[wght].ttf".to_string()], since);
+        assert!(found.contains_key("Demo[wght].ttf"), "stray ../fonts output must be collected");
+        assert!(total > 0 && out.join("Demo[wght].ttf").is_file());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
