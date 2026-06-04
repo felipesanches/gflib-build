@@ -1083,7 +1083,22 @@ impl Orchestrator {
                 key: key.clone(),
                 count: fams.len(),
                 requirements: sh.cohort_reqs.get(key).cloned().unwrap_or_default(),
-                families: fams.clone(),
+                // show the family DISPLAY NAME (from METADATA.pb), falling back to the slug — matches
+                // the Python _rebuild_cohorts (`self.families[s].name if s in self.families else s`)
+                families: {
+                    let mut names: Vec<String> = fams
+                        .iter()
+                        .map(|s| {
+                            sh.families
+                                .get(s)
+                                .map(|f| f.name.clone())
+                                .filter(|n| !n.is_empty())
+                                .unwrap_or_else(|| s.clone())
+                        })
+                        .collect();
+                    names.sort();
+                    names
+                },
                 cached: sh.cached_cohorts.contains(key),
             })
             .collect();
