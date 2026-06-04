@@ -316,7 +316,7 @@ function failRow(f){return {segs:[[L(f.slug,34)+' ','r'],[f.error||'','dr']],rt:
 function qRow(q){const kc={retry:'y',rebuild:'c'}[q.kind]||'g';return {segs:[['  '+L(q.kind,8)+' ',kc],[q.slug||'','gr']],rt:q.slug,det:['queue',q.slug]}}
 // cohort member colour by build status: built=green, failed=red, building=yellow, else grey
 function famCls(st){return {built:'g',failed:'r',building:'y'}[st]||'muted'}
-function cohortRow(c){const segs=[[c.cached?'● ':'○ ',c.cached?'g':'muted'],[Rp(c.count,4)+'  '+L(c.key,14)+' ',c.key=='base'?'w':'c']];
+function cohortRow(c){const segs=[[c.cached?'● ':'○ ',c.cached?'g':'muted'],[Rp(c.count,4)+'  '+L(c.key,14)+' ',!c.cached?'muted':(c.key=='base'?'w':'c')]];
  const f=c.families||[];if(!f.length)segs.push(['(no families yet)','muted']);else f.forEach((m,i)=>{if(i)segs.push([' | ','c']);segs.push([m.name,famCls(m.status)])});
  return {segs,det:['cohort',c.key]}}
 function builtRow(b){const comp=b.compiler_version||b.backend||'';

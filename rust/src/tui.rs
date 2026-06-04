@@ -1104,7 +1104,8 @@ fn cohort_segments(co: &crate::model::CohortView) -> Vec<(String, Color)> {
     ));
     segs.push((
         format!("{:>4}  {:<14} ", co.count, co.key),
-        if co.key == "base" { Color::White } else { Color::Cyan },
+        // a not-yet-cached cohort's count + key are greyed (its venv isn't on disk yet)
+        if !co.cached { Color::DarkGrey } else if co.key == "base" { Color::White } else { Color::Cyan },
     ));
     if co.families.is_empty() {
         segs.push(("(no families yet)".into(), Color::DarkGrey));
