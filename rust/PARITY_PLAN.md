@@ -1,5 +1,10 @@
 # Rust port → drop-in replacement: parity plan
 
+> **STATUS (2026-06-05): COMPLETE.** Parity was achieved (including the TUI: segmented progress bar,
+> multi-section views, status panel, config-schema editor + setup wizard, archive pre-warmer, cohort
+> family names) and the Python implementation has been **removed** — Rust is now the official,
+> canonical implementation. This document is retained as a historical record of the migration.
+
 > **DECISION (2026-06-04): Option A — full drop-in.** Felipe chose to faithfully port the entire
 > Python tool, **including the cohort venv machinery (R2)**, for a true 1:1 replacement. §4's
 > recommendation toward (B)/(C) is therefore overridden; R2 is in scope in full. Execution order is

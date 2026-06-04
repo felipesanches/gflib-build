@@ -1,7 +1,11 @@
 # Architecture
 
-`gflib-build` is a single-file, pure-stdlib Python program (`gflib_build.py`) that
-orchestrates building every buildable family in the Google Fonts library from pristine
+> **Note:** the official implementation is now the **Rust** code in [`../rust/`](../rust/); the
+> original single-file Python program (`gflib_build.py`) has been removed (it lives in git history).
+> The pipeline, schemas and archive-safety invariants below are implementation-agnostic and remain
+> accurate — the Rust implementation is a faithful realization of this design.
+
+`gflib-build` orchestrates building every buildable family in the Google Fonts library from pristine
 archived sources, and renders progress through a pluggable frontend. The actual font
 compile is delegated to a separate interpreter/venv (gftools.builder + fontmake) and/or
 the `fontc` binary.

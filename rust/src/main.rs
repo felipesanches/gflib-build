@@ -2,7 +2,7 @@
 //!
 //! A from-scratch, archive-safe harness to build the entire Google Fonts library locally, with a
 //! live TUI, a web dashboard, a parallel build engine, and resumable state — kept schema-compatible
-//! with the Python `gflib_build.py` (same status.json / control.json / state.json), so the two
+//! with the original Python implementation's schema (same status.json / control.json / state.json), so the two
 //! interoperate: you can watch a Python daemon from this Rust TUI and vice-versa.
 
 mod build;

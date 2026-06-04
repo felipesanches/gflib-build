@@ -27,7 +27,7 @@ const SOURCE_CHOICES: [&str; 2] = ["metadata", "archive"];
 const BACKEND_CHOICES: [&str; 4] = ["auto", "fontc", "fontmake", "both"];
 
 // ---- the unified Configuration tab: a full schema editor used for BOTH live editing and first-run
-// setup — a faithful port of CONFIG_SCHEMA + the _cfg_* helpers in gflib_build.py. ----
+// setup — a faithful port of CONFIG_SCHEMA + the _cfg_* helpers from the original Python tool. ----
 #[derive(Clone)]
 enum CfgKind {
     Choice(&'static [&'static str]),

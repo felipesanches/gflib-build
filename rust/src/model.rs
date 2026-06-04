@@ -1,5 +1,5 @@
 //! Shared data model — the on-disk JSON schema (status.json / state.json / control.json) is kept
-//! byte-compatible with the Python `gflib_build.py` so the two ports interoperate: the Rust monitor
+//! byte-compatible with the original Python implementation's schema (kept for resumability + external tools): the Rust monitor
 //! can render a snapshot written by the Python daemon and vice-versa. Every struct is `#[serde(
 //! default)]`-friendly so a snapshot from either side tolerates missing/extra keys across versions.
 

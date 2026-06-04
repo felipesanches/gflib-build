@@ -1,37 +1,40 @@
 # gflib-build
 
 A from-scratch, **archive-safe** harness to build the **entire Google Fonts library**
-on your own machine (outside the dev VM), with a **live ncurses dashboard**, a
-**Rust-first** build strategy, and **dependency cohorts** that share virtual
-environments.
+on your own machine (outside the dev VM), with a **live dashboard**, a **Rust-first**
+build strategy, and **dependency cohorts** that share virtual environments.
 
-> Status: **work in progress.** The core build pipeline, the live TUI, archive-safe
-> pristine extraction, resumable state, dependency cohorts, and Rust-first/Python-
-> fallback backend selection are implemented. See [Roadmap](#roadmap).
+> 🦀 **The official implementation is Rust, in [`rust/`](rust/).** The original Python tool
+> (`gflib_build.py`) has been **removed** — Rust is now canonical. The Python source remains in the
+> git history if ever needed for reference. The Rust implementation is feature-complete (core
+> pipeline, TUI + web UIs, discovery, persistence, live control, dependency-cohort venvs, the archive
+> mirror pre-warmer, the full Configuration editor + setup wizard, and M0 provenance) — see
+> [`rust/README.md`](rust/README.md) to build and run it.
+>
+> Build & run:
+> ```sh
+> (cd rust && cargo build --release)
+> ./rust/target/release/gflib-build            # uses ./gflib-data/ for everything
+> # or install a PATH launcher:  rust/install-cli.sh   then just:  gflib-build
+> ```
 
-> 🦀 **Rust port (experimental).** A from-scratch Rust port lives in [`rust/`](rust/), kept side by
-> side with this Python tool for head-to-head comparison. It compiles, runs, and is **schema-
-> compatible** (same `status.json` / `control.json` / `state.json`), so either port's UI can monitor
-> the other port's build. v0.1 covers the core pipeline, both UIs, discovery, persistence, live
-> control, and M0 provenance; some features (cohort venvs, `both` comparison, archive populate,
-> daemonize) are simplified or pending. See [`rust/README.md`](rust/README.md) for full parity notes.
-
-**Documentation:** this README is the overview + spec + usage.
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) covers the internals (pipeline, backends,
-cohorts, concurrency, the `state.json`/`events.jsonl` schemas, archive-safety invariants);
-[`docs/EXTENDING.md`](docs/EXTENDING.md) shows how to add a frontend (incl. a web UI) or a
-backend; [`docs/cohort-map.md`](docs/cohort-map.md) is the generated full-library cohort map.
+**Documentation:** this README is the overview + spec. The on-disk schema, archive-safety
+invariants and pipeline it describes are **implementation-agnostic** and remain accurate; the
+historical `python3 gflib_build.py <flags>` command examples below map **1:1** to the same flags on
+the `gflib-build` binary. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) covers the internals;
+[`docs/EXTENDING.md`](docs/EXTENDING.md) shows how to add a frontend/backend;
+[`docs/cohort-map.md`](docs/cohort-map.md) is the generated full-library cohort map.
 
 ---
 
 ## Quick start — zero to built
 
 With no existing data, a single command bootstraps everything. On first run it opens the
-**Configuration tab** (there is no separate "wizard") to set up your build, then drives the
-whole pipeline live in the TUI:
+**Configuration tab** (the setup wizard) to set up your build, then drives the whole pipeline live
+in the TUI:
 
 ```sh
-python3 gflib_build.py            # uses ./gflib-data/ for everything
+gflib-build            # the Rust binary; uses ./gflib-data/ for everything
 ```
 
 The Configuration tab is an **interactive ncurses form** with the settings pre-populated to

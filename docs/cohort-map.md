@@ -49,7 +49,7 @@ Full machine-readable data (every cohort → its requirements + complete family 
 Regenerate with:
 
 ```sh
-python3 gflib_build.py --cohorts-report \
+gflib-build --cohorts-report \
   --google-fonts <clone> --archive <repo_archive> --build-dir <out> --jobs 16
 ```
 

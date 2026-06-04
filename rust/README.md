@@ -1,7 +1,8 @@
-# gflib-build (Rust port)
+# gflib-build (Rust — the official implementation)
 
-A from-scratch Rust port of the Python `gflib_build.py`, kept **side by side** with the original
-(`../gflib_build.py`) so the two can be compared and the migration evaluated. Same purpose: an
+The official implementation of `gflib-build`. It began as a from-scratch Rust port of the original
+Python `gflib_build.py`; that port reached full parity and **Rust is now canonical** — the Python
+tool has been removed (it remains in git history for reference). An
 **archive-safe** harness that builds the **entire Google Fonts library** locally, with a **live TUI**,
 a **web dashboard**, a **parallel build engine**, **resumable state**, and **M0 provenance**
 (record which compiler *and* which orchestrator built — or attempted — every family).
