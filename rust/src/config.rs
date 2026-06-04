@@ -252,17 +252,32 @@ pub fn save_config(cfg: &Config) {
     }
 }
 
+/// Show a path relative to the cwd when it lives under it (else absolute) — mirrors the TUI's
+/// `display_path`, so both UIs render the same short paths in the config tab.
+fn disp_path(p: &str) -> String {
+    if p.is_empty() {
+        return String::new();
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    match std::path::Path::new(p).strip_prefix(&cwd) {
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => p.to_string(),
+    }
+}
+
 /// The full config map for the snapshot — one entry per CONFIG_SCHEMA field, so the config tab (and
 /// the setup wizard, which reuses this) can show and edit every setting.
 pub fn config_map(cfg: &Config) -> BTreeMap<String, serde_json::Value> {
     use serde_json::json;
     let mut m = BTreeMap::new();
     m.insert("source".into(), json!(cfg.source));
-    m.insert("google_fonts".into(), json!(cfg.google_fonts.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()));
-    m.insert("archive".into(), json!(cfg.archive.to_string_lossy()));
-    m.insert("build_dir".into(), json!(cfg.build_dir.to_string_lossy()));
+    // path fields are shown relative to the cwd when under it (matches the TUI's display_path), so the
+    // terminal and the browser render the same short paths
+    m.insert("google_fonts".into(), json!(cfg.google_fonts.as_ref().map(|p| disp_path(&p.to_string_lossy())).unwrap_or_default()));
+    m.insert("archive".into(), json!(disp_path(&cfg.archive.to_string_lossy())));
+    m.insert("build_dir".into(), json!(disp_path(&cfg.build_dir.to_string_lossy())));
     m.insert("backend".into(), json!(cfg.backend));
-    m.insert("fontc_bin".into(), json!(cfg.fontc_bin.clone().unwrap_or_default()));
+    m.insert("fontc_bin".into(), json!(cfg.fontc_bin.as_ref().map(|p| disp_path(p)).unwrap_or_default()));
     m.insert("build_fontc".into(), json!(false));
     m.insert("jobs".into(), json!(cfg.jobs));
     m.insert("percent".into(), json!(cfg.percent));
