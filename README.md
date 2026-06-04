@@ -252,6 +252,15 @@ intent so nothing is lost as the tool evolves.
     line) and restricts the whole run to those families — they become the entire queue (highest
     priority). `--retry-category "output name mismatch"` re-attempts only failures of that cause
     (like `--retry-failed`, but targeted — e.g. after fixing `collect_outputs`).
+62. **Persistent across restarts.** The cohort→venv cache is shown (● = venv on disk, reused next
+    run); the failure history is durable (`failure-history.jsonl`, append-only) + the failing log is
+    archived to `logs/failed/`, surfaced in a *Failure history* section that survives restarts and
+    re-attempts.
+63. **Archive tab.** Shows the **total repos in the whole archive on disk** (not a session count) and a
+    queue-oriented, colour-coded **multi-column** grid: *cloning now* (yellow), *recently archived,
+    last 30 min* (green), *queued next* (cyan), plus an *unreachable* list with the git reason.
+64. **Responsive monitor.** The dashboard re-parses `status.json` only when it changes (mtime-gated),
+    keeping the UI snappy even on networked filesystems.
 60. **Queue tab.** A `queue` tab lists the waiting families in priority order, each tagged **new**
     (never built), **retry** (after a failure), or **rebuild** (of a prior success) — the only three
     kinds a family can be queued under.
