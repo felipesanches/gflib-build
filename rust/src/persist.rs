@@ -5,12 +5,20 @@
 //!   failure-history.jsonl  append-only durable record of how families broke
 //!   daemon.pid             PID of a detached build daemon (for attach/stop)
 
-use crate::model::{Control, FailHist, Res, Snapshot, StateFile};
+use crate::model::{Control, FailHist, FontspectorView, Res, Snapshot, StateFile};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub fn status_path(build_dir: &Path) -> PathBuf { build_dir.join("status.json") }
+/// Directory holding fontspector QA results: per-family <slug__>.json + _summary.json (the aggregate).
+pub fn fontspector_dir(build_dir: &Path) -> PathBuf { build_dir.join("fontspector") }
+
+/// Read the fontspector aggregate (build_dir/fontspector/_summary.json) for the breakdown panels.
+pub fn read_fontspector_summary(build_dir: &Path) -> Option<FontspectorView> {
+    let txt = std::fs::read_to_string(fontspector_dir(build_dir).join("_summary.json")).ok()?;
+    serde_json::from_str(&txt).ok()
+}
 pub fn control_path(build_dir: &Path) -> PathBuf { build_dir.join("control.json") }
 pub fn state_path(build_dir: &Path) -> PathBuf { build_dir.join("state.json") }
 pub fn fail_hist_path(build_dir: &Path) -> PathBuf { build_dir.join("failure-history.jsonl") }

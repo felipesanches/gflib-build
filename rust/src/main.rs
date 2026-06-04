@@ -10,6 +10,7 @@ mod classify;
 mod config;
 mod daemon;
 mod discover;
+mod fontspector;
 mod mirror;
 mod model;
 mod monitor;
@@ -37,6 +38,7 @@ fn main() {
         Mode::Stop => run_stop(&cfg),
         Mode::Reset => run_reset(&cfg),
         Mode::CohortsReport => run_cohorts_report(&cfg),
+        Mode::Fontspector => std::process::exit(fontspector::run_pass(&cfg)),
         Mode::Attach => run_attach(&cfg),
         Mode::Build => run_build(cfg),
     }
@@ -428,6 +430,9 @@ UI:
 
 LIFECYCLE:
   --setup / --wizard            open the editable Configuration tab pre-build; launch on ▶ Start build
+  --fontspector                 QA pass: run a pinned fontspector release over all built fonts (records
+                                the exact version per family). --fontspector-version <v> / -profile <p> /
+                                -bin <path> / --fontspector-rerun. View results via --attach or --ui web.
   --list                        print the buildable worklist and exit
   --cohorts-report              preview the dependency-cohort grouping (read-only) and exit
   --attach                      attach a read-only monitor to a build at --build-dir

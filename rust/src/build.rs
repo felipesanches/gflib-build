@@ -1277,6 +1277,7 @@ impl Orchestrator {
             dep_relaxations: self.venvs.as_ref().map(|v| v.relaxations()).unwrap_or_default(),
             config_path: self.cfg.data_dir.join("gflib-build.config").to_string_lossy().to_string(),
             pre_build: false, // a live build is never the setup wizard
+            fontspector: None, // QA is a separate pass; the monitor overlays results when viewing
             done,
             daemon_alive: true,
         }

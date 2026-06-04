@@ -88,6 +88,7 @@ pub struct MonitorState {
 struct MonCache {
     snap: Snapshot,
     mtime: Option<u128>,
+    fontspector: Option<crate::model::FontspectorView>, // QA aggregate, refreshed with the status reparse
     last_check: std::time::Instant,
 }
 
@@ -98,6 +99,7 @@ impl MonitorState {
             cache: Mutex::new(MonCache {
                 snap: Snapshot::default(),
                 mtime: None,
+                fontspector: None,
                 last_check: std::time::Instant::now() - std::time::Duration::from_secs(10),
             }),
         })
@@ -115,6 +117,7 @@ impl Source for MonitorState {
         if c.last_check.elapsed() < std::time::Duration::from_millis(200) {
             let mut s = c.snap.clone();
             s.daemon_alive = self.daemon_alive();
+            s.fontspector = c.fontspector.clone();
             return s;
         }
         c.last_check = std::time::Instant::now();
@@ -125,8 +128,12 @@ impl Source for MonitorState {
                 c.mtime = mt;
             }
         }
+        // refresh the fontspector QA aggregate at the throttled cadence (it has its own mtime — a
+        // --fontspector pass writes _summary.json without touching status.json)
+        c.fontspector = persist::read_fontspector_summary(&self.build_dir);
         let mut s = c.snap.clone();
         s.daemon_alive = self.daemon_alive();
+        s.fontspector = c.fontspector.clone();
         s
     }
     fn build_dir(&self) -> PathBuf {

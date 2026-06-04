@@ -27,14 +27,26 @@ pub fn load_build_rules(path: &Path) -> HashMap<String, Vec<String>> {
     let mut out = HashMap::new();
     for (slug, spec) in rules {
         if let Some(cmds) = spec.get("pre_build").and_then(|c| c.as_array()) {
-            let list: Vec<String> =
-                cmds.iter().filter_map(|c| c.as_str().map(|s| s.to_string())).collect();
+            let list: Vec<String> = cmds
+                .iter()
+                .filter_map(|c| c.as_str().map(|s| s.to_string()))
+                // QA is handled by gflib-build's own --fontspector pass, consistently for ALL families,
+                // so any fontspector/fontbakery install-or-invoke in an upstream rule is DISABLED here.
+                .filter(|cmd| !is_qa_command(cmd))
+                .collect();
             if !list.is_empty() {
                 out.insert(slug.clone(), list);
             }
         }
     }
     out
+}
+
+/// True if a pre-build command installs or invokes fontbakery/fontspector (which we disable — QA is
+/// our job via --fontspector, run identically for every family).
+fn is_qa_command(cmd: &str) -> bool {
+    let c = cmd.to_lowercase();
+    c.contains("fontbakery") || c.contains("fontspector")
 }
 
 /// Run a family's pre-build commands. Ok(()) on success; Err(msg) on the first failing command. A
@@ -135,5 +147,18 @@ mod tests {
         let bad = run_pre_build(&work, "/usr/bin/python3", &["exit 3".to_string()], &log, Some(60));
         assert!(bad.is_err() && bad.unwrap_err().contains("pre-build failed"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod qa_tests {
+    use super::is_qa_command;
+    #[test]
+    fn qa_commands_filtered() {
+        assert!(is_qa_command("python3 -m pip install fontbakery"));
+        assert!(is_qa_command("fontspector --profile googlefonts x.ttf"));
+        assert!(is_qa_command("FontBakery check-googlefonts *.ttf"));
+        assert!(!is_qa_command("python3 build.py"));
+        assert!(!is_qa_command("pip install ufo2ft"));
     }
 }

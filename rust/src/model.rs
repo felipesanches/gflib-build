@@ -146,6 +146,51 @@ pub struct CohortFam {
     #[serde(default)] pub status: String, // built | failed | building | queued | pending
 }
 
+// ---- fontspector QA (the --fontspector pass) ----
+
+/// Per-status counts for a fontspector run (PASS/WARN/FAIL/… → count).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct FsCounts {
+    #[serde(default)] pub pass: usize,
+    #[serde(default)] pub warn: usize,
+    #[serde(default)] pub fail: usize,
+    #[serde(default)] pub fatal: usize,
+    #[serde(default)] pub error: usize,
+    #[serde(default)] pub skip: usize,
+    #[serde(default)] pub info: usize,
+}
+
+/// One family's fontspector result, stored on disk (build_dir/fontspector/<slug__>.json) AND
+/// surfaced (summary form) in the snapshot for the breakdown panels.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FsFamily {
+    #[serde(default)] pub slug: String,
+    #[serde(default)] pub counts: FsCounts,
+    #[serde(default)] pub worst: String, // the worst status seen (FAIL/WARN/PASS/…) — for sorting/colour
+}
+
+/// One check, aggregated across all QA'd families (panel B: a check across families).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FsCheck {
+    #[serde(default)] pub id: String,
+    #[serde(default)] pub title: String,
+    #[serde(default)] pub counts: FsCounts,
+    #[serde(default)] pub fail_families: Vec<String>, // families with FAIL/FATAL/ERROR on this check
+    #[serde(default)] pub warn_families: Vec<String>, // families with WARN on this check
+}
+
+/// The fontspector aggregate carried in the snapshot (the on-disk _summary.json).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FontspectorView {
+    #[serde(default)] pub version: String,   // exact fontspector version that ran (saved as metadata)
+    #[serde(default)] pub profile: String,
+    #[serde(default)] pub ts: f64,           // when the pass last completed
+    #[serde(default)] pub families_checked: usize,
+    #[serde(default)] pub total: FsCounts,   // grand totals
+    #[serde(default)] pub per_check: Vec<FsCheck>,   // panel B
+    #[serde(default)] pub per_family: Vec<FsFamily>, // panel A (the family list)
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FailHist {
     #[serde(default)] pub ts: f64,
@@ -236,6 +281,7 @@ pub struct Snapshot {
     #[serde(default)] pub dep_relaxations: Vec<String>, // auto-relaxed pins / forced overrides (R2)
     #[serde(default)] pub config_path: String,
     #[serde(default)] pub pre_build: bool, // first-run setup wizard (config tab is the only view)
+    #[serde(default)] pub fontspector: Option<FontspectorView>, // QA results (the --fontspector pass)
     #[serde(default)] pub done: bool,
     #[serde(default)] pub daemon_alive: bool,
 }

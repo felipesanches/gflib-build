@@ -36,6 +36,11 @@ pub struct Config {
     pub keep_fonts: bool,
     pub web_port: u16,
     pub ui: String,            // auto | curses | plain | json | none | web
+    // fontspector QA pass (--fontspector): run a pinned fontspector release over all built fonts
+    pub fontspector_version: String,        // the pinned release to cargo-install + record per family
+    pub fontspector_profile: String,        // fontspector profile (default: googlefonts)
+    pub fontspector_bin: Option<PathBuf>,   // explicit binary (else cargo-install the pinned version)
+    pub fontspector_rerun: bool,            // re-QA families that already have a result (default: skip them)
     pub yes: bool,
     pub wizard: bool,          // force the first-run setup wizard (the editable config tab pre-build)
     pub detach: bool,          // run the build in a detached background daemon
@@ -74,6 +79,10 @@ impl Default for Config {
             keep_fonts: true,
             web_port: 8765,
             ui: "auto".into(),
+            fontspector_version: "1.6.0".into(),
+            fontspector_profile: "googlefonts".into(),
+            fontspector_bin: None,
+            fontspector_rerun: false,
             yes: false,
             wizard: false,
             detach: false,
@@ -91,6 +100,7 @@ pub enum Mode {
     List,
     Reset,
     CohortsReport,
+    Fontspector, // a separate QA pass: run fontspector over all already-built fonts
     Help,
 }
 
@@ -182,6 +192,11 @@ pub fn parse(args: &[String]) -> Parsed {
             "--detach" => cfg.detach = true,
             "--no-detach" => cfg.no_detach = true,
             "--list" => mode = Mode::List,
+            "--fontspector" => mode = Mode::Fontspector,
+            "--fontspector-version" => cfg.fontspector_version = next(&mut i, a),
+            "--fontspector-profile" => cfg.fontspector_profile = next(&mut i, a),
+            "--fontspector-bin" => cfg.fontspector_bin = Some(PathBuf::from(next(&mut i, a))),
+            "--fontspector-rerun" => cfg.fontspector_rerun = true,
             "--cohorts-report" => mode = Mode::CohortsReport,
             "--attach" => mode = Mode::Attach,
             "--stop" => mode = Mode::Stop,
