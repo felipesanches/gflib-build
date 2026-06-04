@@ -186,6 +186,7 @@ pub struct Snapshot {
     #[serde(default)] pub disk_free: u64,
     #[serde(default)] pub disk_build_total: u64,
     #[serde(default)] pub disk_archive_total: u64,
+    #[serde(default)] pub disk_archive_nested: bool,
     #[serde(default)] pub jobs: usize,
     #[serde(default)] pub paused: bool,
     #[serde(default)] pub total: usize,

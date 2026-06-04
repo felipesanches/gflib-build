@@ -149,7 +149,7 @@ function render(){
  const c=snap.counts||{},processed=(c.built||0)+(c.failed||0)+(c.skipped||0),inscope=processed+(c.queued||0)+(c.building||0);
  const pct=inscope?Math.round(processed*100/inscope):0;
  const bld=snap.disk_build_total||0,arc=snap.disk_archive_total||0;
- const disk=arc?('disk used '+human(bld+arc)+' (build '+human(bld)+' + archive '+human(arc)+')'):('disk used '+human(bld)+' (build dir)');
+ const disk=snap.disk_archive_nested?('disk used '+human(bld)+' (build + nested archive, all included)'):('disk used '+human(bld+arc)+' (build '+human(bld)+' + archive '+human(arc)+')');
  document.getElementById('hdr').innerHTML='<div class="t">Google Fonts library build — Rust port'+(snap.paused?' <span class="y">[PAUSED]</span>':'')+
    '<span class="meta">elapsed '+hms(snap.elapsed)+'</span></div><div class="muted">'+disk+' · free '+human(snap.disk_free)+
    ' · jobs '+(snap.jobs||0)+' · fontc '+((snap.backends||{}).fontc||0)+'/fontmake '+((snap.backends||{}).fontmake||0)+

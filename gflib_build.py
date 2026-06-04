@@ -1315,6 +1315,7 @@ class Orchestrator:
         self.disk_baseline = self._disk_used()
         self._build_total = 0                        # build-dir total bytes; refreshed off-thread
         self._archive_bytes = 0                      # archive total bytes (off-thread; 0 if in build dir)
+        self._archive_nested = False                 # archive lives under build_dir (already counted)
         self._cached_cohort_venvs: set = set()       # cohort keys with a venv on disk (off-thread)
         self._enqueued = 0                            # families queued this run; how many are retries
         self._enqueued_retries = 0
@@ -1757,9 +1758,12 @@ class Orchestrator:
             ar = Path(self.archive).resolve()
             bd = Path(self.build_dir).resolve()
         except Exception:
+            self._archive_nested = False
             return 0
         if ar == bd or bd in ar.parents:             # archive nested under build/ -> already counted
-            return 0
+            self._archive_nested = True              # in the build total; flagged so the header is
+            return 0                                  # explicit rather than ambiguous
+        self._archive_nested = False
         return self._measure_dir(ar)
 
     def _size_writer(self):
@@ -1767,30 +1771,36 @@ class Orchestrator:
         curses render thread and every ~1 s on the status writer) only ever reads a plain int.
         Also refresh which cohort venvs are cached on disk (a set), so snapshot() never does
         per-cohort filesystem I/O on the hot render path."""
+        tick = 0
         while not self.stop.is_set():
             try:
                 self._build_total = self._measure_dir(self.build_dir)
             except Exception:
                 pass
-            try:
-                self._archive_bytes = self._measure_archive()
-            except Exception:
-                pass
+            # The archive (potentially thousands of bare mirrors) changes only during mirroring, and
+            # du-ing it is heavy I/O — so measure it (and count its repos) only every ~5 min, not on
+            # every 10 s tick. The build dir + cached-venv set, which change constantly, stay at 10 s.
+            if tick % 30 == 0:
+                try:
+                    self._archive_bytes = self._measure_archive()
+                except Exception:
+                    pass
+                try:                                  # total repos in the WHOLE archive on disk
+                    n = 0
+                    if self.archive.is_dir():
+                        for owner in self.archive.iterdir():
+                            if owner.is_dir():
+                                n += sum(1 for r in owner.iterdir() if r.name.endswith(".git"))
+                    self._archive_total = n
+                except OSError:
+                    pass
             try:
                 vroot = self.build_dir / "venvs"
                 self._cached_cohort_venvs = {d.name for d in vroot.iterdir()
                                              if (d / ".gflib-installed").is_file()} if vroot.is_dir() else set()
             except OSError:
                 pass
-            try:                                      # total repos in the WHOLE archive on disk
-                n = 0
-                if self.archive.is_dir():
-                    for owner in self.archive.iterdir():
-                        if owner.is_dir():
-                            n += sum(1 for r in owner.iterdir() if r.name.endswith(".git"))
-                self._archive_total = n
-            except OSError:
-                pass
+            tick += 1
             self.stop.wait(10)                        # interruptible ~10 s pacing
 
     def snapshot(self) -> dict:
@@ -1909,6 +1919,7 @@ class Orchestrator:
             "disk_used_delta": disk_delta, "disk_free": disk_free,
             "disk_build_total": self._build_total,   # plain int, refreshed by _size_writer (off-thread)
             "disk_archive_total": self._archive_bytes,   # the archive tree (0 if it lives under build/)
+            "disk_archive_nested": self._archive_nested, # archive is inside build/ (already in build total)
             "jobs": self.args.jobs, "paused": self.paused.is_set(),
             "total": len(rs), "counts": counts, "backends": backends,
             "building": building, "failures_recent": fails, "built_recent": built,
@@ -3436,8 +3447,14 @@ class CursesFrontend(Frontend):
                 put(0, max(0, w - 24), f"elapsed {hms(snap['elapsed'])}", curses.A_BOLD)
                 _bld = snap.get('disk_build_total', 0)
                 _arc = snap.get('disk_archive_total', 0)
-                _disk = (f"disk used {human(_bld + _arc)} (build {human(_bld)} + archive {human(_arc)})"
-                         if _arc else f"disk used {human(_bld)} (build dir)")
+                # Always spell out both components so there's no ambiguity about what the figure
+                # covers: build outputs/venvs + the upstream-repo archive (or, when the archive lives
+                # inside build/, a note that it's already included).
+                if snap.get('disk_archive_nested'):
+                    _disk = f"disk used {human(_bld)} (build + nested archive, all included)"
+                else:
+                    _disk = (f"disk used {human(_bld + _arc)}"
+                             f" (build {human(_bld)} + archive {human(_arc)})")
                 put(1, 0, f" {_disk}  free {human(snap['disk_free'])}  jobs {snap['jobs']}  "
                           f"cohorts {len(snap['cohorts'])}  fontc {bk['fontc']}/fontmake {bk['fontmake']}",
                     CYAN)
@@ -3810,7 +3827,7 @@ function render(){
  document.getElementById('hdr').innerHTML=
   '<div class="t">Google Fonts library build'+(snap.paused?' <span class="y">[PAUSED]</span>':'')+
    '<span class="muted" style="float:right">elapsed '+hms(snap.elapsed)+'</span></div>'+
-  '<div class="muted">'+((snap.disk_archive_total||0)?'disk used '+human((snap.disk_build_total||0)+(snap.disk_archive_total||0))+' (build '+human(snap.disk_build_total||0)+' + archive '+human(snap.disk_archive_total||0)+')':'disk used '+human(snap.disk_build_total||0)+' (build dir)')+' · free '+human(snap.disk_free)+
+  '<div class="muted">'+(snap.disk_archive_nested?'disk used '+human(snap.disk_build_total||0)+' (build + nested archive, all included)':'disk used '+human((snap.disk_build_total||0)+(snap.disk_archive_total||0))+' (build '+human(snap.disk_build_total||0)+' + archive '+human(snap.disk_archive_total||0)+')')+' · free '+human(snap.disk_free)+
    ' · jobs <span class="stat">'+snap.jobs+'</span> · cohorts <span class="stat">'+(snap.cohorts||[]).length+'</span>'+
    ' · fontc '+(bk.fontc||0)+'/fontmake '+(bk.fontmake||0)+' · phase <span class="stat">'+E(snap.phase)+'</span>'+
    (snap.done?' <span class="g">— BUILD COMPLETE</span>':'')+'</div>'+

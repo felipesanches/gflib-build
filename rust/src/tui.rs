@@ -157,15 +157,11 @@ fn render(out: &mut Stdout, snap: &Snapshot, ui: &Ui, src: &dyn Source) -> std::
 
     let bld = snap.disk_build_total;
     let arc = snap.disk_archive_total;
-    let disk = if arc > 0 {
-        format!(
-            "disk used {} (build {} + archive {})",
-            human(bld + arc),
-            human(bld),
-            human(arc)
-        )
+    // Always spell out both components — no ambiguous "(build dir)".
+    let disk = if snap.disk_archive_nested {
+        format!("disk used {} (build + nested archive, all included)", human(bld))
     } else {
-        format!("disk used {} (build dir)", human(bld))
+        format!("disk used {} (build {} + archive {})", human(bld + arc), human(bld), human(arc))
     };
     put(
         out,

@@ -49,6 +49,7 @@ pub struct Shared {
     pub done: bool,
     pub disk_build_total: u64,
     pub disk_archive_total: u64,
+    pub disk_archive_nested: bool,
     pub disk_free: u64,
     pub archive_total: usize,
     // cohort map (R1: preserved across resume/migration; populated by R2's VenvManager later)
@@ -170,6 +171,7 @@ impl Orchestrator {
             done: false,
             disk_build_total: 0,
             disk_archive_total: 0,
+            disk_archive_nested: false,
             disk_free: 0,
             archive_total: 0,
             cohort_members: state.cohort_members,
@@ -614,20 +616,29 @@ impl Orchestrator {
     fn spawn_size_thread(self: &Arc<Self>) {
         let me = Arc::clone(self);
         thread::spawn(move || {
+            let mut tick: u64 = 0;
             while !me.stop.load(Ordering::Relaxed) {
                 let build_total = dir_size(&me.cfg.build_dir);
-                let archive_total = measure_archive(&me.cfg.build_dir, &me.cfg.archive);
                 let free = free_bytes(&me.cfg.build_dir);
-                let arc_count = count_archive(&me.cfg.archive);
                 let cached = cached_cohort_set(&me.cfg.build_dir);
+                // The archive (potentially thousands of bare mirrors) changes only during mirroring,
+                // and du-ing it is heavy I/O — measure it (+ count its repos) only every ~5 min, not
+                // every 10 s. The build dir + cached-venv set, which change constantly, stay at 10 s.
+                if tick % 30 == 0 {
+                    let (archive_total, nested) = measure_archive(&me.cfg.build_dir, &me.cfg.archive);
+                    let arc_count = count_archive(&me.cfg.archive);
+                    let mut sh = me.shared.lock().unwrap();
+                    sh.disk_archive_total = archive_total;
+                    sh.disk_archive_nested = nested;
+                    sh.archive_total = arc_count;
+                }
                 {
                     let mut sh = me.shared.lock().unwrap();
                     sh.disk_build_total = build_total;
-                    sh.disk_archive_total = archive_total;
                     sh.disk_free = free;
-                    sh.archive_total = arc_count;
                     sh.cached_cohorts = cached;
                 }
+                tick += 1;
                 for _ in 0..10 {
                     if me.stop.load(Ordering::Relaxed) {
                         break;
@@ -784,6 +795,7 @@ impl Orchestrator {
             disk_free: sh.disk_free,
             disk_build_total: sh.disk_build_total,
             disk_archive_total: sh.disk_archive_total,
+            disk_archive_nested: sh.disk_archive_nested,
             jobs: sh.jobs,
             paused: sh.paused,
             total: sh.results.len(),
@@ -1175,17 +1187,18 @@ fn count_archive(archive: &Path) -> usize {
     n
 }
 
-/// Archive bytes, 0 if the archive lives under build_dir (already counted — no double-count).
-fn measure_archive(build_dir: &Path, archive: &Path) -> u64 {
+/// Archive (bytes, nested?). Returns nested=true (and 0 bytes) when the archive lives under build_dir
+/// — it's already in the build total, so the header notes it's included rather than double-counting.
+fn measure_archive(build_dir: &Path, archive: &Path) -> (u64, bool) {
     let bd = build_dir.canonicalize().unwrap_or_else(|_| build_dir.to_path_buf());
     let ar = match archive.canonicalize() {
         Ok(p) => p,
-        Err(_) => return 0,
+        Err(_) => return (0, false),
     };
     if ar == bd || ar.starts_with(&bd) {
-        return 0;
+        return (0, true);
     }
-    dir_size(&ar)
+    (dir_size(&ar), false)
 }
 
 /// Cohort keys with a venv on disk (a `venvs/<key>/.gflib-installed` success marker) — the 'cached'
