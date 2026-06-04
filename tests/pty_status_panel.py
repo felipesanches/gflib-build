@@ -1,7 +1,7 @@
 """The always-on status panel (above the footer) explains the focused item. The motivating case:
 a RED entry in Overview -> 'Archive — mirrored' means a repo could NOT be mirrored; focusing it must
 surface why (the failure reason). Also checks the panel describes a focused config field and a failure."""
-import json, os, sys, time, pty, select
+import json, os, sys, time, pty, select, struct, fcntl, termios, signal
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = "/tmp/_pty_panel/build"
@@ -15,10 +15,13 @@ status = {
     "building": [{"slug": "ofl/aaa", "worker": 1, "dur": 3.0, "backend": "fontmake", "note": ""}],
     "failures_recent": [{"slug": "ofl/ccc", "error": "boom", "log": "logs/ccc.log"}],
     "built_recent": [{"slug": "ofl/eee", "backend": "fontmake", "bytes": 1000, "compare": "differ", "log": ""}],
-    # first archive entry is a FAILURE with a concrete reason -> panel must show it
-    "archive_recent": [
-        {"status": "failed", "repo": "owner/gone", "reason": "remote: Repository not found (HTTP 404)"},
-        {"status": "added", "repo": "owner/ok"}],
+    # the Archive tab lists unreachable mirrors WITH their reason (was the overview panel)
+    "archive": {"total": 1302, "active": ["owner/cloning"], "pending": ["owner/next1", "owner/next2"],
+                "pending_total": 2, "recent": [
+                    {"status": "failed", "repo": "owner/gone", "ts": 1700000000.0,
+                     "reason": "remote: Repository not found (HTTP 404)"},
+                    {"status": "added", "repo": "owner/ok", "ts": 1700000100.0, "reason": ""}]},
+    "archive_recent": [],
     "cohorts": [], "migration": {}, "op_stats": {}, "phase_durations": {},
     "tasks": [{"key": "build", "name": "build fonts", "status": "running", "elapsed": 9.0,
                "done": 2, "total": 6, "detail": ""}],
@@ -73,14 +76,22 @@ cfg_txt = snap()
 assert "where the worklist comes from" in cfg_txt, "config-field panel missing:\n" + cfg_txt[-700:]
 print("panel describes the focused configuration field")
 
-os.write(fd, TAB); drain(0.5)             # back to Overview (the default tab)
-out = b""                                  # clear so we read the post-focus screen
-os.write(fd, RIGHT); drain(0.6)           # focus 'Archive — mirrored', first item = the failure
+os.write(fd, TAB); drain(0.4)             # Configuration -> Overview
+out = b""                                  # clear so we read the archive screen
+# overview -> queue -> cohorts -> archive (the Archive tab); its 'unreachable' list shows the reason
+os.write(fd, TAB); os.write(fd, TAB); os.write(fd, TAB); drain(0.5)
+for rows in (41, 40):                      # force a full repaint so the body is re-emitted
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, 100, 0, 0))
+    try:
+        os.kill(pid, signal.SIGWINCH)
+    except OSError:
+        pass
+    drain(0.3)
 panel_txt = snap()
-shows_repo = "owner/gone" in panel_txt and "could NOT be mirrored" in panel_txt
+shows_repo = "owner/gone" in panel_txt and ("Archive" in panel_txt or "unreachable" in panel_txt)
 shows_reason = "Repository not found" in panel_txt or "404" in panel_txt
-print("panel shows the archive repo + 'could NOT be mirrored':", shows_repo)
-print("panel shows the failure reason:", shows_reason)
+print("Archive tab lists the unreachable repo:", shows_repo)
+print("Archive tab shows the failure reason:", shows_reason)
 
 os.write(fd, b"q")
 end = time.time() + 6

@@ -569,7 +569,8 @@ class KeyedLocks:
 def populate_archive(repo_urls, archive: Path, jobs: int,
                      on_progress: Optional[Callable[[int, int, str, str], None]] = None,
                      stop: "Optional[threading.Event]" = None,
-                     clone_lock: "Optional[KeyedLocks]" = None):
+                     clone_lock: "Optional[KeyedLocks]" = None,
+                     on_start: "Optional[Callable[[str], None]]" = None):
     """Ensure every repo_url has a bare mirror in the archive; clone --mirror the missing
     ones (APPEND-ONLY — existing mirrors are skipped read-only and NEVER modified/deleted).
     Returns (added, failed, present). Parallel across `jobs`; aborts promptly if `stop` set.
@@ -596,6 +597,8 @@ def populate_archive(repo_urls, archive: Path, jobs: int,
         try:
             if mp.is_dir():               # another cloner (a worker) won the race — present now
                 return ("present", url, "")
+            if on_start:                  # report "archiving right now" the moment cloning begins
+                on_start(url)
             mp.parent.mkdir(parents=True, exist_ok=True)
             rc, _, err = git_clone_mirror(url, str(mp), timeout=1800, stop=stop)
         finally:
@@ -1198,8 +1201,12 @@ class Orchestrator:
         self.phase_label = ""
         self.phase_error = ""
         self.cohorts: Dict[str, dict] = {}
-        self.archive_log: List[Tuple[str, str, str]] = []  # (status, owner/repo, reason) per mirror
+        self.archive_log: List[tuple] = []             # (status, owner/repo, reason, ts) per mirror
         self._archive_seen: set = set()                # de-dup repos across pre-warmer + workers
+        self._archive_urls: List[str] = []             # the pre-warmer's full ordered worklist
+        self._archive_active: Dict[str, float] = {}    # url -> start ts (cloning RIGHT NOW)
+        self._archive_done: set = set()                # urls already mirrored/present/failed
+        self._archive_total = 0                        # repos in the WHOLE archive on disk (off-thread)
         self._cohort_members: Dict[str, set] = {}      # cohort key -> {slugs} (assigned live)
         self._cohort_reqs: Dict[str, str] = {}         # cohort key -> normalized requirements
         # PERSISTENT failure history — every failure is recorded to failure-history.jsonl (append-
@@ -1300,12 +1307,22 @@ class Orchestrator:
         for a 'failed' mirror (shown in the status panel so the red entries are explained)."""
         short = _repo_short(url)
         with self.lock:
+            self._archive_done.add(url)               # it's resolved → out of the queue / active
+            self._archive_active.pop(url, None)
+            if status not in ("added", "failed"):     # 'present'/'skipped' aren't "recently archived"
+                return
             if short in self._archive_seen:
                 return
             self._archive_seen.add(short)
-            self.archive_log.append((status, short, reason))
+            self.archive_log.append((status, short, reason, time.time()))
             if len(self.archive_log) > 400:
                 del self.archive_log[:-400]
+
+    def _archive_cloning(self, url: str):
+        """A clone of `url` just STARTED (pre-warmer) — show it as 'archiving right now'."""
+        with self.lock:
+            if url not in self._archive_done:
+                self._archive_active[url] = time.time()
 
     def _rebuild_cohorts(self):
         """Rebuild the cohorts display dict from _cohort_members/_cohort_reqs (call under the lock)."""
@@ -1377,9 +1394,9 @@ class Orchestrator:
 
     def _archive_progress(self, done: int, url: str, status: str, reason: str = ""):
         """Per-repo callback from the concurrent archive pre-warmer: feed the live list and
-        advance the (concurrent) archive task — WITHOUT touching `phase` (the build owns it)."""
-        if status in ("added", "failed"):
-            self._note_mirrored(url, status, reason)
+        advance the (concurrent) archive task — WITHOUT touching `phase` (the build owns it).
+        Every completion (added/present/failed/skipped) resolves the repo (out of the queue)."""
+        self._note_mirrored(url, status, reason)      # records ts + marks done + clears 'active'
         self._task_update("archive", done, f"{status}: {_repo_short(url)}")
 
     # ---- phase helpers (also accumulate per-phase wall-clock durations)
@@ -1568,6 +1585,15 @@ class Orchestrator:
                                              if (d / ".gflib-installed").is_file()} if vroot.is_dir() else set()
             except OSError:
                 pass
+            try:                                      # total repos in the WHOLE archive on disk
+                n = 0
+                if self.archive.is_dir():
+                    for owner in self.archive.iterdir():
+                        if owner.is_dir():
+                            n += sum(1 for r in owner.iterdir() if r.name.endswith(".git"))
+                self._archive_total = n
+            except OSError:
+                pass
             self.stop.wait(10)                        # interruptible ~10 s pacing
 
     def snapshot(self) -> dict:
@@ -1638,8 +1664,23 @@ class Orchestrator:
             tasks = [{"key": t.key, "name": t.name, "status": t.status,
                       "elapsed": round(t.elapsed(), 1), "done": t.done,
                       "total": t.total, "detail": t.detail} for t in self.tasks]
-            archive_recent = [{"status": s, "repo": r, "reason": (rs[0] if rs else "")}
-                              for s, r, *rs in self.archive_log[-60:]]
+            # ARCHIVE view: the whole-archive total (on disk) + a queue-oriented list — cloning now,
+            # recently archived (last 30 min), and the next ones queued — instead of a session count.
+            _now = time.time()
+            arch_recent = sorted(
+                [{"repo": r, "status": s, "ts": ts, "reason": reason}
+                 for (s, r, reason, ts) in self.archive_log if _now - ts < 1800],
+                key=lambda x: -x["ts"])[:300]
+            arch_active = [_repo_short(u) for u in sorted(self._archive_active,
+                                                          key=lambda u: self._archive_active[u])][:60]
+            _pending = [u for u in self._archive_urls
+                        if u not in self._archive_done and u not in self._archive_active]
+            archive_view = {"total": self._archive_total, "active": arch_active,
+                            "recent": arch_recent, "pending": [_repo_short(u) for u in _pending][:300],
+                            "pending_total": len(_pending)}
+            # legacy compact list (overview status panel etc. still reference it)
+            archive_recent = [{"status": s, "repo": r, "reason": reason}
+                              for (s, r, reason, ts) in self.archive_log[-60:]]
             control_log = list(self.control_log[-12:])
             config = {                               # built under the lock (apply_live mutates args)
                 "source": self.args.source, "google_fonts": self.args.google_fonts,
@@ -1669,7 +1710,7 @@ class Orchestrator:
             "cohorts": cohorts_out,                  # built under the lock; 'cached' from the off-thread set
             "failure_history": fail_hist,            # persistent; newest first (read under the lock)
             "op_stats": op_stats, "phase_durations": phase_dur, "migration": migration,
-            "tasks": tasks, "archive_recent": archive_recent, "config": config,
+            "tasks": tasks, "archive_recent": archive_recent, "archive": archive_view, "config": config,
             "control_log": control_log,
             "config_path": getattr(self.args, "_cfg_path", ""),
             "dep_relaxations": list(self.venvs.relaxations) if self.venvs else [],
@@ -2243,13 +2284,16 @@ class Orchestrator:
                 at = self._task("archive")
                 if at is not None and at.status == "pending" and self.families:
                     urls = sorted({f.repo_url for f in self.families.values()})
+                    with self.lock:                  # the queue of repos to mirror (for the Archive tab)
+                        self._archive_urls = list(urls)
                     self._task_running("archive", len(urls))
 
                     def _prewarm():
                         added, failed, present = populate_archive(
                             urls, self.archive, self.args.jobs,
                             on_progress=lambda d, n, u, st, m='': self._archive_progress(d, u, st, m),
-                            stop=self.stop, clone_lock=self.clone_locks)
+                            stop=self.stop, clone_lock=self.clone_locks,
+                            on_start=self._archive_cloning)
                         self._task_done(  # "unreachable" ≠ build failures
                             "archive",
                             f"{len(added)} mirrored, {present} present, {len(failed)} unreachable")
@@ -2463,7 +2507,7 @@ class CursesFrontend(Frontend):
     # emoji status marks (ASCII fallback chosen at runtime if the terminal can't render them)
     EMOJI = {"pending": "⏳", "running": "🔄", "done": "✅", "failed": "❌", "skipped": "➖"}
     ASCII = {"pending": "..", "running": ">>", "done": "OK", "failed": "XX", "skipped": "--"}
-    VIEWS = ("config", "overview", "queue", "cohorts", "built", "failures", "stats")
+    VIEWS = ("config", "overview", "queue", "cohorts", "archive", "built", "failures", "stats")
 
     # Full config schema for the ONE Configuration tab (first-run setup AND live editing).
     # `live`=True fields can change on a running build; the rest need a restart.
@@ -2919,11 +2963,7 @@ class CursesFrontend(Frontend):
                          f"{((str(t['done'])+'/'+str(t['total'])) if t['total'] else ''):<11}"
                          f"{(hms(t['elapsed']) if t['elapsed'] else ''):>8}  {t['detail']}",
                          lambda t: SATTR.get(t["status"], 0), "overview")]
-                arch = snap.get("archive_recent", [])
-                if arch:
-                    secs.append(("Archive — mirrored", arch,
-                                 lambda a: ("+ " if a["status"] == "added" else "✗ ") + a["repo"],
-                                 lambda a: RED if a["status"] == "failed" else GREEN, None))
+                # the Archive has its own tab now (whole-archive total + queue grid); not a section here.
                 # "Now building" is pinned above (shown on every tab), so it's not a section here
                 secs.append(("Recent failures", snap.get("failures_recent", []),
                              lambda f: [(f"{f['slug']:<34} ", RED), (f['error'], RED | curses.A_DIM)],
@@ -3373,6 +3413,43 @@ class CursesFrontend(Frontend):
                                if (m.get('both_identical') or m.get('both_differ')) else ""),
                     GREEN); row += 2
                 draw_sections(row, sections_for(snap, "stats"))
+            elif view == "archive":                  # whole-archive total + a queue-oriented grid
+                av = snap.get("archive", {})
+                active, recent = av.get("active", []), av.get("recent", [])
+                pending = av.get("pending", [])
+                added = [e["repo"] for e in recent if e.get("status") == "added"]
+                failed = [e for e in recent if e.get("status") == "failed"]
+                put(row, 0, f" Archive — {av.get('total', 0)} repos mirrored on disk ".ljust(w - 1, "-"),
+                    curses.A_BOLD); row += 1
+                put(row, 1, f"{len(active)} cloning now   ·   {len(added)} archived in the last 30 min"
+                            f"   ·   {av.get('pending_total', 0)} queued   ·   {len(failed)} unreachable",
+                    CYAN); row += 1
+                for lx, txt, col in ((1, "● cloning now", YEL), (16, "● recently archived", GREEN),
+                                     (38, "● queued next", CYAN)):
+                    put(row, lx, txt, col)
+                row += 2
+                if failed:                            # red mirrors WITH their reason (was the panel)
+                    put(row, 0, " unreachable (recent) ".ljust(w - 1, "-"), RED | curses.A_BOLD)
+                    row += 1
+                    for e in failed[:4]:
+                        if row >= body_bottom - 1:
+                            break
+                        put(row, 1, f"✗ {e['repo']}  —  {(e.get('reason') or '')}"[:w - 2], RED)
+                        row += 1
+                    row += 1
+                items = ([(s, YEL) for s in active] + [(s, GREEN) for s in added]
+                         + [(s, CYAN) for s in pending])
+                if not items:
+                    put(row, 1, "(archive idle — nothing queued or recently mirrored)", curses.A_DIM)
+                else:
+                    colw = min(38, max(14, max(len(s) for s, _ in items) + 2))
+                    cols = max(1, (w - 2) // colw)
+                    for i, (s, col) in enumerate(items):
+                        rr, cc = row + i // cols, 1 + (i % cols) * colw
+                        if rr >= body_bottom:
+                            put(body_bottom - 1, 1, f"… (+{len(items) - i} more)", curses.A_DIM)
+                            break
+                        put(rr, cc, s[:colw - 1], col)
             else:                                    # overview / cohorts / built / failures
                 draw_sections(row, sections_for(snap, view))
 
@@ -3444,6 +3521,7 @@ WEB_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 .bg-new{background:#14331f;color:var(--g)}.bg-retry{background:#3a2e0a;color:var(--y)}
 .bg-rebuild{background:#0c2e36;color:var(--c)}
 .g{color:var(--g)}.r{color:var(--r)}.y{color:var(--y)}.c{color:var(--c)}.d{color:var(--dim)}
+.agrid{display:flex;flex-wrap:wrap;gap:3px 16px;padding:6px 10px}.acell{font-size:12px;white-space:nowrap}
 #ctl{padding:8px 12px;border-top:1px solid var(--bd);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 button{background:#1e293b;color:var(--fg);border:1px solid var(--bd);border-radius:4px;padding:4px 10px;
  cursor:pointer;font:inherit}button:hover{background:#243248}button:disabled{opacity:.4;cursor:default}
@@ -3457,7 +3535,7 @@ table.kv td{padding:2px 10px}table.kv td:first-child{color:var(--dim)}
 <div id="ctl"></div><div id="log"></div>
 <script>
 let snap=null,tab='overview',selKey=null;
-const TABS=['overview','queue','cohorts','built','failures','stats','config'];
+const TABS=['overview','queue','cohorts','archive','built','failures','stats','config'];
 const E=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function human(n){n=+n||0;const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(Math.abs(n)>=1024&&i<4){n/=1024;i++}return(i?n.toFixed(1):n.toFixed(0))+u[i]}
 function hms(s){s=Math.max(0,Math.floor(+s||0));const h=(s/3600|0),m=(s%3600/60|0),x=s%60;return(h?h+':':'')+String(m).padStart(2,'0')+':'+String(x).padStart(2,'0')}
@@ -3505,9 +3583,17 @@ const TAB_RENDER={
   const t=snap.tasks||[],a=snap.archive_recent||[],f=snap.failures_recent||[];
   let h=card('Pipeline',rows(t,x=>frow(x.key,'<span class="s">'+(MARK[x.status]||'?')+' '+E(x.name)+'</span><span class="meta">'+
     (x.total?x.done+'/'+x.total+'  ':'')+(x.elapsed?hms(x.elapsed):'')+'  '+E(x.detail||'')+'</span>')));
-  if(a.length)h+=card('Archive — mirrored',rows(a,x=>frow(x.repo,'<span class="'+(x.status==='failed'?'r':'g')+'">'+(x.status==='added'?'+ ':'✗ ')+E(x.repo)+'</span>')));
   h+=card('Recent failures ('+(snap.counts.failed||0)+')',rows(f.slice(0,60),x=>frow(x.slug,'<span class="r s">'+E(x.slug)+'</span><span class="meta d">'+E(x.error)+'</span>')));
   return h},
+ archive:()=>{const av=snap.archive||{},rec=av.recent||[];
+  const added=rec.filter(e=>e.status==='added'),failed=rec.filter(e=>e.status==='failed');
+  const cell=(s,cls)=>'<span class="acell '+cls+'">'+E(s)+'</span>';
+  let grid=(av.active||[]).map(s=>cell(s,'y')).join('')+added.map(e=>cell(e.repo,'g')).join('')+(av.pending||[]).map(s=>cell(s,'c')).join('');
+  let fail=failed.length?'<div class="card"><h3 class="r">Unreachable (recent)</h3><div class="body">'+failed.map(e=>'<div class="row r">✗ '+E(e.repo)+' &nbsp;—&nbsp; <span class="d">'+E(e.reason||'')+'</span></div>').join('')+'</div></div>':'';
+  return '<div class="card"><h3>Archive — '+(av.total||0)+' repos mirrored on disk</h3><div class="body">'+
+   '<div class="row d">'+((av.active||[]).length)+' cloning now &nbsp;·&nbsp; '+added.length+' archived in the last 30 min &nbsp;·&nbsp; '+(av.pending_total||0)+' queued &nbsp;·&nbsp; '+failed.length+' unreachable</div>'+
+   '<div class="row"><span class="y">● cloning now</span> &nbsp; <span class="g">● recently archived</span> &nbsp; <span class="c">● queued next</span></div>'+
+   '<div class="agrid">'+(grid||'<span class="d">(archive idle — nothing queued or recently mirrored)</span>')+'</div></div></div>'+fail},
  queue:()=>{const q=snap.queued_list||[];const bc={new:'bg-new',retry:'bg-retry',rebuild:'bg-rebuild'};
   return card('Queued — priority order ('+(snap.counts.queued||0)+(q.length<(snap.counts.queued||0)?', showing '+q.length:'')+')',
    rows(q,x=>frow(x.slug,'<span class="badge '+(bc[x.kind]||'')+'">'+E(x.kind)+'</span><span class="s">'+E(x.slug)+'</span>')))},

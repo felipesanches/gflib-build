@@ -76,9 +76,6 @@ small_n = shown(small)
 out = b""; setsize(48, 140); drain(0.9)                # GROW to 48 rows
 big = out.decode("utf-8", "replace")
 big_n = shown(big)
-# on the tall screen, the small Archive section (7) should be shown IN FULL (no overflow hint)
-big_last = big.rsplit("\x1b[H", 1)[-1] if "\x1b[H" in big else big
-archive_full = "o/repo0" in big_last and "o/repo6" in big_last
 
 os.write(fd, b"q"); drain(1.0)
 try:
@@ -90,8 +87,6 @@ os.waitpid(pid, 0)
 no_crash = "_curses.error" not in (small + big) and "Traceback" not in (small + big)
 print("no crash:", no_crash)
 print(f"failures shown — small(20 rows): {small_n}   after grow(48 rows): {big_n}")
-print("archive (7) shown in full on the tall screen:", archive_full)
 assert no_crash, (small + big)[-800:]
 assert big_n > small_n and big_n > 10, f"grow did not add rows: {small_n} -> {big_n}"
-assert archive_full, "small section should be shown in full when there's room"
 print("\nPTY-RESIZE-REFLOW OK")

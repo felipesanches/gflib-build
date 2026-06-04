@@ -41,9 +41,10 @@ g.build_fontc_from_source = fake_build_fontc
 
 g.discover = lambda gf: (FAMS, 12, 7)
 
-def fake_populate(urls, archive, jobs, on_progress=None, stop=None, clone_lock=None):
+def fake_populate(urls, archive, jobs, on_progress=None, stop=None, clone_lock=None, on_start=None):
     added = []
     for i, u in enumerate(sorted(set(urls)), 1):
+        if on_start: on_start(u)
         time.sleep(0.15)
         st = "added" if i % 4 else "failed"
         (added if st == "added" else []).append(u)

@@ -56,8 +56,7 @@ def drain(sec):
 TAB, RIGHT, DOWN, ENTER, ESC = b"\t", b"\x1bOC", b"\x1bOB", b"\r", b"\x1b"
 drain(1.0)
 drain(0.4)             # default tab is now overview
-# overview sections (Now building is pinned, not a section): Pipeline · Archive · Recent failures
-os.write(fd, RIGHT); drain(0.4)           # focus Archive
+# overview sections (Now building pinned, Archive is its own tab now): Pipeline · Recent failures
 os.write(fd, RIGHT); drain(0.4)           # focus Recent failures
 os.write(fd, DOWN); drain(0.3)            # select 2nd failure
 os.write(fd, ENTER); drain(0.5)           # open its detail

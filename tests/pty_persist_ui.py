@@ -66,10 +66,14 @@ def repaint():
 
 TAB = b"\t"
 drain(0.9)
-os.write(fd, TAB); os.write(fd, TAB); drain(0.4); repaint()          # overview -> queue -> cohorts
+for _ in range(2):                                                   # overview -> queue -> cohorts
+    os.write(fd, TAB); drain(0.2)
+repaint()
 cohorts = out.decode("utf-8", "replace")
 out = b""
-os.write(fd, TAB); os.write(fd, TAB); drain(0.4); repaint()          # -> built -> failures
+for _ in range(3):                                                   # -> archive -> built -> failures
+    os.write(fd, TAB); drain(0.2)
+repaint()
 failures = out.decode("utf-8", "replace")
 os.write(fd, b"q"); drain(0.6)
 try:

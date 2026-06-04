@@ -64,7 +64,7 @@ drain(0.9)
 banner_txt = out.decode("utf-8", "replace")               # banner is visible on the landing tab
 # tab to the failures view for the "Failures by cause" section
 out = b""
-for _ in range(4):                                         # overview -> queue -> cohorts -> built -> failures
+for _ in range(5):                                         # overview -> queue -> cohorts -> archive -> built -> failures
     os.write(fd, TAB); drain(0.25)
 drain(0.4)
 fail_txt = out.decode("utf-8", "replace")
