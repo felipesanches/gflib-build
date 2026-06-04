@@ -305,23 +305,24 @@ struct Ui {
     setup: bool,             // first-run setup wizard (config locked, ▶ Start build / Cancel actions)
     cfg_fields: Vec<CfgField>, // the editable Configuration fields (built once from the config)
     cfg_active: usize,       // selected config field, or an action-button index past the fields
+    fc_sel: usize,           // failures tab: the selected 'by cause' index — filters the families list
 }
 
 /// Number of sections on a tab (archive/config are single custom views → 1).
 fn section_count(snap: &Snapshot, tab: usize) -> usize {
     match TABS[tab] {
         "config" | "archive" => 1,
-        _ => sections_for(snap, tab).len().max(1),
+        _ => sections_for(snap, tab, 0).len().max(1),
     }
 }
 
 /// The identity (slug/key) of each item in the FOCUSED section, in display order — used for stable
 /// selection (the cursor tracks the item, not the row index, as lists reorder live).
-fn list_keys(snap: &Snapshot, tab: usize, section: usize) -> Vec<String> {
+fn list_keys(snap: &Snapshot, tab: usize, section: usize, fc_sel: usize) -> Vec<String> {
     match TABS[tab] {
         "config" => Vec::new(), // the config tab manages its own cursor (cfg_active), not ui.sel
         "archive" => snap.archive.pending.clone(),
-        _ => sections_for(snap, tab).get(section).map(|s| s.keys.clone()).unwrap_or_default(),
+        _ => sections_for(snap, tab, fc_sel).get(section).map(|s| s.keys.clone()).unwrap_or_default(),
     }
 }
 
@@ -341,7 +342,7 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
     let mut ui = Ui {
         tab: if setup { 0 } else { 1 },
         section: 0, sel: 0, detail: false, sel_key: None, detail_lines: Vec::new(), dscroll: 0,
-        setup, cfg_fields: Vec::new(), cfg_active: 0,
+        setup, cfg_fields: Vec::new(), cfg_active: 0, fc_sel: 0,
     };
     let mut prev: Option<Screen> = None;
     let res = loop {
@@ -357,7 +358,7 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
         }
         // stable selection: re-resolve the row index from the remembered item key each frame, so a
         // list reordering (failed→building→built) keeps the cursor on the SAME item.
-        let keys = list_keys(&snap, ui.tab, ui.section);
+        let keys = list_keys(&snap, ui.tab, ui.section, ui.fc_sel);
         if let Some(k) = &ui.sel_key {
             if let Some(i) = keys.iter().position(|x| x == k) {
                 ui.sel = i;
@@ -365,6 +366,13 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
         }
         if ui.sel >= keys.len() {
             ui.sel = keys.len().saturating_sub(1);
+        }
+        // failures tab: when the 'Failures by cause' section is focused, its selection becomes the
+        // sticky cause-filter for the families list (persists when you move to that list).
+        if TABS[ui.tab] == "failures"
+            && sections_for(&snap, ui.tab, ui.fc_sel).get(ui.section).map(|s| s.dview) == Some("failcat")
+        {
+            ui.fc_sel = ui.sel;
         }
         // draw the whole frame into a back-buffer, then emit only the cells that changed (no flicker)
         let (w, h) = terminal::size().unwrap_or((100, 40));
@@ -426,11 +434,11 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
                 match k.code {
                     KeyCode::Up => {
                         if ui.sel > 0 { ui.sel -= 1; }
-                        ui.sel_key = list_keys(&snap, ui.tab, ui.section).get(ui.sel).cloned();
+                        ui.sel_key = list_keys(&snap, ui.tab, ui.section, ui.fc_sel).get(ui.sel).cloned();
                     }
                     KeyCode::Down => {
-                        ui.sel = (ui.sel + 1).min(list_keys(&snap, ui.tab, ui.section).len().saturating_sub(1));
-                        ui.sel_key = list_keys(&snap, ui.tab, ui.section).get(ui.sel).cloned();
+                        ui.sel = (ui.sel + 1).min(list_keys(&snap, ui.tab, ui.section, ui.fc_sel).len().saturating_sub(1));
+                        ui.sel_key = list_keys(&snap, ui.tab, ui.section, ui.fc_sel).get(ui.sel).cloned();
                     }
                     KeyCode::Left => {
                         let n = section_count(&snap, ui.tab);
@@ -441,14 +449,14 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
                         if n > 1 { ui.section = (ui.section + 1) % n; ui.sel = 0; ui.sel_key = None; }
                     }
                     KeyCode::Enter => {
-                        ui.detail_lines = build_detail(&snap, ui.tab, ui.section, ui.sel, &source.build_dir());
+                        ui.detail_lines = build_detail(&snap, ui.tab, ui.section, ui.sel, ui.fc_sel, &source.build_dir());
                         if !ui.detail_lines.is_empty() { ui.dscroll = 0; ui.detail = true; }
                     }
                     KeyCode::Char('p') | KeyCode::Char('P') => {
                         source.control(&ControlSet { paused: Some(!snap.paused), ..Default::default() });
                     }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
-                        if let Some(slug) = selected_slug(&snap, ui.tab, ui.section, ui.sel) {
+                        if let Some(slug) = selected_slug(&snap, ui.tab, ui.section, ui.sel, ui.fc_sel) {
                             source.control(&ControlSet { retry: Some(vec![slug]), ..Default::default() });
                         }
                     }
@@ -522,8 +530,8 @@ fn handle_config_key(ui: &mut Ui, code: KeyCode, snap: &Snapshot, src: &dyn Sour
 
 /// The slug to retry on [R] — only the focused section's selected family, and only for the sections
 /// where a family identity is meaningful (failures / built / queue / history).
-fn selected_slug(snap: &Snapshot, tab: usize, section: usize, sel: usize) -> Option<String> {
-    let secs = sections_for(snap, tab);
+fn selected_slug(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel: usize) -> Option<String> {
+    let secs = sections_for(snap, tab, fc_sel);
     let s = secs.get(section)?;
     if matches!(s.dview, "failures" | "built" | "queue" | "history") {
         s.keys.get(sel).cloned()
@@ -697,7 +705,7 @@ fn failures_section(snap: &Snapshot) -> SectionR {
 }
 
 /// All sections of a tab, in display order — a port of the Python `sections_for`.
-fn sections_for(snap: &Snapshot, tab: usize) -> Vec<SectionR> {
+fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
     match TABS[tab] {
         "overview" => {
             let rows = snap.tasks.iter().map(|t| {
@@ -744,18 +752,41 @@ fn sections_for(snap: &Snapshot, tab: usize) -> Vec<SectionR> {
         }
         "failures" => {
             let mut secs = Vec::new();
-            if !snap.fail_categories.is_empty() {
-                let rows = snap.fail_categories.iter().map(|c| vec![
-                    (format!("{:>4}  ", c.count), Color::White),
-                    (format!("{:<24}", head(&c.cat, 24)), Color::Cyan),
-                    (format!(" {}", c.hint), Color::DarkGrey),
-                ]).collect();
+            let has_cats = !snap.fail_categories.is_empty();
+            // the selected cause (sticky); its families filter the 'newest' list below
+            let sel_cat = if has_cats { snap.fail_categories.get(fc_sel.min(snap.fail_categories.len() - 1)) } else { None };
+            if has_cats {
+                let sel_idx = fc_sel.min(snap.fail_categories.len().saturating_sub(1));
+                let rows = snap.fail_categories.iter().enumerate().map(|(i, c)| {
+                    let on = i == sel_idx;
+                    vec![
+                        (format!("{}{:>4}  ", if on { "▸" } else { " " }, c.count), Color::White),
+                        (format!("{:<24}", head(&c.cat, 24)), if on { Color::Yellow } else { Color::Cyan }),
+                        (format!(" {}", c.hint), Color::DarkGrey),
+                    ]
+                }).collect();
                 secs.push(SectionR {
-                    title: "Failures by cause".into(), dview: "failcat", rows,
+                    title: "Failures by cause  (←/→ here, ↑/↓ to pick — filters the list below)".into(), dview: "failcat", rows,
                     keys: snap.fail_categories.iter().map(|c| c.cat.clone()).collect(),
                 });
             }
-            secs.push(failures_section(snap));
+            // 'newest first', auto-filtered to the selected cause's families
+            let famset: Option<std::collections::HashSet<&str>> = sel_cat.map(|c| c.families.iter().map(|s| s.as_str()).collect());
+            let filtered: Vec<&crate::model::FailItem> = snap.failures_recent.iter()
+                .filter(|f| famset.as_ref().map_or(true, |set| set.contains(f.slug.as_str())))
+                .collect();
+            let frows = filtered.iter().map(|f| vec![
+                (format!("{:<34} ", f.slug), Color::Red),
+                (f.error.clone(), Color::DarkRed),
+            ]).collect();
+            let ftitle = match sel_cat {
+                Some(c) => format!("Failures — newest first · cause: {}", c.cat),
+                None => "Failures — newest first (current)".into(),
+            };
+            secs.push(SectionR {
+                title: ftitle, dview: "failures", rows: frows,
+                keys: filtered.iter().map(|f| f.slug.clone()).collect(),
+            });
             if !snap.failure_history.is_empty() {
                 let rows = snap.failure_history.iter().map(|h| vec![
                     (format!("{:<20} ", head(&h.cause, 20)), Color::Yellow),
@@ -1017,9 +1048,9 @@ fn render_tabbar_body(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16
             // Python's stats view = a fontc-migration summary, then the timing sections below it
             let used = render_stats_prefix(scr, snap, row, w);
             let r2 = row + used;
-            draw_sections(scr, &sections_for(snap, ui.tab), r2, sep_row.saturating_sub(r2), w, ui.section, ui.sel);
+            draw_sections(scr, &sections_for(snap, ui.tab, ui.fc_sel), r2, sep_row.saturating_sub(r2), w, ui.section, ui.sel);
         }
-        _ => draw_sections(scr, &sections_for(snap, ui.tab), row, avail, w, ui.section, ui.sel),
+        _ => draw_sections(scr, &sections_for(snap, ui.tab, ui.fc_sel), row, avail, w, ui.section, ui.sel),
     }
 
     // ---- status panel (separator + up to 3 context lines) ----
@@ -1356,7 +1387,7 @@ fn focus_info(snap: &Snapshot, ui: &Ui) -> Vec<String> {
         }
         _ => {}
     }
-    let secs = sections_for(snap, ui.tab);
+    let secs = sections_for(snap, ui.tab, ui.fc_sel);
     let dview = match secs.get(ui.section) { Some(s) => s.dview, None => return vec![] };
     match dview {
         "overview" => snap.tasks.get(sel).map(|t| {
@@ -1466,14 +1497,14 @@ fn wrap_line(s: &str, width: usize) -> Vec<String> {
 
 /// Build the full detail content for the selected list item — a faithful port of the Python
 /// `_detail_lines` (incl. reading the per-family log tail). Captured ONCE when the overlay opens.
-fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, build_dir: &std::path::Path) -> Vec<String> {
+fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel: usize, build_dir: &std::path::Path) -> Vec<String> {
     let mut o: Vec<String> = Vec::new();
     // archive/config are single custom views; every other tab dispatches on the FOCUSED section's
     // detail-view tag — so the right detail opens for whichever section ←/→ has focused.
     let dview: &str = match TABS[tab] {
         "config" => "config",
         "archive" => "archive",
-        _ => sections_for(snap, tab).get(section).map(|s| s.dview).unwrap_or(""),
+        _ => sections_for(snap, tab, fc_sel).get(section).map(|s| s.dview).unwrap_or(""),
     };
     match dview {
         "failures" => {

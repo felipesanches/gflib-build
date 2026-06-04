@@ -304,11 +304,13 @@ function ctl(set){fetch('/api/control',{method:'POST',headers:{'Content-Type':'a
 function setTab(t){tab=t;location.hash=t;render()}
 async function poll(){try{snap=await (await fetch('/api/status')).json()}catch(e){}sample();render();checkNotify()}
 
-// --- a row = {segs:[[text,class]…], rt?:retry-slug, det?:[kind,id]}; det makes it click-to-detail ---
-let DET=[];
+// --- a row = {segs:[[text,class]…], rt?:retry-slug, det?:[kind,id], fc?:cause-to-filter-by} ---
+let DET=[], fsCause=null;
+function setFsCause(c){fsCause=(fsCause==c?null:c);render()}
 function R(row){
  let cls='ln',oc='';
- if(row.det){DET.push(row.det);cls='ln clk';oc=' onclick="openDetailIdx('+(DET.length-1)+')"';}
+ if(row.fc!=null){cls='ln clk';oc=' onclick="setFsCause(\''+E(row.fc)+'\')"';}
+ else if(row.det){DET.push(row.det);cls='ln clk';oc=' onclick="openDetailIdx('+(DET.length-1)+')"';}
  let h='<div class="'+cls+'"'+oc+'>'+row.segs.map(s=>'<span class="'+s[1]+'">'+E(s[0])+'</span>').join('');
  if(row.rt) h+='<button class="rb" onclick="event.stopPropagation();ctl({retry:[\''+E(row.rt)+'\']})" title="retry this family">↻ retry</button>';
  return h+'</div>';
@@ -329,7 +331,9 @@ function cohortRow(c){const segs=[[c.cached?'● ':'○ ',c.cached?'g':'muted'],
  return {segs,det:['cohort',c.key]}}
 function builtRow(b){const comp=b.compiler_version||b.backend||'';
  return {segs:[[L(b.slug,32)+' ','g'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9)+'  '+(b.compare||''),'gr']],rt:b.slug,det:['built',b.slug]}}
-function failcatRow(c){return {segs:[[Rp(c.count,4)+'  ','w'],[L(c.cat,24),'c'],[' '+(c.hint||''),'muted']],det:['failcat',c.cat]}}
+// clicking a cause FILTERS the families list below (and highlights the selected cause)
+function failcatRow(c){const sel=fsCause==c.cat;
+ return {segs:[[(sel?'▸':' ')+Rp(c.count,3)+'  ','w'],[L(c.cat,24),sel?'y':'c'],[' '+(c.hint||''),'muted']],fc:c.cat}}
 function histRow(h){return {segs:[[L(h.cause,20)+' ','y'],[h.slug||'','gr']],rt:h.slug,det:['history',h.slug]}}
 function phaseRow(kv){return {segs:[[L(kv[0],12)+' '+hms(kv[1]),'gr']]}}
 function opRow(kv){const s=kv[1];return {segs:[[L(kv[0],10)+' total '+Rp((s.total||0).toFixed(1),9)+'  n '+Rp(s.count||0,5)+'  mean '+Rp((s.mean||0).toFixed(2),7)+'  max '+Rp((s.max||0).toFixed(1),7),'c']]}}
@@ -340,8 +344,12 @@ function sections(t){
  if(t=='queue')return [{title:'Queued — priority order (variable + larger families first)',rows:filterList(snap.queued_list,['slug','kind']).map(qRow)}];
  if(t=='cohorts')return [{title:'Dependency cohorts  (● = venv cached on disk, reused next run)',rows:filterList(snap.cohorts,['key']).map(cohortRow)}];
  if(t=='built')return [{title:'Built — successes  (slug · compiler+version · size · vs-shipped)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(builtRow)}];
- if(t=='failures'){const s=[];if((snap.fail_categories||[]).length)s.push({title:'Failures by cause',rows:filterList(snap.fail_categories,['cat','hint']).map(failcatRow)});
-  s.push({title:'Failures — newest first (current)',rows:filterList(snap.failures_recent,['slug','error']).map(failRow)});
+ if(t=='failures'){const s=[];const cats=snap.fail_categories||[];
+  if(cats.length)s.push({title:'Failures by cause (click to filter)',rows:filterList(cats,['cat','hint']).map(failcatRow)});
+  // the families list is auto-filtered by the selected cause
+  let fr=snap.failures_recent||[];
+  if(fsCause){const cat=cats.find(c=>c.cat==fsCause);const fam=new Set(cat?(cat.families||[]):[]);fr=fr.filter(f=>fam.has(f.slug));}
+  s.push({title:'Failures — newest first'+(fsCause?' · cause: '+fsCause+' (click the cause again to clear)':' (current)'),rows:filterList(fr,['slug','error']).map(failRow)});
   if((snap.failure_history||[]).length)s.push({title:'Failure history (persistent — survives restarts & re-attempts)',rows:filterList(snap.failure_history,['slug','cause','error']).map(histRow)});return s}
  if(t=='stats'){const ph=Object.entries(snap.phase_durations||{}).sort((a,b)=>b[1]-a[1]);
   const ops=Object.entries(snap.op_stats||{}).sort((a,b)=>(b[1].total||0)-(a[1].total||0));
