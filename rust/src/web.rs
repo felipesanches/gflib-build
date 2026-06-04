@@ -190,10 +190,15 @@ fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> std::
 const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
 <title>gflib-build dashboard</title>
 <style>
- :root{--g:#86efac;--r:#fca5a5;--c:#67e8f9;--y:#fde68a;--muted:#7c8aa0;--dr:#c77d7d;--w:#fff;--gr:#cbd5e1;--bg:#0b0e14;--panel:#11161f;--line:#1e293b}
+ :root{--g:#86efac;--r:#fca5a5;--c:#67e8f9;--y:#fde68a;--muted:#7c8aa0;--dr:#c77d7d;--w:#fff;--gr:#cbd5e1;--bg:#0b0e14;--panel:#11161f;--line:#1e293b;--secbg:#0e1420;--hover:#16202f;--pinbg:#1a1505}
+ body[data-theme=light]{--g:#15803d;--r:#b91c1c;--c:#0e7490;--y:#a16207;--muted:#64748b;--dr:#b45454;--w:#0b1220;--gr:#1e293b;--bg:#f6f7f9;--panel:#ffffff;--line:#e2e8f0;--secbg:#eef2f7;--hover:#e8edf3;--pinbg:#fdf6e3}
  body{background:var(--bg);color:var(--gr);font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:10px 12px}
+ /* W5: responsive multi-pane (overview sections side by side on wide screens) */
+ .panes{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
+ @media(max-width:900px){.panes{grid-template-columns:1fr}}
+ .w5{font-size:11px}
  .g{color:var(--g)}.r{color:var(--r)}.c{color:var(--c)}.y{color:var(--y)}.muted{color:var(--muted)}.dr{color:var(--dr)}.w{color:var(--w)}.gr{color:var(--gr)}.b{font-weight:600}
- .t{font-size:15px;color:#fff;font-weight:600}
+ .t{font-size:15px;color:var(--w);font-weight:600}
  .sub{color:var(--c)}
  .right{float:right}
  /* segmented progress bar */
@@ -205,7 +210,7 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  /* tabs */
  .tabs{margin:8px 0 4px;border-bottom:1px solid var(--line);padding-bottom:4px}
  .tab{display:inline-block;padding:3px 11px;cursor:pointer;border-radius:4px 4px 0 0;color:var(--muted)}
- .tab.on{background:var(--line);color:#fff}
+ .tab.on{background:var(--line);color:var(--w)}
  .tabhint{float:right;color:var(--muted);font-size:11px;padding-top:4px}
  /* controls */
  .ctl{margin:4px 0 8px;color:var(--muted)}
@@ -214,17 +219,17 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  .rb{visibility:hidden;margin-left:8px;padding:0 6px;font-size:11px}
  .ln:hover .rb{visibility:visible}
  /* sections + rows */
- .sec{background:#0e1420;border-left:3px solid #334155;color:#fff;font-weight:600;padding:3px 8px;margin:10px 0 2px;border-radius:0 4px 4px 0}
+ .sec{background:var(--secbg);border-left:3px solid var(--line);color:var(--w);font-weight:600;padding:3px 8px;margin:10px 0 2px;border-radius:0 4px 4px 0}
  .ln{white-space:pre;padding:1px 8px;border-radius:3px}
- .ln:hover{background:#0e1420}
+ .ln:hover{background:var(--hover)}
  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(26ch,1fr));gap:0 8px;padding:2px 8px}
- .pin{background:#1a1505;border:1px solid #3b2f08;border-radius:6px;padding:4px 0;margin:6px 0}
+ .pin{background:var(--pinbg);border:1px solid var(--line);border-radius:6px;padding:4px 0;margin:6px 0}
  .pin .sec{background:none;border:none;color:var(--y);margin:2px 0}
  .cfg td{padding:1px 10px 1px 8px;white-space:pre}
  /* charts (hand-rolled, dependency-free: CSS-div bars + inline-SVG donuts/rings) */
  .chartrow{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0}
  .chart{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;flex:1;min-width:250px}
- .ctitle{color:#fff;font-weight:600;margin-bottom:8px;font-size:12px}
+ .ctitle{color:var(--w);font-weight:600;margin-bottom:8px;font-size:12px}
  .bars{display:flex;flex-direction:column;gap:3px}
  .brow{display:flex;align-items:center;gap:6px}
  .blabel{width:36%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--gr);font-size:11px}
@@ -235,23 +240,25 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  .legend{font-size:11px;color:var(--gr)}
  .legend span{display:inline-block;margin:2px 10px 0 0}
  .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:middle}
- .clk{cursor:pointer}.clk:hover{background:#16202f}
+ .clk{cursor:pointer}.clk:hover{background:var(--hover)}
  /* detail panel + config form */
- #detail{display:none;position:fixed;top:0;right:0;width:46%;max-width:780px;height:100%;overflow:auto;background:#0d121c;border-left:1px solid var(--line);box-shadow:-8px 0 24px rgba(0,0,0,.5);padding:12px 14px;z-index:50}
- .dhead{color:#fff;font-weight:600;border-bottom:1px solid var(--line);padding-bottom:6px;margin-bottom:8px}
+ #detail{display:none;position:fixed;top:0;right:0;width:46%;max-width:780px;height:100%;overflow:auto;background:var(--panel);border-left:1px solid var(--line);box-shadow:-8px 0 24px rgba(0,0,0,.5);padding:12px 14px;z-index:50}
+ .dhead{color:var(--w);font-weight:600;border-bottom:1px solid var(--line);padding-bottom:6px;margin-bottom:8px}
  .dclose{float:right;cursor:pointer;color:var(--muted);font-weight:400}
  .dbody{white-space:pre-wrap;word-break:break-word;font:inherit;margin:0;color:var(--gr)}
  .dlog{margin-top:10px;border-top:1px solid var(--line);padding-top:8px}
- .cfg input,.cfg select{background:var(--line);color:#fff;border:1px solid #334155;border-radius:4px;padding:1px 5px;font:inherit}
+ .cfg input,.cfg select{background:var(--line);color:var(--w);border:1px solid var(--line);border-radius:4px;padding:1px 5px;font:inherit}
  .cfg input[type=number]{width:74px}
  /* W4: filter box + export toolbar */
  .toolbar{margin:6px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
- #filter{background:var(--line);color:#fff;border:1px solid #334155;border-radius:4px;padding:2px 8px;font:inherit;width:240px}
+ #filter{background:var(--line);color:var(--w);border:1px solid var(--line);border-radius:4px;padding:2px 8px;font:inherit;width:240px}
  .tbtn{font-size:11px}.tbtn.on{background:#334155;color:#fff}
+ .rtxt{fill:var(--w)}
  /* fontspector QA panel */
  .fsbar{display:inline-flex;width:150px;height:11px;border-radius:3px;overflow:hidden;background:var(--line);vertical-align:middle;margin:0 8px}
  .fsg{height:100%}.bval2{font-size:11px}.fsexp{padding:1px 0 6px 12px}
 </style></head><body>
+<script>document.body.dataset.theme=localStorage.getItem('gf_theme')||'dark'</script>
 <div id="hdr"></div>
 <div id="bar"></div>
 <div class="tabs" id="tabs"></div>
@@ -294,7 +301,7 @@ function trunc(s,n){s=(s==null?'':''+s);return s.length>n?s.slice(0,n-1)+'…':s
 function prov(x){const c=x.compiler_version||x.backend||'';return c+(x.builder_version?' · '+x.builder_version:'')}
 function ctl(set){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({set:set})})}
 function setTab(t){tab=t;location.hash=t;render()}
-async function poll(){try{snap=await (await fetch('/api/status')).json()}catch(e){}sample();render()}
+async function poll(){try{snap=await (await fetch('/api/status')).json()}catch(e){}sample();render();checkNotify()}
 
 // --- a row = {segs:[[text,class]…], rt?:retry-slug, det?:[kind,id]}; det makes it click-to-detail ---
 let DET=[];
@@ -461,11 +468,16 @@ function render(){
  const fEl=document.getElementById('filter');
  if(!(fEl&&document.activeElement===fEl)){
   const listTab=['overview','queue','cohorts','built','failures','fontspector'].includes(tab);
+  const opt=(ms,lbl)=>'<option value="'+ms+'"'+(POLL_MS==ms?' selected':'')+'>'+lbl+'</option>';
+  const notifyBtn=(window.Notification&&Notification.permission!='granted')?' <button class="tbtn" onclick="askNotify()" title="notify when the build completes">🔔 notify</button>':'';
   document.getElementById('ctl').innerHTML=
     '<button onclick="ctl({paused:true})"'+(snap.paused?' disabled':'')+'>pause</button> '+
     '<button onclick="ctl({paused:false})"'+(snap.paused?'':' disabled')+'>resume</button>'+
     (listTab?' <input id="filter" placeholder="filter… (slug / cause)" oninput="setFilter(this.value)" value="'+E(FILTER)+'">':'')+
     ' <button class="tbtn" onclick="exportJSON()">⬇ JSON</button> <button class="tbtn" onclick="exportCSV()">⬇ CSV (built+failed)</button>'+
+    ' <button class="tbtn" onclick="poll()" title="refresh now">↻</button>'+
+    ' <select class="w5" onchange="setPoll(this.value)" title="auto-refresh interval">'+opt(1000,'1s')+opt(1500,'1.5s')+opt(3000,'3s')+opt(5000,'5s')+opt(0,'paused')+'</select>'+
+    ' <button class="tbtn" onclick="toggleTheme()" title="light / dark">◐</button>'+notifyBtn+
     '<span class="muted"> &nbsp; hover a row for ↻ retry · click a row for details</span>';
  }
  // ---- pinned now-building (every tab) ----
@@ -479,6 +491,7 @@ function render(){
  if(tab=='config')body+=cfgView();
  else if(tab=='archive')body+=archiveView();
  else if(tab=='fontspector')body+=fsView();
+ else if(tab=='overview')body+='<div class="panes">'+sections(tab).map(s=>'<div>'+renderSec(s)+'</div>').join('')+'</div>'; // multi-pane
  else{body+=(tab=='stats'?statsPrefix():'')+sections(tab).map(renderSec).join('');}
  document.getElementById('body').innerHTML=body;
 }
@@ -521,7 +534,7 @@ function lineChart(series,W,H){
  const pad=4,iw=W-2*pad,ih=H-2*pad;
  const sx=x=>pad+(xmax==xmin?0:(x-xmin)/(xmax-xmin)*iw);
  const sy=y=>pad+ih-y/ymax*ih;
- let svg='<svg width="100%" height="'+H+'" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" style="background:#0e1420;border-radius:4px">';
+ let svg='<svg width="100%" height="'+H+'" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" style="background:var(--secbg);border-radius:4px">';
  series.forEach(s=>{if(s.pts.length<2)return;const d=s.pts.map((p,i)=>(i?'L':'M')+sx(p[0]).toFixed(1)+' '+sy(p[1]).toFixed(1)).join(' ');
   svg+='<path d="'+d+'" fill="none" stroke="'+s.color+'" stroke-width="1.5"/>';});
  return svg+'</svg>';
@@ -636,7 +649,7 @@ function ring(done,total,sub){
  return '<svg width="88" height="88" viewBox="0 0 88 88">'+
   '<circle cx="44" cy="44" r="34" fill="none" stroke="#1e293b" stroke-width="10"/>'+
   (len>0?'<circle cx="44" cy="44" r="34" fill="none" stroke="#06b6d4" stroke-width="10" stroke-linecap="round" stroke-dasharray="'+len+' '+(C-len)+'" transform="rotate(-90 44 44)"/>':'')+
-  '<text x="44" y="42" text-anchor="middle" fill="#fff" font-size="15" font-weight="600">'+Math.floor(100*frac)+'%</text>'+
+  '<text x="44" y="42" text-anchor="middle" class="rtxt" font-size="15" font-weight="600">'+Math.floor(100*frac)+'%</text>'+
   '<text x="44" y="58" text-anchor="middle" fill="#7c8aa0" font-size="9">'+E(sub||'')+'</text></svg>';
 }
 function legend(slices){return '<div class="legend">'+slices.filter(s=>(s.value||0)>0).map(s=>'<span><i style="background:'+s.color+'"></i>'+E(s.label)+' '+(s.value||0)+'</span>').join('')+'</div>'}
@@ -674,5 +687,19 @@ function charts(t){
 
 addEventListener('hashchange',()=>{const t=location.hash.slice(1);if(TABS.includes(t)){tab=t;render()}});
 if(TABS.includes(location.hash.slice(1)))tab=location.hash.slice(1);
-poll();setInterval(poll,1500);
+
+// ---- W5: polling cadence + pause-when-hidden + theme + completion notification ----
+let POLL_MS=+(localStorage.getItem('gf_poll')||1500), timer=null, lastDone=false;
+function startPoll(){if(timer)clearInterval(timer);if(POLL_MS>0&&!document.hidden)timer=setInterval(poll,POLL_MS)}
+function setPoll(ms){POLL_MS=+ms;localStorage.setItem('gf_poll',POLL_MS);startPoll()}
+document.addEventListener('visibilitychange',()=>{if(document.hidden){if(timer){clearInterval(timer);timer=null}}else{poll();startPoll()}});
+function setTheme(t){document.body.dataset.theme=t;localStorage.setItem('gf_theme',t)}
+function toggleTheme(){setTheme(document.body.dataset.theme=='light'?'dark':'light')}
+function askNotify(){if(window.Notification)Notification.requestPermission().then(()=>render())}
+function checkNotify(){const done=snap.done&&(snap.total||0)>0;
+ if(done&&!lastDone&&window.Notification&&Notification.permission=='granted'){
+  const c=snap.counts||{};new Notification('gflib-build — build complete',{body:(c.built||0)+' built · '+(c.failed||0)+' failed · '+(c.skipped||0)+' skipped'});}
+ lastDone=done;}
+setTheme(localStorage.getItem('gf_theme')||'dark');
+poll();startPoll();
 </script></body></html>"###;
