@@ -59,6 +59,7 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
     out.flush()?;
 
     let mut ui = Ui { tab: 1, sel: 0, detail: false, sel_key: None };
+    let mut prev: Option<Screen> = None;
     let res = loop {
         let snap = source.snapshot();
         // stable selection: re-resolve the row index from the remembered item key each frame, so a
@@ -72,7 +73,12 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
         if ui.sel >= keys.len() {
             ui.sel = keys.len().saturating_sub(1);
         }
-        render(&mut out, &snap, &ui, &*source)?;
+        // draw the whole frame into a back-buffer, then emit only the cells that changed (no flicker)
+        let (w, h) = terminal::size().unwrap_or((100, 40));
+        let mut scr = Screen::new(w.max(1), h.max(1));
+        render(&mut scr, &snap, &ui, &*source);
+        flush_diff(&mut out, &scr, &prev)?;
+        prev = Some(scr);
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(k) = event::read()? {
@@ -214,16 +220,86 @@ fn selected_slug(snap: &Snapshot, tab: usize, sel: usize) -> Option<String> {
     }
 }
 
-fn put(out: &mut Stdout, row: u16, col: u16, text: &str, color: Color, width: u16) {
-    let mut s: String = text.chars().take(width.saturating_sub(col) as usize).collect();
-    // strip control chars
-    s = s.chars().filter(|c| !c.is_control()).collect();
-    let _ = queue!(out, cursor::MoveTo(col, row), SetForegroundColor(color), Print(s), ResetColor);
+// ---- flicker-free rendering: draw the whole frame into a back-buffer of cells, then emit ONLY the
+// cells that changed since the previous frame (like ncurses does). No full-screen Clear → no flicker.
+#[derive(Clone, PartialEq)]
+struct Cell {
+    ch: char,
+    fg: Color,
+}
+impl Default for Cell {
+    fn default() -> Self {
+        Cell { ch: ' ', fg: Color::Reset }
+    }
+}
+struct Screen {
+    w: u16,
+    h: u16,
+    cells: Vec<Cell>,
+}
+impl Screen {
+    fn new(w: u16, h: u16) -> Self {
+        Screen { w, h, cells: vec![Cell::default(); (w as usize) * (h as usize)] }
+    }
+    fn set(&mut self, row: u16, col: u16, text: &str, fg: Color) {
+        if row >= self.h {
+            return;
+        }
+        let mut c = col;
+        for ch in text.chars().filter(|c| !c.is_control()) {
+            if c >= self.w {
+                break;
+            }
+            let idx = (row as usize) * (self.w as usize) + c as usize;
+            self.cells[idx] = Cell { ch, fg };
+            c += 1;
+        }
+    }
 }
 
-fn render(out: &mut Stdout, snap: &Snapshot, ui: &Ui, src: &dyn Source) -> std::io::Result<()> {
-    let (w, h) = terminal::size().unwrap_or((100, 40));
-    queue!(out, terminal::Clear(terminal::ClearType::All))?;
+/// Draw `text` at (row,col) into the back-buffer `scr`. (`_w` kept for call-site compatibility.)
+fn put(scr: &mut Screen, row: u16, col: u16, text: &str, color: Color, _w: u16) {
+    scr.set(row, col, text, color);
+}
+
+/// Emit only the cells that differ from the previous frame (runs of same colour), so the terminal
+/// never blanks. Full repaint when the size changed or there is no previous frame.
+fn flush_diff(out: &mut Stdout, new: &Screen, prev: &Option<Screen>) -> std::io::Result<()> {
+    let full = match prev {
+        Some(p) => p.w != new.w || p.h != new.h,
+        None => true,
+    };
+    for row in 0..new.h {
+        let mut col = 0u16;
+        while col < new.w {
+            let idx = (row as usize) * (new.w as usize) + col as usize;
+            let nc = &new.cells[idx];
+            let changed = full || prev.as_ref().map(|p| p.cells.get(idx) != Some(nc)).unwrap_or(true);
+            if !changed {
+                col += 1;
+                continue;
+            }
+            let fg = nc.fg;
+            let start = col;
+            let mut run = String::new();
+            while col < new.w {
+                let i = (row as usize) * (new.w as usize) + col as usize;
+                let cc = &new.cells[i];
+                let ch_changed = full || prev.as_ref().map(|p| p.cells.get(i) != Some(cc)).unwrap_or(true);
+                if !ch_changed || cc.fg != fg {
+                    break;
+                }
+                run.push(cc.ch);
+                col += 1;
+            }
+            queue!(out, cursor::MoveTo(start, row), SetForegroundColor(fg), Print(run), ResetColor)?;
+        }
+    }
+    out.flush()
+}
+
+fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui, src: &dyn Source) {
+    let (w, h) = (scr.w, scr.h);
 
     // ---- header ----
     let mode = if src.is_live() { "live" } else if snap.daemon_alive { "monitor" } else { "stopped" };
@@ -232,8 +308,8 @@ fn render(out: &mut Stdout, snap: &Snapshot, ui: &Ui, src: &dyn Source) -> std::
         mode,
         if snap.paused { "  [PAUSED]" } else { "" }
     );
-    put(out, 0, 0, &title, Color::White, w);
-    put(out, 0, w.saturating_sub(18), &format!("elapsed {}", hms(snap.elapsed)), Color::Grey, w);
+    put(scr, 0, 0, &title, Color::White, w);
+    put(scr, 0, w.saturating_sub(18), &format!("elapsed {}", hms(snap.elapsed)), Color::Grey, w);
 
     let bld = snap.disk_build_total;
     let arc = snap.disk_archive_total;
@@ -244,7 +320,7 @@ fn render(out: &mut Stdout, snap: &Snapshot, ui: &Ui, src: &dyn Source) -> std::
         format!("disk used {} (build {} + archive {})", human(bld + arc), human(bld), human(arc))
     };
     put(
-        out,
+        scr,
         1,
         0,
         &format!(
@@ -261,7 +337,7 @@ fn render(out: &mut Stdout, snap: &Snapshot, ui: &Ui, src: &dyn Source) -> std::
     let in_scope = processed + c.queued + c.building;
     let pct = if in_scope > 0 { processed * 100 / in_scope } else { 0 };
     put(
-        out,
+        scr,
         2,
         0,
         &format!(
@@ -275,16 +351,16 @@ fn render(out: &mut Stdout, snap: &Snapshot, ui: &Ui, src: &dyn Source) -> std::
     // of leaving the dashboard looking frozen mid-flight.
     if snap.done && snap.total > 0 {
         let top = snap.fail_categories.first().map(|f| format!("  ·  top cause: {} ({})", f.cat, f.count)).unwrap_or_default();
-        put(out, 3, 0, &format!(" ✓ BUILD COMPLETE — built {} · failed {} · skipped {} of {}{}",
+        put(scr, 3, 0, &format!(" ✓ BUILD COMPLETE — built {} · failed {} · skipped {} of {}{}",
             c.built, c.failed, c.skipped, snap.total, top), Color::Green, w);
     } else if !src.is_live() && !snap.daemon_alive && snap.total > 0 {
-        put(out, 3, 0, &format!(" ■ DAEMON STOPPED — built {} · failed {} · queued {} (re-run to resume)",
+        put(scr, 3, 0, &format!(" ■ DAEMON STOPPED — built {} · failed {} · queued {} (re-run to resume)",
             c.built, c.failed, c.queued), Color::Yellow, w);
     } else {
         let barw = w.saturating_sub(8) as usize;
         let fill = barw * pct / 100;
         let bar: String = std::iter::repeat('#').take(fill).chain(std::iter::repeat('-').take(barw - fill)).collect();
-        put(out, 3, 0, &format!(" [{}] {:>3}%", bar, pct), Color::Cyan, w);
+        put(scr, 3, 0, &format!(" [{}] {:>3}%", bar, pct), Color::Cyan, w);
     }
 
     // ---- tab bar ----
@@ -296,7 +372,7 @@ fn render(out: &mut Stdout, snap: &Snapshot, ui: &Ui, src: &dyn Source) -> std::
             tabline.push_str(&format!(" {}  ", t));
         }
     }
-    put(out, 4, 0, &tabline, Color::Yellow, w);
+    put(scr, 4, 0, &tabline, Color::Yellow, w);
 
     // ---- pinned now-building (on every tab) ----
     let body_top = 6u16;
@@ -304,11 +380,11 @@ fn render(out: &mut Stdout, snap: &Snapshot, ui: &Ui, src: &dyn Source) -> std::
     let panel_row = h.saturating_sub(3);
     let mut row = body_top;
     if !snap.building.is_empty() && TABS[ui.tab] != "overview" {
-        put(out, row, 0, &format!(" Now building ({})", snap.building.len()), Color::DarkYellow, w);
+        put(scr, row, 0, &format!(" Now building ({})", snap.building.len()), Color::DarkYellow, w);
         row += 1;
         for b in snap.building.iter().take(3) {
             put(
-                out,
+                scr,
                 row,
                 1,
                 &format!("w{} {:<40} {:>6}  {}", b.worker, b.slug, hms(b.dur), b.note),
@@ -323,53 +399,35 @@ fn render(out: &mut Stdout, snap: &Snapshot, ui: &Ui, src: &dyn Source) -> std::
     // ---- body per tab ----
     let avail = panel_row.saturating_sub(row);
     match TABS[ui.tab] {
-        "overview" => render_overview(out, snap, row, avail, w),
+        "overview" => render_overview(scr, snap, row, avail, w),
         "queue" => render_list_simple(
-            out,
-            row,
-            avail,
-            w,
-            ui.sel,
-            "Queue",
+            scr, row, avail, w, ui.sel, "Queue",
             snap.queued_list.iter().map(|q| format!("{:<48} {}", q.slug, q.kind)).collect(),
         ),
         "cohorts" => render_list_simple(
-            out,
-            row,
-            avail,
-            w,
-            ui.sel,
-            "Cohorts",
+            scr, row, avail, w, ui.sel, "Cohorts",
             snap.cohorts.iter().map(|c| format!("{:<20} {} families", c.key, c.count)).collect(),
         ),
-        "built" => render_built(out, snap, row, avail, w, ui.sel),
-        "failures" => render_failures(out, snap, row, avail, w, ui.sel),
-        "stats" => render_stats(out, snap, row, avail, w),
-        "archive" => render_archive(out, snap, row, avail, w),
-        _ => render_config(out, snap, ui.sel, row, w),
+        "built" => render_built(scr, snap, row, avail, w, ui.sel),
+        "failures" => render_failures(scr, snap, row, avail, w, ui.sel),
+        "stats" => render_stats(scr, snap, row, avail, w),
+        "archive" => render_archive(scr, snap, row, avail, w),
+        _ => render_config(scr, snap, ui.sel, row, w),
     }
 
     // ---- status panel ----
-    put(out, panel_row, 0, &"─".repeat(w as usize), Color::DarkGrey, w);
-    let panel = status_panel(snap, ui);
-    put(out, panel_row + 0, 0, "", Color::Grey, w);
-    put(out, panel_row, 0, &panel, Color::White, w);
+    put(scr, panel_row, 0, &"─".repeat(w as usize), Color::DarkGrey, w);
+    put(scr, panel_row, 0, &status_panel(snap, ui), Color::White, w);
 
     // ---- footer ----
-    put(
-        out,
-        footer_row,
-        0,
+    put(scr, footer_row, 0,
         " [Tab/⇧Tab]tabs  [↑↓]item  [↵]details  [p]ause  [R]etry  [+/-]jobs  [C]onfig  [q]uit",
-        Color::DarkGrey,
-        w,
-    );
+        Color::DarkGrey, w);
 
-    // detail overlay
+    // detail overlay (drawn on top of the back-buffer)
     if ui.detail {
-        render_detail(out, snap, ui, w, h);
+        render_detail(scr, snap, ui, w, h);
     }
-    out.flush()
 }
 
 /// Share `avail` rows fairly across sections wanting `desired[i]` rows each: a section that needs
@@ -402,27 +460,27 @@ fn water_fill(desired: &[usize], avail: usize) -> Vec<usize> {
     alloc
 }
 
-fn render_overview(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u16) {
+fn render_overview(scr: &mut Screen, snap: &Snapshot, top: u16, avail: u16, w: u16) {
     // water-fill the two sections so they fill the available height (header + items each)
     let desired = [snap.building.len() + 1, snap.failures_recent.len() + 1];
     let alloc = water_fill(&desired, avail as usize);
     let mut row = top;
-    put(out, row, 0, &format!(" Now building ({})", snap.building.len()), Color::DarkYellow, w);
+    put(scr, row, 0, &format!(" Now building ({})", snap.building.len()), Color::DarkYellow, w);
     row += 1;
     for b in snap.building.iter().take(alloc[0].saturating_sub(1)) {
-        put(out, row, 1, &format!("w{} {:<44} {:>6} {}", b.worker, b.slug, hms(b.dur), b.note), Color::Grey, w);
+        put(scr, row, 1, &format!("w{} {:<44} {:>6} {}", b.worker, b.slug, hms(b.dur), b.note), Color::Grey, w);
         row += 1;
     }
-    put(out, row, 0, &format!(" Recent failures ({})", snap.failures_recent.len()), Color::Red, w);
+    put(scr, row, 0, &format!(" Recent failures ({})", snap.failures_recent.len()), Color::Red, w);
     row += 1;
     for f in snap.failures_recent.iter().take(alloc[1].saturating_sub(1)) {
-        put(out, row, 1, &format!("{:<36} {}", f.slug, f.error), Color::Grey, w);
+        put(scr, row, 1, &format!("{:<36} {}", f.slug, f.error), Color::Grey, w);
         row += 1;
     }
 }
 
 fn render_list_simple(
-    out: &mut Stdout,
+    scr: &mut Screen,
     top: u16,
     avail: u16,
     w: u16,
@@ -430,20 +488,20 @@ fn render_list_simple(
     title: &str,
     items: Vec<String>,
 ) {
-    put(out, top, 0, &format!(" {} ({})", title, items.len()), Color::Cyan, w);
+    put(scr, top, 0, &format!(" {} ({})", title, items.len()), Color::Cyan, w);
     let mut row = top + 1;
     let start = scroll_start(sel, avail as usize - 1, items.len());
     for (i, it) in items.iter().enumerate().skip(start).take(avail as usize - 1) {
         let color = if i == sel { Color::Yellow } else { Color::Grey };
         let marker = if i == sel { "▸ " } else { "  " };
-        put(out, row, 0, &format!("{}{}", marker, it), color, w);
+        put(scr, row, 0, &format!("{}{}", marker, it), color, w);
         row += 1;
     }
 }
 
-fn render_built(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u16, sel: usize) {
+fn render_built(scr: &mut Screen, snap: &Snapshot, top: u16, avail: u16, w: u16, sel: usize) {
     put(
-        out,
+        scr,
         top,
         0,
         &format!(" Built — successes ({})  slug · compiler · builder · size", snap.built_recent.len()),
@@ -457,7 +515,7 @@ fn render_built(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u16,
         let prov = prov_str(&b.compiler_version, &b.backend, &b.builder_version);
         let marker = if i == sel { "▸ " } else { "  " };
         put(
-            out,
+            scr,
             row,
             0,
             &format!("{}{:<30} {:<34} {}", marker, b.slug, prov, human(b.bytes)),
@@ -468,63 +526,63 @@ fn render_built(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u16,
     }
 }
 
-fn render_failures(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u16, sel: usize) {
-    put(out, top, 0, &format!(" Failures ({})", snap.failures_recent.len()), Color::Red, w);
+fn render_failures(scr: &mut Screen, snap: &Snapshot, top: u16, avail: u16, w: u16, sel: usize) {
+    put(scr, top, 0, &format!(" Failures ({})", snap.failures_recent.len()), Color::Red, w);
     let mut row = top + 1;
     let start = scroll_start(sel, avail as usize - 1, snap.failures_recent.len());
     for (i, f) in snap.failures_recent.iter().enumerate().skip(start).take(avail as usize - 1) {
         let color = if i == sel { Color::Yellow } else { Color::Grey };
         let marker = if i == sel { "▸ " } else { "  " };
-        put(out, row, 0, &format!("{}{:<32} {}", marker, f.slug, f.error), color, w);
+        put(scr, row, 0, &format!("{}{:<32} {}", marker, f.slug, f.error), color, w);
         row += 1;
     }
 }
 
-fn render_stats(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u16) {
+fn render_stats(scr: &mut Screen, snap: &Snapshot, top: u16, avail: u16, w: u16) {
     let mut row = top;
-    put(out, row, 0, " Migration", Color::Green, w);
+    put(scr, row, 0, " Migration", Color::Green, w);
     row += 1;
     for (k, v) in &snap.migration {
-        put(out, row, 1, &format!("{:<22} {}", k, v), Color::Grey, w);
+        put(scr, row, 1, &format!("{:<22} {}", k, v), Color::Grey, w);
         row += 1;
     }
     row += 1;
     if !snap.tooling.is_empty() {
         let t: Vec<String> = snap.tooling.iter().map(|(k, v)| format!("{} → {}", k, v)).collect();
-        put(out, row, 1, &format!("compilers in use:  {}", t.join("   ")), Color::Cyan, w);
+        put(scr, row, 1, &format!("compilers in use:  {}", t.join("   ")), Color::Cyan, w);
         row += 1;
     }
     if !snap.builders.is_empty() {
         let b: Vec<String> = snap.builders.iter().map(|(k, v)| format!("{} → {}", k, v)).collect();
-        put(out, row, 1, &format!("builders in use:   {}", b.join("   ")), Color::Cyan, w);
+        put(scr, row, 1, &format!("builders in use:   {}", b.join("   ")), Color::Cyan, w);
         row += 1;
     }
     if !snap.op_stats.is_empty() {
         row += 1;
-        put(out, row, 0, " Per-operation timing (total · count · mean · max)", Color::Cyan, w);
+        put(scr, row, 0, " Per-operation timing (total · count · mean · max)", Color::Cyan, w);
         row += 1;
         let mut ops: Vec<_> = snap.op_stats.iter().collect();
         ops.sort_by(|a, b| b.1.total.partial_cmp(&a.1.total).unwrap_or(std::cmp::Ordering::Equal));
         for (op, s) in ops.iter().take(7) {
-            put(out, row, 1, &format!("{:<10} {:>8.1}s  n={:<5} mean {:.2}s  max {:.1}s",
+            put(scr, row, 1, &format!("{:<10} {:>8.1}s  n={:<5} mean {:.2}s  max {:.1}s",
                 op, s.total, s.count, s.mean, s.max), Color::Grey, w);
             row += 1;
         }
     }
     row += 1;
-    put(out, row, 0, &format!(" Failure causes ({})", snap.fail_categories.len()), Color::Red, w);
+    put(scr, row, 0, &format!(" Failure causes ({})", snap.fail_categories.len()), Color::Red, w);
     row += 1;
     for fc in snap.fail_categories.iter().take(avail.saturating_sub(row - top) as usize) {
-        put(out, row, 1, &format!("{:>4}  {:<28} {}", fc.count, fc.cat, fc.hint), Color::Grey, w);
+        put(scr, row, 1, &format!("{:>4}  {:<28} {}", fc.count, fc.cat, fc.hint), Color::Grey, w);
         row += 1;
     }
 }
 
-fn render_archive(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u16) {
+fn render_archive(scr: &mut Screen, snap: &Snapshot, top: u16, avail: u16, w: u16) {
     let a = &snap.archive;
     let unreachable = a.recent.iter().filter(|r| r.status == "failed").count();
-    put(out, top, 0, &format!(" {} repos mirrored on disk", a.total), Color::Cyan, w);
-    put(out, top + 1, 0, &format!("  {} cloning now   {} queued   {} unreachable",
+    put(scr, top, 0, &format!(" {} repos mirrored on disk", a.total), Color::Cyan, w);
+    put(scr, top + 1, 0, &format!("  {} cloning now   {} queued   {} unreachable",
         a.active.len(), a.pending_total, unreachable), Color::Grey, w);
     let mut row = top + 3;
 
@@ -532,20 +590,20 @@ fn render_archive(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u1
     // fit as many repo slugs on screen as possible. Each section is a labelled colour block.
     let colw: usize = 30;
     let cols = (w as usize / colw).max(1);
-    let grid = |out: &mut Stdout, row: &mut u16, items: &[String], color: Color, label: &str, maxrows: u16| {
+    let grid = |scr: &mut Screen, row: &mut u16, items: &[String], color: Color, label: &str, maxrows: u16| {
         if items.is_empty() || maxrows == 0 { return; }
-        put(out, *row, 0, label, color, w);
+        put(scr, *row, 0, label, color, w);
         *row += 1;
         let mut shown = 0;
         let cap = (maxrows as usize - 1).saturating_mul(cols);
         for chunk in items.iter().take(cap).collect::<Vec<_>>().chunks(cols) {
             let line: String = chunk.iter().map(|s| format!("{:<width$}", trunc(s, colw - 1), width = colw)).collect();
-            put(out, *row, 1, &line, color, w);
+            put(scr, *row, 1, &line, color, w);
             *row += 1;
             shown += chunk.len();
         }
         if items.len() > shown {
-            put(out, *row, 1, &format!("… +{} more", items.len() - shown), Color::DarkGrey, w);
+            put(scr, *row, 1, &format!("… +{} more", items.len() - shown), Color::DarkGrey, w);
             *row += 1;
         }
         *row += 1;
@@ -554,12 +612,12 @@ fn render_archive(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u1
     let recent_added: Vec<String> = a.recent.iter().filter(|r| r.status != "failed").map(|r| r.repo.clone()).collect();
     let unreach: Vec<String> = a.recent.iter().filter(|r| r.status == "failed")
         .map(|r| format!("{} ({})", r.repo, trunc(&r.reason, 16))).collect();
-    grid(out, &mut row, &a.active, Color::Yellow, " cloning now", budget / 4);
-    grid(out, &mut row, &recent_added, Color::Green, " recently archived (last 30 min)", budget / 3);
-    grid(out, &mut row, &a.pending, Color::Cyan, " queued next", budget / 3);
-    grid(out, &mut row, &unreach, Color::Red, " unreachable (git reason)", budget / 4);
+    grid(scr, &mut row, &a.active, Color::Yellow, " cloning now", budget / 4);
+    grid(scr, &mut row, &recent_added, Color::Green, " recently archived (last 30 min)", budget / 3);
+    grid(scr, &mut row, &a.pending, Color::Cyan, " queued next", budget / 3);
+    grid(scr, &mut row, &unreach, Color::Red, " unreachable (git reason)", budget / 4);
     if a.active.is_empty() && a.recent.is_empty() && a.pending.is_empty() {
-        put(out, row, 1, "(archive idle — nothing being mirrored)", Color::DarkGrey, w);
+        put(scr, row, 1, "(archive idle — nothing being mirrored)", Color::DarkGrey, w);
     }
 }
 
@@ -567,9 +625,9 @@ fn trunc(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { s.chars().take(n.saturating_sub(1)).collect::<String>() + "…" }
 }
 
-fn render_config(out: &mut Stdout, snap: &Snapshot, sel: usize, top: u16, w: u16) {
+fn render_config(scr: &mut Screen, snap: &Snapshot, sel: usize, top: u16, w: u16) {
     let mut row = top;
-    put(out, row, 0, " Configuration — ↑/↓ pick a field · ←/→ change it (applied live)", Color::Cyan, w);
+    put(scr, row, 0, " Configuration — ↑/↓ pick a field · ←/→ change it (applied live)", Color::Cyan, w);
     row += 2;
     let cf = &snap.config;
     let val = |k: &str| -> String {
@@ -590,34 +648,34 @@ fn render_config(out: &mut Stdout, snap: &Snapshot, sel: usize, top: u16, w: u16
         let marker = if active { "▸ " } else { "  " };
         let shown = if active { format!("‹ {} ›", v) } else { v };
         let color = if active { Color::Yellow } else { Color::Grey };
-        put(out, row, 0, &format!("{}{:<14} {}", marker, f, shown), color, w);
+        put(scr, row, 0, &format!("{}{:<14} {}", marker, f, shown), color, w);
         row += 1;
     }
     row += 1;
     // the rest of the config (read-only paths/source), for context
-    put(out, row, 0, " (paths — restart to change)", Color::DarkGrey, w);
+    put(scr, row, 0, " (paths — restart to change)", Color::DarkGrey, w);
     row += 1;
     for k in ["source", "build_dir", "archive", "manage_venvs"] {
         if cf.contains_key(k) {
-            put(out, row, 1, &format!("{:<14} {}", k, val(k)), Color::DarkGrey, w);
+            put(scr, row, 1, &format!("{:<14} {}", k, val(k)), Color::DarkGrey, w);
             row += 1;
         }
     }
     if !snap.dep_relaxations.is_empty() {
         row += 1;
-        put(out, row, 0, " Dependency relaxations / overrides", Color::Cyan, w);
+        put(scr, row, 0, " Dependency relaxations / overrides", Color::Cyan, w);
         row += 1;
         for l in snap.dep_relaxations.iter().take(4) {
-            put(out, row, 1, l, Color::Grey, w);
+            put(scr, row, 1, l, Color::Grey, w);
             row += 1;
         }
     }
     if !snap.control_log.is_empty() {
         row += 1;
-        put(out, row, 0, " Recent live changes", Color::Cyan, w);
+        put(scr, row, 0, " Recent live changes", Color::Cyan, w);
         row += 1;
         for l in snap.control_log.iter().rev().take(4) {
-            put(out, row, 1, l, Color::Grey, w);
+            put(scr, row, 1, l, Color::Grey, w);
             row += 1;
         }
     }
@@ -648,7 +706,7 @@ fn status_panel(snap: &Snapshot, ui: &Ui) -> String {
     }
 }
 
-fn render_detail(out: &mut Stdout, snap: &Snapshot, ui: &Ui, w: u16, h: u16) {
+fn render_detail(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16) {
     let lines: Vec<String> = match TABS[ui.tab] {
         "failures" => snap
             .failures_recent
@@ -681,13 +739,13 @@ fn render_detail(out: &mut Stdout, snap: &Snapshot, ui: &Ui, w: u16, h: u16) {
     let bw = w.saturating_sub(6);
     let top = (h - bh) / 2;
     for r in 0..bh {
-        put(out, top + r, 2, &" ".repeat(bw as usize), Color::Black, w);
+        put(scr, top + r, 2, &" ".repeat(bw as usize), Color::Black, w);
     }
-    put(out, top, 2, &format!("┌{}┐", "─".repeat(bw as usize - 2)), Color::Cyan, w);
+    put(scr, top, 2, &format!("┌{}┐", "─".repeat(bw as usize - 2)), Color::Cyan, w);
     for (i, l) in lines.iter().enumerate() {
-        put(out, top + 1 + i as u16, 4, l, Color::White, w);
+        put(scr, top + 1 + i as u16, 4, l, Color::White, w);
     }
-    put(out, top + bh - 1, 2, &format!("└{}┘  [Esc] close", "─".repeat(bw as usize - 2)), Color::Cyan, w);
+    put(scr, top + bh - 1, 2, &format!("└{}┘  [Esc] close", "─".repeat(bw as usize - 2)), Color::Cyan, w);
 }
 
 fn prov_str(cver: &str, backend: &str, bver: &str) -> String {
