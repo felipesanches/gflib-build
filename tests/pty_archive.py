@@ -7,7 +7,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = "/tmp/_pty_arch/build"
 os.makedirs(BUILD, exist_ok=True)
 status = {
-    "elapsed": 60.0, "disk_build_total": 1 << 30, "disk_free": 1 << 30, "jobs": 8, "paused": False,
+    "elapsed": 60.0, "disk_build_total": 1 << 30, "disk_archive_total": 2 << 30,
+    "disk_free": 1 << 30, "jobs": 8, "paused": False,
     "total": 30, "counts": {"built": 2, "failed": 1, "building": 1, "queued": 5, "skipped": 0},
     "backends": {"fontc": 0, "fontmake": 0}, "phase": "build", "phase_total": 0, "phase_done": 0,
     "phase_label": "", "phase_error": "", "building": [], "queued_list": [], "failures_recent": [],
@@ -93,6 +94,10 @@ os.waitpid(pid, 0)
 
 no_crash = "_curses.error" not in txt and "Traceback" not in txt
 print("no crash:", no_crash)
+# the header disk figure must include the archive, not just the build dir, with explicit wording
+hdr_disk = "disk used 3.0GiB (build 1.0GiB + archive 2.0GiB)" in txt
+print("header shows build + archive in the disk total:", hdr_disk)
+assert hdr_disk, ("header must sum build+archive disk usage", [l for l in txt.splitlines() if "disk used" in l][-3:])
 total = "1302 repos mirrored on disk" in txt                 # WHOLE archive, not session count
 counts = "2 cloning now" in txt and "220 queued" in txt and "1 unreachable" in txt
 cloning = "googlefonts/cloningnow" in txt

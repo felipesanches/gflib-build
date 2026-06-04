@@ -1208,6 +1208,7 @@ class Orchestrator:
                                        # is cumulative across reopen/resume, not reset to 0)
         self.disk_baseline = self._disk_used()
         self._build_total = 0                        # build-dir total bytes; refreshed off-thread
+        self._archive_bytes = 0                      # archive total bytes (off-thread; 0 if in build dir)
         self._cached_cohort_venvs: set = set()       # cohort keys with a venv on disk (off-thread)
         self._enqueued = 0                            # families queued this run; how many are retries
         self._enqueued_retries = 0
@@ -1591,15 +1592,15 @@ class Orchestrator:
         except OSError:
             return 0
 
-    def _measure_build_dir(self) -> int:
-        """Compute the total bytes the build system occupies on disk (the whole build dir: out/,
-        venvs/, work/, caches, logs). SLOW (a full tree walk) — must run only on the background
-        size thread, never on a render/snapshot path. `du`'s reported total is valid even when it
-        exits non-zero because a file vanished mid-walk (workers churn work/ during a build), so we
-        trust any numeric stdout and only fall back to os.walk when du gives nothing usable."""
+    def _measure_dir(self, path: Path) -> int:
+        """Total bytes a directory occupies on disk. SLOW (a full tree walk) — must run only on the
+        background size thread, never on a render/snapshot path. `du`'s reported total is valid even
+        when it exits non-zero because a file vanished mid-walk (workers churn work/ during a build),
+        so we trust any numeric stdout and only fall back to os.walk when du gives nothing usable."""
+        if not path or not Path(path).is_dir():
+            return 0
         try:                                          # `du` is fast (C); falls back to os.walk
-            p = subprocess.run(["du", "-sk", str(self.build_dir)],
-                               capture_output=True, text=True, timeout=60)
+            p = subprocess.run(["du", "-sk", str(path)], capture_output=True, text=True, timeout=120)
             tok = p.stdout.split()
             if tok and tok[0].isdigit():
                 return int(tok[0]) * 1024             # partial-but-fine even if returncode != 0
@@ -1607,7 +1608,7 @@ class Orchestrator:
             pass
         total = 0
         try:
-            for root, _dirs, files in os.walk(self.build_dir):
+            for root, _dirs, files in os.walk(path):
                 for f in files:
                     try:
                         total += os.path.getsize(os.path.join(root, f))
@@ -1617,6 +1618,20 @@ class Orchestrator:
             pass
         return total
 
+    def _measure_archive(self) -> int:
+        """Bytes the upstream-repo archive (the bare git mirrors) occupies on disk. The archive is its
+        OWN tree, usually OUTSIDE build_dir, so the headline disk figure must add it to the build-dir
+        total. Returns 0 when the archive lives *under* build_dir (it's already counted in the build
+        total — don't double-count) or doesn't exist yet."""
+        try:
+            ar = Path(self.archive).resolve()
+            bd = Path(self.build_dir).resolve()
+        except Exception:
+            return 0
+        if ar == bd or bd in ar.parents:             # archive nested under build/ -> already counted
+            return 0
+        return self._measure_dir(ar)
+
     def _size_writer(self):
         """Refresh self._build_total off the UI thread, so snapshot() (called every ~0.25 s on the
         curses render thread and every ~1 s on the status writer) only ever reads a plain int.
@@ -1624,7 +1639,11 @@ class Orchestrator:
         per-cohort filesystem I/O on the hot render path."""
         while not self.stop.is_set():
             try:
-                self._build_total = self._measure_build_dir()
+                self._build_total = self._measure_dir(self.build_dir)
+            except Exception:
+                pass
+            try:
+                self._archive_bytes = self._measure_archive()
             except Exception:
                 pass
             try:
@@ -1754,6 +1773,7 @@ class Orchestrator:
             "elapsed": self._resumed_elapsed + (time.time() - self.start_time),
             "disk_used_delta": disk_delta, "disk_free": disk_free,
             "disk_build_total": self._build_total,   # plain int, refreshed by _size_writer (off-thread)
+            "disk_archive_total": self._archive_bytes,   # the archive tree (0 if it lives under build/)
             "jobs": self.args.jobs, "paused": self.paused.is_set(),
             "total": len(rs), "counts": counts, "backends": backends,
             "building": building, "failures_recent": fails, "built_recent": built,
@@ -3267,8 +3287,11 @@ class CursesFrontend(Frontend):
                 put(1, 0, " configure your build below, then navigate to ▶ Start build", CYAN)
             else:
                 put(0, max(0, w - 24), f"elapsed {hms(snap['elapsed'])}", curses.A_BOLD)
-                put(1, 0, f" build dir {human(snap.get('disk_build_total', 0))}  "
-                          f"free {human(snap['disk_free'])}  jobs {snap['jobs']}  "
+                _bld = snap.get('disk_build_total', 0)
+                _arc = snap.get('disk_archive_total', 0)
+                _disk = (f"disk used {human(_bld + _arc)} (build {human(_bld)} + archive {human(_arc)})"
+                         if _arc else f"disk used {human(_bld)} (build dir)")
+                put(1, 0, f" {_disk}  free {human(snap['disk_free'])}  jobs {snap['jobs']}  "
                           f"cohorts {len(snap['cohorts'])}  fontc {bk['fontc']}/fontmake {bk['fontmake']}",
                     CYAN)
                 # phase banner + progress
@@ -3636,7 +3659,7 @@ function render(){
  document.getElementById('hdr').innerHTML=
   '<div class="t">Google Fonts library build'+(snap.paused?' <span class="y">[PAUSED]</span>':'')+
    '<span class="muted" style="float:right">elapsed '+hms(snap.elapsed)+'</span></div>'+
-  '<div class="muted">build dir '+human(snap.disk_build_total)+' · free '+human(snap.disk_free)+
+  '<div class="muted">'+((snap.disk_archive_total||0)?'disk used '+human((snap.disk_build_total||0)+(snap.disk_archive_total||0))+' (build '+human(snap.disk_build_total||0)+' + archive '+human(snap.disk_archive_total||0)+')':'disk used '+human(snap.disk_build_total||0)+' (build dir)')+' · free '+human(snap.disk_free)+
    ' · jobs <span class="stat">'+snap.jobs+'</span> · cohorts <span class="stat">'+(snap.cohorts||[]).length+'</span>'+
    ' · fontc '+(bk.fontc||0)+'/fontmake '+(bk.fontmake||0)+' · phase <span class="stat">'+E(snap.phase)+'</span>'+
    (snap.done?' <span class="g">— BUILD COMPLETE</span>':'')+'</div>'+
