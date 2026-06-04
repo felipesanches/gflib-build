@@ -69,6 +69,7 @@ pub struct Orchestrator {
     pub spawned: Mutex<usize>,
     pub venvs: Option<VenvManager>, // cohort venv manager (R2); None unless --manage-venvs
     pub build_rules: std::collections::HashMap<String, Vec<String>>, // per-family pre-build (R3)
+    pub all_families: Vec<Family>,  // full discovered list (R6: raising % enqueues more from here)
 }
 
 impl Orchestrator {
@@ -96,6 +97,7 @@ impl Orchestrator {
             },
         };
         fams.sort_by(|a, b| a.slug.cmp(&b.slug));
+        let all_families = fams.clone(); // full list kept so raising --percent live can enqueue more
 
         if let Some(w) = &want {
             fams.retain(|f| w.contains(&f.slug));
@@ -200,6 +202,7 @@ impl Orchestrator {
             spawned: Mutex::new(0),
             venvs,
             build_rules,
+            all_families,
         })
     }
 
@@ -611,8 +614,38 @@ impl Orchestrator {
                 log.push(format!("jobs → {}", j));
             }
             if let Some(p) = set.percent {
-                sh.percent = p.clamp(0.0, 100.0);
-                log.push(format!("percent → {:.0}", sh.percent));
+                let np = p.clamp(0.0, 100.0);
+                let old = sh.percent;
+                sh.percent = np;
+                // R6: raising the percent live enqueues the families newly included in the even
+                // sample (fetch + cohort + build them) — the running pool picks them up on notify.
+                let mut added = 0;
+                if self.cfg.only.trim().is_empty() && np > old {
+                    for f in discover::sample_evenly(self.all_families.clone(), np) {
+                        if !sh.results.contains_key(&f.slug) {
+                            sh.results.insert(
+                                f.slug.clone(),
+                                Res { slug: f.slug.clone(), status: "queued".into(),
+                                      queued_kind: "new".into(), ..Default::default() },
+                            );
+                            sh.families.insert(f.slug.clone(), f);
+                            // (slug pushed after the loop to satisfy the borrow checker)
+                            added += 1;
+                        }
+                    }
+                    // collect the freshly-queued slugs and push them onto the work queue
+                    let fresh: Vec<String> = sh
+                        .results
+                        .values()
+                        .filter(|r| r.status == "queued" && r.queued_kind == "new"
+                            && !sh.queue.contains(&r.slug))
+                        .map(|r| r.slug.clone())
+                        .collect();
+                    for s in fresh {
+                        sh.queue.push_back(s);
+                    }
+                }
+                log.push(format!("percent → {:.0} (+{} families)", np, added));
             }
             if let Some(pause) = set.paused {
                 sh.paused = pause;
