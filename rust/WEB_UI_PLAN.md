@@ -135,7 +135,10 @@ Charts that need *change over time*, not just the current snapshot.
 4. **W4 = Part D1 + C4/C6** ✅ **DONE (2026-06-05, commit af8366b).** Client-side timeseries
    (build-progress / disk / throughput line charts on overview), a filter box on the list tabs, and
    ⬇ JSON / ⬇ CSV export. Deep links (C5) already shipped in W1.
-5. **W5 = Part E** (polish) and, if wanted, **Part D2** (daemon history).
+5. **W5 = Part E** ✅ **DONE (2026-06-05, commit 231e8c1).** Multi-pane overview, pause-when-hidden
+   polling, completion notification, and a light/dark theme + auto-refresh-interval control. Web-only
+   (graphical/interactive). **The web UI plan (W1–W5) is complete.** Optional future work: Part D2
+   (daemon-side history surviving reloads) and C2 (live log streaming via SSE).
 
 **Out of scope by design:** the first-run **setup wizard** stays TUI/CLI-only (the web UI is a
 monitor + live editor, not a launcher); pixel-identical parity with the *old Python* web UI (we are
