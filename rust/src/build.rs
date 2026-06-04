@@ -53,6 +53,11 @@ pub struct Shared {
     pub disk_archive_nested: bool,
     pub disk_free: u64,
     pub archive_total: usize,
+    // archive pre-warmer (R3): proactively mirror the whole worklist's repos, concurrent with the
+    // build, so the archive reaches 100% regardless of build pace (matches Python's populate_archive)
+    pub archive_pending: VecDeque<String>,    // repo URLs queued to mirror (de-duped, mirror absent)
+    pub archive_active: Vec<String>,          // repo URLs cloning right now
+    pub archive_recent: Vec<ArchiveRecent>,   // recently mirrored / failed (newest last, capped)
     // cohort map (R1: preserved across resume/migration; populated by R2's VenvManager later)
     pub cohort_members: BTreeMap<String, Vec<String>>,
     pub cohort_reqs: BTreeMap<String, String>,
@@ -181,6 +186,9 @@ impl Orchestrator {
             disk_archive_nested: false,
             disk_free: 0,
             archive_total: 0,
+            archive_pending: VecDeque::new(),
+            archive_active: Vec::new(),
+            archive_recent: Vec::new(),
             cohort_members: state.cohort_members,
             cohort_reqs: state.cohort_reqs,
             cached_cohorts: HashSet::new(),
@@ -232,9 +240,94 @@ impl Orchestrator {
         }
         let jobs = self.shared.lock().unwrap().jobs;
         self.ensure_workers(jobs);
+        self.spawn_archive_prewarmer();
         self.spawn_status_writer();
         self.spawn_size_thread();
         self.spawn_control_watcher();
+    }
+
+    /// Proactively mirror EVERY worklist repo into the archive, concurrent with the build, so the
+    /// archive reaches 100% regardless of build pace (a port of Python's `populate_archive`
+    /// pre-warmer). Build workers and the pre-warmer share `clone_locks`, so no repo is cloned twice.
+    fn spawn_archive_prewarmer(self: &Arc<Self>) {
+        if !self.cfg.mirror_missing {
+            return; // only when allowed to add to the archive (append-only)
+        }
+        // de-duped, sorted set of worklist repo URLs whose mirror is not yet on disk
+        let mut seen = HashSet::new();
+        let mut urls: Vec<String> = Vec::new();
+        for f in &self.all_families {
+            if f.url.is_empty() || !seen.insert(f.url.clone()) {
+                continue;
+            }
+            if !mirror_path(&self.cfg.archive, &f.url).is_dir() {
+                urls.push(f.url.clone());
+            }
+        }
+        urls.sort();
+        if urls.is_empty() {
+            return; // the archive already covers the whole worklist
+        }
+        {
+            let mut sh = self.shared.lock().unwrap();
+            sh.archive_pending = urls.into_iter().collect();
+        }
+        // a modest pool so the pre-warmer's clones don't crowd out the build workers' clones
+        let n = self.cfg.jobs.clamp(1, 6);
+        for _ in 0..n {
+            let me = Arc::clone(self);
+            thread::spawn(move || me.prewarm_loop());
+        }
+    }
+
+    fn prewarm_loop(self: Arc<Self>) {
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let url = {
+                let mut sh = self.shared.lock().unwrap();
+                match sh.archive_pending.pop_front() {
+                    Some(u) => {
+                        sh.archive_active.push(u.clone());
+                        u
+                    }
+                    None => return, // queue drained — the archive is fully mirrored
+                }
+            };
+            let mirror = mirror_path(&self.cfg.archive, &url);
+            // share the per-repo clone lock with the build workers so a repo is never cloned twice
+            let res = if mirror.is_dir() {
+                Ok(())
+            } else {
+                let key = mirror.to_string_lossy().to_string();
+                let lock = {
+                    let mut m = self.clone_locks.lock().unwrap();
+                    m.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+                };
+                let _g = lock.lock().unwrap();
+                if mirror.is_dir() {
+                    Ok(())
+                } else {
+                    crate::mirror::clone_mirror(&url, &mirror, 1800, &self.stop, 3)
+                }
+            };
+            let ts = crate::util::now();
+            {
+                let mut sh = self.shared.lock().unwrap();
+                sh.archive_active.retain(|u| u != &url);
+                let (status, reason) = match &res {
+                    Ok(()) => ("added", String::new()),
+                    Err(e) => ("failed", e.clone()),
+                };
+                sh.archive_recent.push(ArchiveRecent { repo: repo_slug(&url), status: status.into(), ts, reason });
+                let len = sh.archive_recent.len();
+                if len > 200 {
+                    sh.archive_recent.drain(0..len - 200);
+                }
+            }
+            self.emit("archived", &url, serde_json::json!({"status": if res.is_ok() {"added"} else {"failed"}}));
+        }
     }
 
     fn ensure_workers(self: &Arc<Self>, n: usize) {
@@ -1128,7 +1221,10 @@ impl Orchestrator {
 
         let archive = ArchiveView {
             total: sh.archive_total,
-            ..Default::default()
+            active: sh.archive_active.iter().map(|u| repo_slug(u)).collect(),
+            pending: sh.archive_pending.iter().take(60).map(|u| repo_slug(u)).collect(),
+            pending_total: sh.archive_pending.len(),
+            recent: sh.archive_recent.iter().rev().take(40).cloned().collect(),
         };
 
         Snapshot {
@@ -1192,6 +1288,28 @@ impl Orchestrator {
 // ----------------------------------------------------------------- build subroutines
 
 /// Map a repo URL to its bare-mirror path under the archive (ported from Python `mirror_path`).
+/// A short "owner/repo" display slug for a git URL (for the archive view).
+pub fn repo_slug(repo_url: &str) -> String {
+    let mut u = repo_url.trim().trim_end_matches('/').to_string();
+    for p in ["https://", "http://"] {
+        if let Some(r) = u.strip_prefix(p) {
+            u = r.to_string();
+        }
+    }
+    if let Some(idx) = u.find("git@") {
+        u = u[idx + 4..].replacen(':', "/", 1);
+    }
+    if u.ends_with(".git") {
+        u.truncate(u.len() - 4);
+    }
+    let parts: Vec<&str> = u.split('/').collect();
+    if parts.len() >= 2 {
+        format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else {
+        u
+    }
+}
+
 pub fn mirror_path(archive: &Path, repo_url: &str) -> PathBuf {
     let mut u = repo_url.trim().trim_end_matches('/').to_string();
     if let Some(rest) = u.strip_prefix("https://") {
