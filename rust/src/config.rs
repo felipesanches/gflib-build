@@ -1,0 +1,282 @@
+//! Run configuration: parsed from the CLI (a hand-rolled parser mirroring the Python argparse — no
+//! external clap dependency) and persisted to `<data-dir>/gflib-build.config` as JSON so the next
+//! run pre-fills the same settings. CLI flags always override the persisted file.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Config {
+    pub source: String,        // metadata | archive
+    pub data_dir: PathBuf,
+    pub google_fonts: Option<PathBuf>,
+    pub archive: PathBuf,
+    pub archive_rev: String,
+    pub build_dir: PathBuf,
+    pub backend: String,       // auto | fontc | fontmake | both
+    pub fontc_bin: Option<String>,
+    pub builder3_bin: Option<String>,
+    pub build_python: String,
+    pub manage_venvs: bool,
+    pub jobs: usize,
+    pub timeout: Option<u64>,
+    pub percent: f64,
+    pub only: String,
+    pub retry_category: String,
+    pub compare: bool,
+    pub mirror_missing: bool,
+    pub populate_archive: bool,
+    pub retry_failed: bool,
+    pub rebuild: bool,
+    pub keep_work: bool,
+    pub keep_fonts: bool,
+    pub web_port: u16,
+    pub ui: String,            // auto | curses | plain | json | none | web
+    pub yes: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let data_dir = PathBuf::from("gflib-data");
+        Config {
+            source: "metadata".into(),
+            archive: data_dir.join("archive"),
+            build_dir: data_dir.join("build"),
+            google_fonts: None,
+            data_dir,
+            archive_rev: "HEAD".into(),
+            backend: "auto".into(),
+            fontc_bin: None,
+            builder3_bin: None,
+            build_python: "python3".into(),
+            manage_venvs: false,
+            jobs: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+            timeout: None,
+            percent: 100.0,
+            only: String::new(),
+            retry_category: String::new(),
+            compare: false,
+            mirror_missing: false,
+            populate_archive: false,
+            retry_failed: false,
+            rebuild: false,
+            keep_work: false,
+            keep_fonts: true,
+            web_port: 8765,
+            ui: "auto".into(),
+            yes: false,
+        }
+    }
+}
+
+/// What the program was asked to do (decided by CLI flags), distinct from the build settings.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Mode {
+    Build,
+    Attach,
+    Stop,
+    List,
+    Reset,
+    Help,
+}
+
+pub struct Parsed {
+    pub cfg: Config,
+    pub mode: Mode,
+}
+
+fn die(msg: &str) -> ! {
+    eprintln!("{}", msg);
+    std::process::exit(2);
+}
+
+/// Parse argv (already without the program name). Mirrors the Python flag surface; unknown flags
+/// are reported. `--data-dir` is consulted first so build/archive defaults derive from it.
+pub fn parse(args: &[String]) -> Parsed {
+    let mut cfg = Config::default();
+    // resolve --data-dir first so other path defaults follow it
+    let mut data_dir = PathBuf::from("gflib-data");
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--data-dir" {
+            if let Some(v) = args.get(i + 1) {
+                data_dir = PathBuf::from(v);
+            }
+        }
+        i += 1;
+    }
+    cfg.data_dir = data_dir.clone();
+    cfg.archive = data_dir.join("archive");
+    cfg.build_dir = data_dir.join("build");
+
+    // load persisted config (defaults), then let CLI override below
+    let cfg_path = data_dir.join("gflib-build.config");
+    if let Some(loaded) = load_config(&cfg_path) {
+        merge_persisted(&mut cfg, &loaded);
+    }
+
+    let mut mode = Mode::Build;
+    let mut explicit_build_dir: Option<PathBuf> = None;
+    let mut explicit_archive: Option<PathBuf> = None;
+
+    let next = |i: &mut usize, name: &str| -> String {
+        *i += 1;
+        match args.get(*i) {
+            Some(v) => v.clone(),
+            None => die(&format!("{} needs a value", name)),
+        }
+    };
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "--data-dir" => { let _ = next(&mut i, a); }
+            "--source" => cfg.source = next(&mut i, a),
+            "--google-fonts" => cfg.google_fonts = Some(PathBuf::from(next(&mut i, a))),
+            "--archive" => explicit_archive = Some(PathBuf::from(next(&mut i, a))),
+            "--archive-rev" => cfg.archive_rev = next(&mut i, a),
+            "--build-dir" => explicit_build_dir = Some(PathBuf::from(next(&mut i, a))),
+            "--backend" => cfg.backend = next(&mut i, a),
+            "--fontc-bin" => cfg.fontc_bin = Some(next(&mut i, a)),
+            "--builder3-bin" => cfg.builder3_bin = Some(next(&mut i, a)),
+            "--build-python" => cfg.build_python = next(&mut i, a),
+            "--manage-venvs" => cfg.manage_venvs = true,
+            "--no-manage-venvs" => cfg.manage_venvs = false,
+            "--jobs" => cfg.jobs = next(&mut i, a).parse().unwrap_or(cfg.jobs).max(1),
+            "--timeout" => cfg.timeout = next(&mut i, a).parse().ok(),
+            "--percent" => cfg.percent = next(&mut i, a).parse::<f64>().unwrap_or(100.0).clamp(0.0, 100.0),
+            "--only" => cfg.only = next(&mut i, a),
+            "--retry-category" => cfg.retry_category = next(&mut i, a),
+            "--compare" => cfg.compare = true,
+            "--no-compare" => cfg.compare = false,
+            "--mirror-missing" => cfg.mirror_missing = true,
+            "--populate-archive" => cfg.populate_archive = true,
+            "--no-populate-archive" => cfg.populate_archive = false,
+            "--retry-failed" => cfg.retry_failed = true,
+            "--rebuild" => cfg.rebuild = true,
+            "--keep-work" => cfg.keep_work = true,
+            "--keep-fonts" => cfg.keep_fonts = true,
+            "--discard-fonts" => cfg.keep_fonts = false,
+            "--web-port" => cfg.web_port = next(&mut i, a).parse().unwrap_or(8765),
+            "--ui" => cfg.ui = next(&mut i, a),
+            "--yes" | "-y" => cfg.yes = true,
+            "--list" => mode = Mode::List,
+            "--attach" => mode = Mode::Attach,
+            "--stop" => mode = Mode::Stop,
+            "--reset" => mode = Mode::Reset,
+            "--help" | "-h" => mode = Mode::Help,
+            other => die(&format!("unknown argument: {}", other)),
+        }
+        i += 1;
+    }
+
+    // resolve derived path defaults honoring explicit overrides
+    cfg.build_dir = explicit_build_dir.unwrap_or_else(|| cfg.data_dir.join("build"));
+    cfg.archive = explicit_archive.unwrap_or_else(|| cfg.data_dir.join("archive"));
+    if cfg.google_fonts.is_none() && cfg.source == "metadata" {
+        cfg.google_fonts = Some(cfg.data_dir.join("google-fonts"));
+    }
+    Parsed { cfg, mode }
+}
+
+fn merge_persisted(cfg: &mut Config, loaded: &BTreeMap<String, serde_json::Value>) {
+    use serde_json::Value;
+    let s = |v: &Value| v.as_str().map(|x| x.to_string());
+    for (k, v) in loaded {
+        match k.as_str() {
+            "source" => if let Some(x) = s(v) { cfg.source = x },
+            "backend" => if let Some(x) = s(v) { cfg.backend = x },
+            "fontc_bin" => cfg.fontc_bin = s(v),
+            "builder3_bin" => cfg.builder3_bin = s(v),
+            "build_python" => if let Some(x) = s(v) { cfg.build_python = x },
+            "jobs" => if let Some(x) = v.as_u64() { cfg.jobs = x as usize },
+            "percent" => if let Some(x) = v.as_f64() { cfg.percent = x },
+            "compare" => if let Some(x) = v.as_bool() { cfg.compare = x },
+            "manage_venvs" => if let Some(x) = v.as_bool() { cfg.manage_venvs = x },
+            "ui" => if let Some(x) = s(v) { cfg.ui = x },
+            "web_port" => if let Some(x) = v.as_u64() { cfg.web_port = x as u16 },
+            _ => {}
+        }
+    }
+}
+
+pub fn load_config(path: &std::path::Path) -> Option<BTreeMap<String, serde_json::Value>> {
+    let txt = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&txt).ok()
+}
+
+/// Persist the chosen settings (a curated subset) so the next run pre-fills them.
+pub fn save_config(cfg: &Config) {
+    let path = cfg.data_dir.join("gflib-build.config");
+    let mut m = BTreeMap::<String, serde_json::Value>::new();
+    use serde_json::json;
+    m.insert("source".into(), json!(cfg.source));
+    m.insert("backend".into(), json!(cfg.backend));
+    m.insert("fontc_bin".into(), json!(cfg.fontc_bin));
+    m.insert("builder3_bin".into(), json!(cfg.builder3_bin));
+    m.insert("build_python".into(), json!(cfg.build_python));
+    m.insert("jobs".into(), json!(cfg.jobs));
+    m.insert("percent".into(), json!(cfg.percent));
+    m.insert("compare".into(), json!(cfg.compare));
+    m.insert("manage_venvs".into(), json!(cfg.manage_venvs));
+    m.insert("ui".into(), json!(cfg.ui));
+    m.insert("web_port".into(), json!(cfg.web_port));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(txt) = serde_json::to_string_pretty(&m) {
+        let _ = std::fs::write(&path, txt);
+    }
+}
+
+/// A small config map for embedding in the snapshot (what the config tab/web show).
+pub fn config_map(cfg: &Config) -> BTreeMap<String, serde_json::Value> {
+    use serde_json::json;
+    let mut m = BTreeMap::new();
+    m.insert("jobs".into(), json!(cfg.jobs));
+    m.insert("percent".into(), json!(cfg.percent));
+    m.insert("backend".into(), json!(cfg.backend));
+    m.insert("source".into(), json!(cfg.source));
+    m.insert("build_dir".into(), json!(cfg.build_dir.to_string_lossy()));
+    m.insert("archive".into(), json!(cfg.archive.to_string_lossy()));
+    m.insert("compare".into(), json!(cfg.compare));
+    m.insert("manage_venvs".into(), json!(cfg.manage_venvs));
+    m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn parses_core_flags() {
+        let args: Vec<String> = ["--source","archive","--jobs","12","--percent","5","--backend","fontc","--only","a/b,c/d"]
+            .iter().map(|s| s.to_string()).collect();
+        let p = parse(&args);
+        assert_eq!(p.cfg.source, "archive");
+        assert_eq!(p.cfg.jobs, 12);
+        assert_eq!(p.cfg.percent, 5.0);
+        assert_eq!(p.cfg.backend, "fontc");
+        assert_eq!(p.cfg.only, "a/b,c/d");
+        assert_eq!(p.mode, Mode::Build);
+    }
+    #[test]
+    fn percent_clamps() {
+        let args: Vec<String> = ["--percent","250"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse(&args).cfg.percent, 100.0);
+    }
+    #[test]
+    fn lifecycle_modes() {
+        assert_eq!(parse(&["--list".into()]).mode, Mode::List);
+        assert_eq!(parse(&["--stop".into()]).mode, Mode::Stop);
+        assert_eq!(parse(&["--reset".into()]).mode, Mode::Reset);
+    }
+    #[test]
+    fn data_dir_drives_path_defaults() {
+        let args: Vec<String> = ["--data-dir","/tmp/xyz"].iter().map(|s| s.to_string()).collect();
+        let p = parse(&args);
+        assert_eq!(p.cfg.build_dir, std::path::PathBuf::from("/tmp/xyz/build"));
+        assert_eq!(p.cfg.archive, std::path::PathBuf::from("/tmp/xyz/archive"));
+    }
+}

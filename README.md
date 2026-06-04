@@ -9,6 +9,13 @@ environments.
 > pristine extraction, resumable state, dependency cohorts, and Rust-first/Python-
 > fallback backend selection are implemented. See [Roadmap](#roadmap).
 
+> 🦀 **Rust port (experimental).** A from-scratch Rust port lives in [`rust/`](rust/), kept side by
+> side with this Python tool for head-to-head comparison. It compiles, runs, and is **schema-
+> compatible** (same `status.json` / `control.json` / `state.json`), so either port's UI can monitor
+> the other port's build. v0.1 covers the core pipeline, both UIs, discovery, persistence, live
+> control, and M0 provenance; some features (cohort venvs, `both` comparison, archive populate,
+> daemonize) are simplified or pending. See [`rust/README.md`](rust/README.md) for full parity notes.
+
 **Documentation:** this README is the overview + spec + usage.
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) covers the internals (pipeline, backends,
 cohorts, concurrency, the `state.json`/`events.jsonl` schemas, archive-safety invariants);

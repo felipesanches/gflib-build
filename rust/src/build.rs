@@ -1,0 +1,1134 @@
+//! The build engine (a port of the Python `Orchestrator`): a worker pool that, for each family,
+//! streams its pristine source out of the bare mirror with `git archive` (read-only — archives are
+//! never touched), pre-cleans committed build outputs, resolves the gftools-builder config, runs the
+//! build (fontc-first, fontmake fallback, or builder3), collects the freshly-built fonts into the
+//! separate build dir, and records M0 provenance (compiler + orchestrator + versions) on success AND
+//! failure. State is persisted to status.json / state.json / failure-history.jsonl; a monitor drives
+//! live config via control.json. UI-agnostic: it just exposes `snapshot()`.
+
+use crate::config::{config_map, Config};
+use crate::model::*;
+use crate::provenance::{builder_version_str, compiler_version_str};
+use crate::util::{dir_size, free_bytes, now, slug_to_logname};
+use crate::{discover, persist};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::Duration;
+
+const OUTPUT_DIRS_TO_CLEAN: [&str; 11] = [
+    "fonts", "instance_ufos", "instance_ufo", "master_ufo", "master_ufos", "variable_ttf",
+    "variable", "build", "out", "output", "instances",
+];
+const CONFIG_CANDIDATES: [&str; 4] =
+    ["sources/config.yaml", "sources/config.yml", "config.yaml", "config.yml"];
+const EXTRACT_TIMEOUT: u64 = 3600;
+pub const MAX_JOBS: usize = 256;
+
+/// Mutable shared state, guarded by one mutex; `snapshot()` reads it, workers mutate it.
+pub struct Shared {
+    pub results: BTreeMap<String, Res>,
+    pub queue: VecDeque<String>,
+    pub families: BTreeMap<String, Family>,
+    pub phase: String,
+    pub phase_label: String,
+    pub paused: bool,
+    pub jobs: usize,
+    pub percent: f64,
+    pub backend: String,
+    pub cver_cache: HashMap<(String, String), String>,
+    pub bver_cache: HashMap<(String, String), String>,
+    pub failure_history: Vec<FailHist>,
+    pub control_log: Vec<String>,
+    pub library_total: usize,
+    #[allow(dead_code)] // library families outside the worklist (reported via --list / phase_total)
+    pub skipped_total: usize,
+    pub done: bool,
+    pub disk_build_total: u64,
+    pub disk_archive_total: u64,
+    pub disk_free: u64,
+    pub archive_total: usize,
+}
+
+pub struct Orchestrator {
+    pub cfg: Config,
+    pub shared: Arc<Mutex<Shared>>,
+    pub cond: Arc<Condvar>,
+    pub stop: Arc<AtomicBool>,
+    pub start_time: f64,
+    pub resumed_elapsed: f64,
+    pub active: AtomicUsize,
+    pub spawned: Mutex<usize>,
+}
+
+impl Orchestrator {
+    /// Build the worklist (metadata or archive), reconcile with prior state.json, enqueue, and
+    /// return the orchestrator ready to `start()`.
+    pub fn new(cfg: Config) -> Arc<Self> {
+        // --only restricts the whole run to an explicit subset (highest priority); pass it into
+        // archive discovery so we don't resolve all ~1300 mirrors just to build a handful.
+        let want: Option<HashSet<String>> = if cfg.only.trim().is_empty() {
+            None
+        } else {
+            Some(
+                cfg.only
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            )
+        };
+        let (mut fams, library_total, skipped) = match cfg.source.as_str() {
+            "archive" => discover::discover_archive(&cfg.archive, &cfg.archive_rev, cfg.jobs, want.as_ref()),
+            _ => match &cfg.google_fonts {
+                Some(gf) => discover::discover_metadata(gf),
+                None => (Vec::new(), 0, 0),
+            },
+        };
+        fams.sort_by(|a, b| a.slug.cmp(&b.slug));
+
+        if let Some(w) = &want {
+            fams.retain(|f| w.contains(&f.slug));
+        } else {
+            fams = discover::sample_evenly(fams, cfg.percent);
+        }
+
+        let prior = persist::read_state(&cfg.build_dir);
+        let mut results = BTreeMap::new();
+        let mut families = BTreeMap::new();
+        let mut queue = VecDeque::new();
+        for f in fams {
+            let slug = f.slug.clone();
+            families.insert(slug.clone(), f);
+            let prev = prior.get(&slug);
+            // resume: keep a prior success unless --rebuild; re-queue failures only on retry flags
+            let (status, kind) = match prev {
+                Some(p) if p.status == "built" && !cfg.rebuild => ("built", ""),
+                Some(p) if p.status == "failed" => {
+                    let retry = cfg.rebuild
+                        || cfg.retry_failed
+                        || (!cfg.retry_category.is_empty()
+                            && p.error.contains(&cfg.retry_category));
+                    if retry {
+                        ("queued", "retry")
+                    } else {
+                        ("failed", "")
+                    }
+                }
+                _ => ("queued", "new"),
+            };
+            let mut r = prev.cloned().unwrap_or_else(|| Res {
+                slug: slug.clone(),
+                ..Default::default()
+            });
+            r.slug = slug.clone();
+            r.status = status.into();
+            if status == "queued" {
+                r.queued_kind = if cfg.rebuild { "rebuild".into() } else { kind.into() };
+                queue.push_back(slug.clone());
+            }
+            results.insert(slug, r);
+        }
+
+        let failure_history = persist::read_failure_history(&cfg.build_dir);
+        let jobs = cfg.jobs.clamp(1, MAX_JOBS);
+        let shared = Shared {
+            results,
+            queue,
+            families,
+            phase: "build".into(),
+            phase_label: String::new(),
+            paused: false,
+            jobs,
+            percent: cfg.percent,
+            backend: cfg.backend.clone(),
+            cver_cache: HashMap::new(),
+            bver_cache: HashMap::new(),
+            failure_history,
+            control_log: Vec::new(),
+            library_total,
+            skipped_total: skipped,
+            done: false,
+            disk_build_total: 0,
+            disk_archive_total: 0,
+            disk_free: 0,
+            archive_total: 0,
+        };
+        Arc::new(Orchestrator {
+            cfg,
+            shared: Arc::new(Mutex::new(shared)),
+            cond: Arc::new(Condvar::new()),
+            stop: Arc::new(AtomicBool::new(false)),
+            start_time: now(),
+            resumed_elapsed: 0.0,
+            active: AtomicUsize::new(0),
+            spawned: Mutex::new(0),
+        })
+    }
+
+    /// Spawn the worker pool, the status writer, the disk-size thread, and the control watcher.
+    pub fn start(self: &Arc<Self>) {
+        let _ = std::fs::create_dir_all(&self.cfg.build_dir);
+        let _ = std::fs::create_dir_all(self.cfg.build_dir.join("logs"));
+        let jobs = self.shared.lock().unwrap().jobs;
+        self.ensure_workers(jobs);
+        self.spawn_status_writer();
+        self.spawn_size_thread();
+        self.spawn_control_watcher();
+    }
+
+    fn ensure_workers(self: &Arc<Self>, n: usize) {
+        let mut spawned = self.spawned.lock().unwrap();
+        while *spawned < n.min(MAX_JOBS) {
+            let id = *spawned;
+            *spawned += 1;
+            let me = Arc::clone(self);
+            thread::spawn(move || me.worker_loop(id));
+        }
+    }
+
+    fn worker_loop(self: Arc<Self>, id: usize) {
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let slug = {
+                let mut sh = self.shared.lock().unwrap();
+                loop {
+                    if self.stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let ready = id < sh.jobs && !sh.paused && !sh.queue.is_empty();
+                    if ready {
+                        break;
+                    }
+                    let (g, _) = self
+                        .cond
+                        .wait_timeout(sh, Duration::from_millis(500))
+                        .unwrap();
+                    sh = g;
+                }
+                let slug = sh.queue.pop_front().unwrap();
+                if let Some(r) = sh.results.get_mut(&slug) {
+                    r.status = "building".into();
+                    r.worker = id as i64;
+                    r.started = now();
+                    r.note = "checkout".into();
+                }
+                slug
+            };
+            self.active.fetch_add(1, Ordering::Relaxed);
+            self.build_one(&slug, id);
+            self.active.fetch_sub(1, Ordering::Relaxed);
+            self.save_state();
+            self.check_done();
+        }
+    }
+
+    fn set_result<F: FnOnce(&mut Res)>(&self, slug: &str, f: F) {
+        let mut sh = self.shared.lock().unwrap();
+        if let Some(r) = sh.results.get_mut(slug) {
+            f(r);
+        }
+    }
+
+    /// Cached exact compiler version (run once per backend/venv).
+    fn compiler_version(&self, backend: &str) -> String {
+        let key = (backend.to_string(), self.cfg.build_python.clone());
+        {
+            let sh = self.shared.lock().unwrap();
+            if let Some(v) = sh.cver_cache.get(&key) {
+                return v.clone();
+            }
+        }
+        let v = compiler_version_str(backend, &self.cfg.build_python, self.cfg.fontc_bin.as_deref());
+        let mut sh = self.shared.lock().unwrap();
+        sh.cver_cache.entry(key).or_insert_with(|| v.clone());
+        v
+    }
+
+    fn builder_name(&self) -> String {
+        if self.cfg.builder3_bin.is_some() {
+            "builder3".into()
+        } else {
+            "builder2".into()
+        }
+    }
+
+    /// Cached exact orchestrator version (run once per builder/venv).
+    fn builder_version(&self, builder: &str) -> String {
+        let key = (builder.to_string(), self.cfg.build_python.clone());
+        {
+            let sh = self.shared.lock().unwrap();
+            if let Some(v) = sh.bver_cache.get(&key) {
+                return v.clone();
+            }
+        }
+        let v = builder_version_str(builder, &self.cfg.build_python, self.cfg.builder3_bin.as_deref());
+        let mut sh = self.shared.lock().unwrap();
+        sh.bver_cache.entry(key).or_insert_with(|| v.clone());
+        v
+    }
+
+    fn backend_order(&self) -> Vec<String> {
+        match self.cfg.backend.as_str() {
+            "fontc" => vec!["fontc".into()],
+            "fontmake" => vec!["fontmake".into()],
+            "both" => vec!["fontc".into(), "fontmake".into()],
+            _ => {
+                // auto: fontc-first, fontmake fallback (only if a fontc binary is present)
+                if self.cfg.fontc_bin.is_some() {
+                    vec!["fontc".into(), "fontmake".into()]
+                } else {
+                    vec!["fontmake".into()]
+                }
+            }
+        }
+    }
+
+    /// Build one family end-to-end. Mirrors the Python `_build` flow (single-backend / auto path).
+    fn build_one(&self, slug: &str, _worker: usize) {
+        let fam = {
+            let sh = self.shared.lock().unwrap();
+            match sh.families.get(slug) {
+                Some(f) => f.clone(),
+                None => return,
+            }
+        };
+        let logname = slug_to_logname(slug);
+        let log_path = self.cfg.build_dir.join("logs").join(format!("{}.log", logname));
+        let work = self.cfg.build_dir.join("work").join(&logname);
+        let out_dir = self.cfg.build_dir.join("out").join(&logname);
+        self.set_result(slug, |r| r.log = log_path.to_string_lossy().to_string());
+
+        let mirror = mirror_path(&self.cfg.archive, &fam.url);
+        if !mirror.is_dir() {
+            self.fail(slug, "mirror-missing", &format!("no mirror in archive: {}", mirror.display()));
+            cleanup(&work, self.cfg.keep_work);
+            return;
+        }
+
+        let order = self.backend_order();
+        let builder = self.builder_name();
+        let bver = self.builder_version(&builder);
+        let mut last_err = String::new();
+        let mut fontc_err = String::new();
+        let mut built_any = false;
+
+        for (i, backend) in order.iter().enumerate() {
+            // fresh extraction for each backend attempt (a previous attempt may have dirtied work/)
+            self.set_result(slug, |r| r.note = "checkout".into());
+            if let Err(e) = extract_tree(&mirror, &fam.commit, &work, EXTRACT_TIMEOUT, &log_path) {
+                last_err = e;
+                continue;
+            }
+            preclean_outputs(&work);
+            let (cfg_path, label) = match resolve_config(self.cfg.google_fonts.as_deref(), &fam, &work) {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = e;
+                    break; // no config -> trying another backend won't help
+                }
+            };
+            let cver = self.compiler_version(backend);
+            self.set_result(slug, |r| {
+                r.backend = backend.clone();
+                r.compiler_version = cver.clone();
+                r.builder = builder.clone();
+                r.builder_version = bver.clone();
+                r.note = String::new();
+            });
+            log_line(&log_path, &format!(
+                "build[{}]: {} {} via {} · config={} — running {}…",
+                backend, backend, cver, bver, label, builder
+            ));
+            let t0 = now();
+            let run = run_builder(
+                &self.cfg.build_python,
+                &cfg_path,
+                &work,
+                &log_path,
+                self.cfg.timeout,
+                backend,
+                self.cfg.fontc_bin.as_deref(),
+                self.cfg.builder3_bin.as_deref(),
+            );
+            if let Err(e) = run {
+                last_err = format!("{}: {}", backend, e);
+                if backend == "fontc" {
+                    fontc_err = last_err.clone();
+                }
+                continue;
+            }
+            // collect only fonts written during THIS build (mtime gate), recursively
+            let (bytes, found, extras) = collect_outputs(&work, &out_dir, &fam.shipped_fonts, t0);
+            if !fam.shipped_fonts.is_empty() && found.is_empty() {
+                last_err = if extras.is_empty() {
+                    format!("{}: produced no expected font files", backend)
+                } else {
+                    format!("{}: output name mismatch — got {:?}", backend, &extras[..extras.len().min(3)])
+                };
+                if backend == "fontc" {
+                    fontc_err = last_err.clone();
+                }
+                continue;
+            }
+            // success
+            built_any = true;
+            let missing = fam
+                .shipped_fonts
+                .iter()
+                .filter(|f| !found.contains_key(*f))
+                .count();
+            let used = backend.clone();
+            self.set_result(slug, |r| {
+                r.status = "built".into();
+                r.ended = now();
+                r.out_bytes = bytes;
+                r.out_missing = missing;
+                r.backend = used.clone();
+                r.note = String::new();
+            });
+            log_line(&log_path, &format!(
+                "DONE: backend={} bytes={} missing={}", backend, bytes, missing
+            ));
+            if !self.cfg.keep_fonts {
+                let _ = std::fs::remove_dir_all(&out_dir);
+            }
+            let _ = i;
+            break;
+        }
+
+        if !built_any {
+            let err = if last_err.is_empty() { "build failed".into() } else { last_err };
+            // remember fontc gap even when fontmake later succeeds (it didn't here)
+            self.fail(slug, &classify(&err), &err);
+            let _ = fontc_err;
+        }
+        cleanup(&work, self.cfg.keep_work);
+    }
+
+    fn fail(&self, slug: &str, cause: &str, msg: &str) {
+        // build the durable record WITH M0 provenance (the same data goes to the in-memory history
+        // and the append-only failure-history.jsonl, so a restart never loses how a family broke).
+        let entry;
+        {
+            let mut sh = self.shared.lock().unwrap();
+            let (backend, cver, builder, bver) = match sh.results.get_mut(slug) {
+                Some(r) => {
+                    r.status = "failed".into();
+                    r.error = msg.chars().take(400).collect();
+                    r.ended = now();
+                    r.note = String::new();
+                    (
+                        r.backend.clone(),
+                        r.compiler_version.clone(),
+                        r.builder.clone(),
+                        r.builder_version.clone(),
+                    )
+                }
+                None => return,
+            };
+            entry = FailHist {
+                ts: now(),
+                slug: slug.to_string(),
+                cause: cause.to_string(),
+                error: msg.chars().take(400).collect(),
+                backend,
+                compiler_version: cver,
+                builder,
+                builder_version: bver,
+            };
+            sh.failure_history.push(entry.clone());
+            let n = sh.failure_history.len();
+            if n > 5000 {
+                sh.failure_history.drain(0..n - 5000);
+            }
+        }
+        // append to durable jsonl outside the lock
+        persist::append_failure(&self.cfg.build_dir, &entry);
+        // archive the failing log so a later success can't erase how it broke
+        let logname = slug_to_logname(slug);
+        let src = self.cfg.build_dir.join("logs").join(format!("{}.log", logname));
+        let fdir = self.cfg.build_dir.join("logs").join("failed");
+        let _ = std::fs::create_dir_all(&fdir);
+        let _ = std::fs::copy(&src, fdir.join(format!("{}.log", logname)));
+    }
+
+    fn check_done(&self) {
+        let mut sh = self.shared.lock().unwrap();
+        let pending = sh
+            .results
+            .values()
+            .filter(|r| r.status == "queued" || r.status == "building")
+            .count();
+        let working = self.active.load(Ordering::Relaxed);
+        sh.done = pending == 0 && working == 0 && sh.queue.is_empty();
+    }
+
+    fn save_state(&self) {
+        let results = {
+            let sh = self.shared.lock().unwrap();
+            sh.results.clone()
+        };
+        persist::write_state(&self.cfg.build_dir, &results);
+    }
+
+    // ---- live config: a monitor writes control.json; we apply it on the fly ----
+    fn spawn_control_watcher(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        thread::spawn(move || {
+            let mut last = 0u64;
+            while !me.stop.load(Ordering::Relaxed) {
+                if let Some(ctl) = persist::read_control(&me.cfg.build_dir) {
+                    if ctl.seq != last {
+                        last = ctl.seq;
+                        me.apply_live(&ctl.set);
+                    }
+                }
+                thread::sleep(Duration::from_millis(700));
+            }
+        });
+    }
+
+    /// Apply an untrusted control message (clamped) to the running build.
+    pub fn apply_live(self: &Arc<Self>, set: &ControlSet) {
+        let mut log = Vec::new();
+        let mut new_jobs = None;
+        {
+            let mut sh = self.shared.lock().unwrap();
+            if let Some(j) = set.jobs {
+                let j = j.clamp(1, MAX_JOBS);
+                sh.jobs = j;
+                new_jobs = Some(j);
+                log.push(format!("jobs → {}", j));
+            }
+            if let Some(p) = set.percent {
+                sh.percent = p.clamp(0.0, 100.0);
+                log.push(format!("percent → {:.0}", sh.percent));
+            }
+            if let Some(pause) = set.paused {
+                sh.paused = pause;
+                log.push(if pause { "paused".into() } else { "resumed".into() });
+            }
+            if let Some(b) = &set.backend {
+                sh.backend = b.clone();
+                log.push(format!("backend → {}", b));
+            }
+            if let Some(retry) = &set.retry {
+                for slug in retry {
+                    if let Some(r) = sh.results.get_mut(slug) {
+                        r.status = "queued".into();
+                        r.queued_kind = "retry".into();
+                        r.error.clear();
+                        sh.queue.push_front(slug.clone());
+                        log.push(format!("retry {}", slug));
+                    }
+                }
+            }
+            if set.retry_all == Some(true) {
+                let failed: Vec<String> = sh
+                    .results
+                    .values()
+                    .filter(|r| r.status == "failed")
+                    .map(|r| r.slug.clone())
+                    .collect();
+                for slug in failed {
+                    if let Some(r) = sh.results.get_mut(&slug) {
+                        r.status = "queued".into();
+                        r.queued_kind = "retry".into();
+                        r.error.clear();
+                        sh.queue.push_back(slug);
+                    }
+                }
+                log.push("retry ALL failed".into());
+            }
+            for l in &log {
+                sh.control_log.push(l.clone());
+            }
+            let n = sh.control_log.len();
+            if n > 200 {
+                sh.control_log.drain(0..n - 200);
+            }
+        }
+        if let Some(j) = new_jobs {
+            self.ensure_workers(j);
+        }
+        self.cond.notify_all();
+    }
+
+    fn spawn_status_writer(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        thread::spawn(move || {
+            while !me.stop.load(Ordering::Relaxed) {
+                let snap = me.snapshot();
+                persist::write_status(&me.cfg.build_dir, &snap);
+                thread::sleep(Duration::from_millis(1000));
+            }
+            // one last write so a monitor sees the final state
+            let snap = me.snapshot();
+            persist::write_status(&me.cfg.build_dir, &snap);
+        });
+    }
+
+    fn spawn_size_thread(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        thread::spawn(move || {
+            while !me.stop.load(Ordering::Relaxed) {
+                let build_total = dir_size(&me.cfg.build_dir);
+                let archive_total = measure_archive(&me.cfg.build_dir, &me.cfg.archive);
+                let free = free_bytes(&me.cfg.build_dir);
+                let arc_count = count_archive(&me.cfg.archive);
+                {
+                    let mut sh = me.shared.lock().unwrap();
+                    sh.disk_build_total = build_total;
+                    sh.disk_archive_total = archive_total;
+                    sh.disk_free = free;
+                    sh.archive_total = arc_count;
+                }
+                for _ in 0..10 {
+                    if me.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1000));
+                }
+            }
+        });
+    }
+
+    pub fn elapsed(&self) -> f64 {
+        self.resumed_elapsed + (now() - self.start_time)
+    }
+
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.cond.notify_all();
+    }
+
+    /// Build the live snapshot rendered by every frontend and written to status.json.
+    pub fn snapshot(&self) -> Snapshot {
+        let sh = self.shared.lock().unwrap();
+        let mut counts = Counts::default();
+        let mut backends = Backends::default();
+        let mut migration: BTreeMap<String, usize> = BTreeMap::new();
+        let mut building = Vec::new();
+        let mut queued_list = Vec::new();
+        let mut fails = Vec::new();
+        let mut built = Vec::new();
+        let mut fail_cat: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
+
+        for r in sh.results.values() {
+            match r.status.as_str() {
+                "built" => counts.built += 1,
+                "failed" => counts.failed += 1,
+                "building" => counts.building += 1,
+                "queued" => counts.queued += 1,
+                "skipped" => counts.skipped += 1,
+                _ => {}
+            }
+            if r.status == "built" {
+                match r.backend.as_str() {
+                    "fontc" => {
+                        backends.fontc += 1;
+                        *migration.entry("fontc".into()).or_default() += 1;
+                    }
+                    "fontmake" => {
+                        backends.fontmake += 1;
+                        *migration.entry("fontmake_fallback".into()).or_default() += 1;
+                    }
+                    _ => {}
+                }
+                built.push(BuiltItem {
+                    slug: r.slug.clone(),
+                    backend: r.backend.clone(),
+                    bytes: r.out_bytes,
+                    compare: r.compare.clone(),
+                    log: r.log.clone(),
+                    ended: r.ended,
+                    compiler_version: r.compiler_version.clone(),
+                    builder: r.builder.clone(),
+                    builder_version: r.builder_version.clone(),
+                });
+            }
+            if r.status == "building" {
+                building.push(BuildingItem {
+                    slug: r.slug.clone(),
+                    worker: r.worker,
+                    dur: now() - r.started,
+                    backend: r.backend.clone(),
+                    note: r.note.clone(),
+                });
+            }
+            if r.status == "queued" {
+                queued_list.push(QueuedItem {
+                    slug: r.slug.clone(),
+                    kind: if r.queued_kind.is_empty() { "new".into() } else { r.queued_kind.clone() },
+                });
+            }
+            if r.status == "failed" {
+                fails.push(FailItem {
+                    slug: r.slug.clone(),
+                    error: r.error.chars().take(300).collect(),
+                    log: r.log.clone(),
+                    ended: r.ended,
+                    backend: r.backend.clone(),
+                    compiler_version: r.compiler_version.clone(),
+                    builder: r.builder.clone(),
+                    builder_version: r.builder_version.clone(),
+                });
+                let e = &r.error;
+                let cause = classify(e);
+                let ent = fail_cat.entry(cause).or_insert((0, Vec::new()));
+                ent.0 += 1;
+                if ent.1.len() < 40 {
+                    ent.1.push(r.slug.clone());
+                }
+            }
+        }
+        building.sort_by(|a, b| a.slug.cmp(&b.slug));
+        fails.sort_by(|a, b| b.ended.partial_cmp(&a.ended).unwrap_or(std::cmp::Ordering::Equal));
+        built.sort_by(|a, b| b.ended.partial_cmp(&a.ended).unwrap_or(std::cmp::Ordering::Equal));
+        fails.truncate(400);
+        built.truncate(200);
+
+        let fail_categories = {
+            let mut v: Vec<FailCategory> = fail_cat
+                .into_iter()
+                .map(|(cat, (count, families))| FailCategory {
+                    hint: hint_for(&cat),
+                    cat,
+                    count,
+                    families,
+                })
+                .collect();
+            v.sort_by(|a, b| b.count.cmp(&a.count));
+            v
+        };
+
+        let tooling: BTreeMap<String, String> = sh
+            .cver_cache
+            .iter()
+            .filter(|((b, _), _)| b == "fontc" || b == "fontmake")
+            .map(|((b, _), v)| (b.clone(), v.clone()))
+            .collect();
+        let builders: BTreeMap<String, String> =
+            sh.bver_cache.iter().map(|((b, _), v)| (b.clone(), v.clone())).collect();
+
+        let mut fail_hist: Vec<FailHist> = sh.failure_history.iter().rev().take(400).cloned().collect();
+        fail_hist.reverse();
+
+        let archive = ArchiveView {
+            total: sh.archive_total,
+            ..Default::default()
+        };
+
+        Snapshot {
+            elapsed: self.elapsed(),
+            disk_used_delta: 0,
+            disk_free: sh.disk_free,
+            disk_build_total: sh.disk_build_total,
+            disk_archive_total: sh.disk_archive_total,
+            jobs: sh.jobs,
+            paused: sh.paused,
+            total: sh.results.len(),
+            counts,
+            backends,
+            building,
+            failures_recent: fails,
+            built_recent: built,
+            queued_list,
+            fail_categories,
+            cohorts: Vec::new(),
+            cohorts_ready: 0,
+            phase: sh.phase.clone(),
+            phase_total: sh.library_total,
+            phase_done: 0,
+            phase_label: sh.phase_label.clone(),
+            phase_error: String::new(),
+            failure_history: fail_hist,
+            tooling,
+            builders,
+            migration,
+            tasks: Vec::new(),
+            archive_recent: Vec::new(),
+            archive,
+            config: config_map(&self.cfg),
+            control_log: sh.control_log.clone(),
+            config_path: self.cfg.data_dir.join("gflib-build.config").to_string_lossy().to_string(),
+            done: sh.done,
+            daemon_alive: true,
+        }
+    }
+}
+
+// ----------------------------------------------------------------- build subroutines
+
+/// Map a repo URL to its bare-mirror path under the archive (ported from Python `mirror_path`).
+pub fn mirror_path(archive: &Path, repo_url: &str) -> PathBuf {
+    let mut u = repo_url.trim().trim_end_matches('/').to_string();
+    if let Some(rest) = u.strip_prefix("https://") {
+        u = rest.to_string();
+    } else if let Some(rest) = u.strip_prefix("http://") {
+        u = rest.to_string();
+    }
+    if let Some(idx) = u.find("git@") {
+        // git@host:owner/repo -> host/owner/repo
+        let tail = &u[idx + 4..];
+        u = tail.replacen(':', "/", 1);
+    }
+    if u.ends_with(".git") {
+        u.truncate(u.len() - 4);
+    }
+    let parts: Vec<&str> = u.split('/').collect();
+    if parts.len() >= 2 {
+        archive
+            .join(parts[parts.len() - 2])
+            .join(format!("{}.git", parts[parts.len() - 1]))
+    } else {
+        archive.join(format!("{}.git", u))
+    }
+}
+
+fn log_line(log_path: &Path, msg: &str) {
+    if let Some(p) = log_path.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
+/// Stream the pristine tree at `commit` out of the bare mirror with `git archive | tar -x` — a
+/// read-only op that never touches the mirror. Returns Err(msg) on failure.
+fn extract_tree(mirror: &Path, commit: &str, dest: &Path, _timeout: u64, log_path: &Path) -> Result<(), String> {
+    let _ = std::fs::remove_dir_all(dest);
+    std::fs::create_dir_all(dest).map_err(|e| format!("mkdir work: {}", e))?;
+    log_line(log_path, &format!("extract: git archive {} → {}", commit, dest.display()));
+    // git archive --format=tar <commit> | tar -x -C dest
+    use std::process::{Command, Stdio};
+    let mut git = Command::new("git")
+        .args(["--git-dir", &mirror.to_string_lossy(), "archive", "--format=tar", commit])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn git archive: {}", e))?;
+    let stdout = git.stdout.take().ok_or("no git stdout")?;
+    let tar = Command::new("tar")
+        .args(["-x", "-C", &dest.to_string_lossy()])
+        .stdin(Stdio::from(stdout))
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn tar: {}", e))?;
+    let tar_out = tar.wait_with_output().map_err(|e| format!("tar wait: {}", e))?;
+    let git_out = git.wait_with_output().map_err(|e| format!("git wait: {}", e))?;
+    if !git_out.status.success() {
+        return Err(format!(
+            "git archive failed: {}",
+            String::from_utf8_lossy(&git_out.stderr).trim().chars().take(200).collect::<String>()
+        ));
+    }
+    if !tar_out.status.success() {
+        return Err(format!(
+            "tar extract failed: {}",
+            String::from_utf8_lossy(&tar_out.stderr).trim().chars().take(200).collect::<String>()
+        ));
+    }
+    Ok(())
+}
+
+/// Remove committed build outputs so the build regenerates everything from sources.
+fn preclean_outputs(work: &Path) {
+    for d in OUTPUT_DIRS_TO_CLEAN {
+        let p = work.join(d);
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(work) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("build") && name.ends_with(".ninja") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
+/// Resolve the gftools-builder config: a google/fonts override, else the in-repo config_yaml, else
+/// an auto-discovered candidate. Returns (config_path, label).
+fn resolve_config(google_fonts: Option<&Path>, fam: &Family, work: &Path) -> Result<(PathBuf, String), String> {
+    if let Some(gf) = google_fonts {
+        let override_cfg = gf.join(&fam.slug).join("config.yaml");
+        if override_cfg.is_file() {
+            let dest = work.join("__gflib_override_config.yaml");
+            std::fs::copy(&override_cfg, &dest).map_err(|e| format!("stage override config: {}", e))?;
+            return Ok((dest, format!("override:{}/config.yaml", fam.slug)));
+        }
+    }
+    if !fam.config_yaml.is_empty() {
+        let p = work.join(&fam.config_yaml);
+        if p.is_file() {
+            return Ok((p, fam.config_yaml.clone()));
+        }
+    }
+    for cand in CONFIG_CANDIDATES {
+        let p = work.join(cand);
+        if p.is_file() {
+            return Ok((p, cand.to_string()));
+        }
+    }
+    Err("no config.yaml found (no override, no in-repo config)".into())
+}
+
+/// Run the build orchestrator. builder3_bin set -> invoke the Rust-native builder3 binary directly
+/// (no Python); else `python -m gftools.builder <config>` (with --experimental-fontc for fontc).
+fn run_builder(
+    python: &str,
+    config_path: &Path,
+    work: &Path,
+    log_path: &Path,
+    timeout: Option<u64>,
+    backend: &str,
+    fontc_bin: Option<&str>,
+    builder3_bin: Option<&str>,
+) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let logf = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|e| format!("open log: {}", e))?;
+    let logf2 = logf.try_clone().map_err(|e| format!("clone log fd: {}", e))?;
+
+    let mut cmd;
+    let orch;
+    if let Some(b3) = builder3_bin {
+        cmd = Command::new(b3);
+        cmd.arg(config_path);
+        orch = "gftools-builder3";
+    } else {
+        cmd = Command::new(python);
+        cmd.args(["-m", "gftools.builder"]).arg(config_path);
+        if backend == "fontc" {
+            if let Some(fc) = fontc_bin {
+                cmd.args(["--experimental-fontc", fc]);
+            }
+        }
+        orch = "gftools.builder";
+    }
+    log_line(log_path, &format!("===== {} (backend={}) =====", orch, backend));
+    cmd.current_dir(work)
+        .env("SOURCE_DATE_EPOCH", "0")
+        .stdout(Stdio::from(logf))
+        .stderr(Stdio::from(logf2));
+
+    let mut child = cmd.spawn().map_err(|e| format!("could not launch builder: {}", e))?;
+    // simple timeout: poll
+    if let Some(t) = timeout {
+        let deadline = std::time::Instant::now() + Duration::from_secs(t);
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    return if st.success() { Ok(()) } else { Err(last_error_line(log_path)) };
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        return Err(format!("timed out after {}s", t));
+                    }
+                    thread::sleep(Duration::from_millis(300));
+                }
+                Err(e) => return Err(format!("wait: {}", e)),
+            }
+        }
+    } else {
+        let st = child.wait().map_err(|e| format!("wait: {}", e))?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err(last_error_line(log_path))
+        }
+    }
+}
+
+fn last_error_line(log_path: &Path) -> String {
+    let txt = std::fs::read_to_string(log_path).unwrap_or_default();
+    for ln in txt.lines().rev() {
+        let s = ln.trim();
+        if !s.is_empty()
+            && ["Error", "error", "Exception", "Traceback", "FAILED", "assert"]
+                .iter()
+                .any(|k| s.contains(k))
+        {
+            return s.chars().take(200).collect();
+        }
+    }
+    txt.lines()
+        .last()
+        .map(|l| l.trim().chars().take(200).collect())
+        .unwrap_or_else(|| "exit non-zero".into())
+}
+
+/// Copy freshly-built fonts (mtime >= cutoff) whose name matches a shipped binary into out_dir.
+/// Returns (total_bytes, {name: path}, extras). Recursive — the config may write to any outputDir.
+fn collect_outputs(
+    work: &Path,
+    out_dir: &Path,
+    shipped: &[String],
+    since: f64,
+) -> (u64, BTreeMap<String, PathBuf>, Vec<String>) {
+    let _ = std::fs::create_dir_all(out_dir);
+    let want: HashSet<&str> = shipped.iter().map(|s| s.as_str()).collect();
+    let cutoff = if since > 0.0 { since - 30.0 } else { 0.0 };
+    let mut found = BTreeMap::new();
+    let mut extras = Vec::new();
+    let mut seen = HashSet::new();
+    let mut total = 0u64;
+
+    let mut stack = vec![work.to_path_buf()];
+    let mut fonts = Vec::new();
+    while let Some(p) = stack.pop() {
+        if let Ok(rd) = std::fs::read_dir(&p) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Some(ext) = path.extension() {
+                    let ext = ext.to_string_lossy().to_lowercase();
+                    if ext == "ttf" || ext == "otf" {
+                        fonts.push(path);
+                    }
+                }
+            }
+        }
+    }
+    fonts.sort();
+    for f in fonts {
+        let md = match std::fs::metadata(&f) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if cutoff > 0.0 {
+            let mt = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            if mt < cutoff {
+                continue; // a committed/extracted binary, not a fresh build
+            }
+        }
+        let name = f.file_name().unwrap().to_string_lossy().to_string();
+        if !want.is_empty() && !want.contains(name.as_str()) {
+            if seen.insert(name.clone()) {
+                extras.push(name);
+            }
+            continue;
+        }
+        if found.contains_key(&name) {
+            continue;
+        }
+        let dst = out_dir.join(&name);
+        if std::fs::copy(&f, &dst).is_ok() {
+            total += std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+            found.insert(name, dst);
+        }
+    }
+    (total, found, extras)
+}
+
+fn cleanup(work: &Path, keep: bool) {
+    if !keep {
+        let _ = std::fs::remove_dir_all(work);
+    }
+}
+
+/// Count repos in the whole archive on disk ({owner}/{repo}.git).
+fn count_archive(archive: &Path) -> usize {
+    let mut n = 0;
+    if let Ok(owners) = std::fs::read_dir(archive) {
+        for owner in owners.flatten() {
+            if owner.path().is_dir() {
+                if let Ok(repos) = std::fs::read_dir(owner.path()) {
+                    for r in repos.flatten() {
+                        if r.path().extension().map(|e| e == "git").unwrap_or(false) {
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Archive bytes, 0 if the archive lives under build_dir (already counted — no double-count).
+fn measure_archive(build_dir: &Path, archive: &Path) -> u64 {
+    let bd = build_dir.canonicalize().unwrap_or_else(|_| build_dir.to_path_buf());
+    let ar = match archive.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    if ar == bd || ar.starts_with(&bd) {
+        return 0;
+    }
+    dir_size(&ar)
+}
+
+/// Classify a failure into a coarse cause bucket (for the failures summary).
+fn classify(err: &str) -> String {
+    let low = err.to_lowercase();
+    if low.contains("no module named gftools") || low.contains("modulenotfound") {
+        "broken venv / missing module".into()
+    } else if low.contains("no config.yaml") {
+        "no build config".into()
+    } else if low.contains("mirror") && low.contains("missing") {
+        "mirror missing".into()
+    } else if low.contains("produced no expected") {
+        "no output produced".into()
+    } else if low.contains("output name mismatch") {
+        "output name mismatch".into()
+    } else if low.contains("timed out") {
+        "timed out".into()
+    } else if low.contains("git archive") || low.contains("tar extract") {
+        "source extraction failed".into()
+    } else {
+        "build error".into()
+    }
+}
+
+fn hint_for(cat: &str) -> String {
+    match cat {
+        "broken venv / missing module" => "rebuild the cohort venv (retry)".into(),
+        "no build config" => "needs a config.yaml override".into(),
+        "mirror missing" => "mirror the upstream repo (--mirror-missing)".into(),
+        "no output produced" => "check the build log for the real error".into(),
+        "output name mismatch" => "config writes differently-named fonts".into(),
+        "timed out" => "raise --timeout or investigate a hang".into(),
+        "source extraction failed" => "git remote update the stale mirror".into(),
+        _ => "open the log for details".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn mirror_path_maps_urls() {
+        let ar = Path::new("/arch");
+        assert_eq!(mirror_path(ar, "https://github.com/googlefonts/foo"), Path::new("/arch/googlefonts/foo.git"));
+        assert_eq!(mirror_path(ar, "https://github.com/googlefonts/foo.git"), Path::new("/arch/googlefonts/foo.git"));
+        assert_eq!(mirror_path(ar, "git@github.com:owner/bar.git"), Path::new("/arch/owner/bar.git"));
+    }
+    #[test]
+    fn classify_buckets() {
+        assert_eq!(classify("ModuleNotFoundError: No module named 'gftools'"), "broken venv / missing module");
+        assert_eq!(classify("no config.yaml found"), "no build config");
+        assert_eq!(classify("fontc: produced no expected font files"), "no output produced");
+        assert_eq!(classify("kaboom"), "build error");
+    }
+}
