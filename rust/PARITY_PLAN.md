@@ -5,6 +5,13 @@
 > recommendation toward (B)/(C) is therefore overridden; R2 is in scope in full. Execution order is
 > unchanged: harness → R1 → R2 → … (R1 first because it closes the persistence gap at low risk).
 
+> **✅ FEATURE-COMPLETE + REAL-BUILD VALIDATED (2026-06-04).** R1–R6 done. End-to-end validation:
+> the Rust port built `ofl/brawler` + `ofl/coustard` from scratch — created the cohort venv (compreffor
+> 0.6.0 cp313 wheel via PIN_OVERRIDE), reused it across families, ran gftools.builder + fontmake, and
+> produced 4 valid TTFs. **`Brawler-Regular.ttf` is byte-identical (sha256) to the Python daemon's
+> output.** The validation also caught + fixed a real PATH bug (venv bin/ wasn't on PATH). Remaining:
+> archive pre-warmer + table-tag compare diff (both optional/minor).
+
 Goal: make `rust/` a **drop-in replacement** for `gflib_build.py` (4674 lines). This plan inventories
 every gap, grounds the effort in the actual Python subsystems, sequences the work into milestones,
 and — importantly — surfaces a **strategic decision** (§4) that should be made *before* the biggest
