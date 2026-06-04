@@ -430,9 +430,11 @@ UI:
 
 LIFECYCLE:
   --setup / --wizard            open the editable Configuration tab pre-build; launch on ▶ Start build
-  --fontspector                 QA pass: run a pinned fontspector release over all built fonts (records
-                                the exact version per family). --fontspector-version <v> / -profile <p> /
-                                -bin <path> / --fontspector-rerun. View results via --attach or --ui web.
+  --fontspector                 enable async fontspector QA during the build: a pinned release runs
+                                (niced) on each green-built family, results in the 'fontspector' tab.
+                                Also a config-tab/wizard setting (fontspector_qa). --no-fontspector off.
+  --fontspector-pass            one-shot: QA all already-built fonts now and exit (no build).
+                                shared opts: --fontspector-version <v> / -profile <p> / -bin <path> / -rerun
   --list                        print the buildable worklist and exit
   --cohorts-report              preview the dependency-cohort grouping (read-only) and exit
   --attach                      attach a read-only monitor to a build at --build-dir

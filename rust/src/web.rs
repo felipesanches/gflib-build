@@ -291,6 +291,7 @@ const SCHEMA=[
  {k:'manage_venvs',l:'cohort venvs',t:'bool',live:false},
  {k:'retry_failed',l:'retry ALL failed (incl. genuine errors)',t:'bool',live:false},
  {k:'compare',l:'compare to shipped',t:'bool',live:true},
+ {k:'fontspector_qa',l:'fontspector QA on green builds',t:'bool',live:false},
 ];
 function human(n){n=n||0;const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return (i?n.toFixed(1):n)+u[i]}
 function hms(s){s=Math.max(0,s|0);return [s/3600|0,(s%3600)/60|0,s%60].map(x=>String(x).padStart(2,'0')).join(':')}

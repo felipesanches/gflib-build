@@ -82,6 +82,7 @@ fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
         ("manage_venvs", "cohort venvs", CfgKind::Bool, false),
         ("retry_failed", "retry ALL failed (incl. genuine errors)", CfgKind::Bool, false),
         ("compare", "compare to shipped", CfgKind::Bool, true),
+        ("fontspector_qa", "fontspector QA on green builds", CfgKind::Bool, false),
     ]
 }
 
@@ -1321,6 +1322,7 @@ fn field_help(key: &str) -> &str {
         "manage_venvs" => "create & share one venv per dependency cohort",
         "retry_failed" => "also re-attempt families that failed with genuine build errors (fixable causes — broken venvs, transient fetches — are always retried)",
         "compare" => "sha256-compare each built font to the shipped one (metadata source only)",
+        "fontspector_qa" => "run fontspector QA asynchronously on each successfully-built family (niced; results in the fontspector tab)",
         _ => "edit with ←/→ or type",
     }
 }

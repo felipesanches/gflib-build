@@ -42,7 +42,7 @@ pub fn run_pass(cfg: &Config) -> i32 {
         if resfile.is_file() && !cfg.fontspector_rerun {
             continue; // already QA'd (use --fontspector-rerun to redo)
         }
-        match run_one(&bin, cfg, slug, fonts, &version) {
+        match run_one(&bin, cfg, slug, fonts, &version, false) {
             Ok(fam) => {
                 let _ = std::fs::write(&resfile, serde_json::to_string(&fam.json).unwrap_or_default());
                 let c = &fam.summary.counts;
@@ -67,7 +67,7 @@ pub fn run_pass(cfg: &Config) -> i32 {
 
 /// Resolve the fontspector binary + its exact version string. Order: --fontspector-bin → a cached
 /// install under <data_dir>/tools/fontspector-<ver>/ → cargo-install the pinned release there.
-fn ensure_binary(cfg: &Config) -> Result<(PathBuf, String), String> {
+pub(crate) fn ensure_binary(cfg: &Config) -> Result<(PathBuf, String), String> {
     if let Some(b) = &cfg.fontspector_bin {
         let v = binary_version(b)?;
         return Ok((b.clone(), v));
@@ -99,15 +99,23 @@ fn binary_version(bin: &Path) -> Result<String, String> {
     if v.is_empty() { Err("fontspector --version produced no output".into()) } else { Ok(v) }
 }
 
-struct OneResult {
-    json: Value,        // what we persist per family
-    summary: FsFamily,  // the family's counts + worst (for the eprintln + a sanity check)
+pub(crate) struct OneResult {
+    pub json: Value,        // what we persist per family
+    pub summary: FsFamily,  // the family's counts + worst (for the eprintln + a sanity check)
 }
 
-/// Run fontspector on one family's fonts and shape the result we persist.
-fn run_one(bin: &Path, cfg: &Config, slug: &str, fonts: &[PathBuf], version: &str) -> Result<OneResult, String> {
+/// Run fontspector on one family's fonts and shape the result we persist. `nice` runs it at low CPU
+/// priority (so the in-build QA orchestration yields to the build workers).
+pub(crate) fn run_one(bin: &Path, cfg: &Config, slug: &str, fonts: &[PathBuf], version: &str, nice: bool) -> Result<OneResult, String> {
     let tmp = persist::fontspector_dir(&cfg.build_dir).join(format!(".{}.tmp.json", slug.replace('/', "__")));
-    let mut cmd = Command::new(bin);
+    // niced: `nice -n 19 <bin> …` (best-effort; if `nice` is absent we just run the bin directly)
+    let mut cmd = if nice {
+        let mut c = Command::new("nice");
+        c.arg("-n").arg("19").arg(bin);
+        c
+    } else {
+        Command::new(bin)
+    };
     cmd.args(["--profile", &cfg.fontspector_profile, "--quiet", "--skip-network", "--json"]).arg(&tmp);
     for f in fonts {
         cmd.arg(f);
@@ -192,7 +200,7 @@ fn bump(c: &mut FsCounts, status: &str) {
 }
 
 /// All `out/<slug__>/` dirs that contain at least one built font → (slug, font paths).
-fn enumerate_built(out_root: &Path) -> Vec<(String, Vec<PathBuf>)> {
+pub(crate) fn enumerate_built(out_root: &Path) -> Vec<(String, Vec<PathBuf>)> {
     let mut v = Vec::new();
     let entries = match std::fs::read_dir(out_root) {
         Ok(e) => e,
@@ -216,7 +224,7 @@ fn enumerate_built(out_root: &Path) -> Vec<(String, Vec<PathBuf>)> {
 }
 
 /// Recursively collect .ttf/.otf files under a family's output dir (covers out/<slug>/{fontc,fontmake}/…).
-fn collect_fonts(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn collect_fonts(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
@@ -232,7 +240,7 @@ fn collect_fonts(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Read every per-family result file and build the aggregate the panels read.
-fn aggregate(fsdir: &Path, profile: &str, version: &str) -> FontspectorView {
+pub(crate) fn aggregate(fsdir: &Path, profile: &str, version: &str) -> FontspectorView {
     let mut per_family: Vec<FsFamily> = Vec::new();
     let mut per_check: BTreeMap<String, FsCheck> = BTreeMap::new();
     let mut total = FsCounts::default();

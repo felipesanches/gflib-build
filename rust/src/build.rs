@@ -58,6 +58,13 @@ pub struct Shared {
     pub archive_pending: VecDeque<String>,    // repo URLs queued to mirror (de-duped, mirror absent)
     pub archive_active: Vec<String>,          // repo URLs cloning right now
     pub archive_recent: Vec<ArchiveRecent>,   // recently mirrored / failed (newest last, capped)
+    // fontspector QA orchestration (--fontspector): QA green families asynchronously, niced, during
+    // the build; the live aggregate feeds the breakdown panels.
+    pub qa_queue: VecDeque<String>,           // green families awaiting QA
+    pub qa_active: Vec<String>,               // families being QA'd right now
+    pub qa_done: HashSet<String>,             // families QA'd this run (de-dup)
+    pub qa_init: bool,                        // QA subsystem ready (binary resolved + queue seeded, or disabled)
+    pub fontspector: Option<crate::model::FontspectorView>, // live aggregate (also written to _summary.json)
     // cohort map (R1: preserved across resume/migration; populated by R2's VenvManager later)
     pub cohort_members: BTreeMap<String, Vec<String>>,
     pub cohort_reqs: BTreeMap<String, String>,
@@ -78,6 +85,7 @@ pub struct Orchestrator {
     pub build_rules: std::collections::HashMap<String, Vec<String>>, // per-family pre-build (R3)
     pub all_families: Vec<Family>,  // full discovered list (R6: raising % enqueues more from here)
     pub clone_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>, // per-repo clone lock (--mirror-missing)
+    pub qa_bin: Mutex<Option<(PathBuf, String)>>, // resolved fontspector (path, version), lazily set
 }
 
 impl Orchestrator {
@@ -189,6 +197,11 @@ impl Orchestrator {
             archive_pending: VecDeque::new(),
             archive_active: Vec::new(),
             archive_recent: Vec::new(),
+            qa_queue: VecDeque::new(),
+            qa_active: Vec::new(),
+            qa_done: HashSet::new(),
+            qa_init: false,
+            fontspector: None,
             cohort_members: state.cohort_members,
             cohort_reqs: state.cohort_reqs,
             cached_cohorts: HashSet::new(),
@@ -217,6 +230,7 @@ impl Orchestrator {
             build_rules,
             all_families,
             clone_locks: Mutex::new(HashMap::new()),
+            qa_bin: Mutex::new(None),
         })
     }
 
@@ -241,9 +255,124 @@ impl Orchestrator {
         let jobs = self.shared.lock().unwrap().jobs;
         self.ensure_workers(jobs);
         self.spawn_archive_prewarmer();
+        self.spawn_qa();
         self.spawn_status_writer();
         self.spawn_size_thread();
         self.spawn_control_watcher();
+    }
+
+    /// Asynchronous fontspector QA (--fontspector): resolve the binary off-thread (may cargo-install),
+    /// seed the queue with already-built families, then run niced QA workers + a periodic aggregator.
+    fn spawn_qa(self: &Arc<Self>) {
+        if !self.cfg.fontspector_qa {
+            return;
+        }
+        let me = Arc::clone(self);
+        thread::spawn(move || {
+            // resolve the pinned binary (one-time; may compile via cargo install — off the hot path)
+            match crate::fontspector::ensure_binary(&me.cfg) {
+                Ok(bv) => {
+                    *me.qa_bin.lock().unwrap() = Some(bv);
+                }
+                Err(e) => {
+                    let mut sh = me.shared.lock().unwrap();
+                    sh.control_log.push(format!("fontspector QA disabled: {}", e));
+                    sh.qa_init = true; // don't block the daemon's done-state when QA can't run
+                    return;
+                }
+            }
+            let _ = std::fs::create_dir_all(crate::persist::fontspector_dir(&me.cfg.build_dir));
+            // seed the queue with every already-built family not yet QA'd
+            me.seed_qa_queue();
+            me.shared.lock().unwrap().qa_init = true;
+            // a small niced QA pool that yields to build workers
+            let n = me.cfg.jobs.clamp(1, 8);
+            for _ in 0..n {
+                let w = Arc::clone(&me);
+                thread::spawn(move || w.qa_worker_loop());
+            }
+            let agg = Arc::clone(&me);
+            thread::spawn(move || agg.qa_aggregator_loop());
+        });
+    }
+
+    /// Enqueue every family that has built output but no stored QA result yet.
+    fn seed_qa_queue(&self) {
+        let fsdir = crate::persist::fontspector_dir(&self.cfg.build_dir);
+        let built = crate::fontspector::enumerate_built(&self.cfg.build_dir.join("out"));
+        let mut sh = self.shared.lock().unwrap();
+        for (slug, _fonts) in built {
+            let has = fsdir.join(format!("{}.json", slug.replace('/', "__"))).is_file();
+            if (!has || self.cfg.fontspector_rerun) && !sh.qa_done.contains(&slug) && !sh.qa_queue.contains(&slug) {
+                sh.qa_queue.push_back(slug);
+            }
+        }
+    }
+
+    /// Enqueue one freshly-green family for QA (called on every successful build).
+    fn enqueue_qa(&self, slug: &str) {
+        if !self.cfg.fontspector_qa {
+            return;
+        }
+        let mut sh = self.shared.lock().unwrap();
+        if !sh.qa_done.contains(slug) && !sh.qa_queue.contains(&slug.to_string()) {
+            sh.qa_queue.push_back(slug.to_string());
+        }
+    }
+
+    fn qa_worker_loop(self: Arc<Self>) {
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let slug = {
+                let mut sh = self.shared.lock().unwrap();
+                match sh.qa_queue.pop_front() {
+                    Some(s) => {
+                        sh.qa_active.push(s.clone());
+                        s
+                    }
+                    None => {
+                        drop(sh);
+                        thread::sleep(Duration::from_millis(500)); // idle: wait for more green families
+                        continue;
+                    }
+                }
+            };
+            let bin = self.qa_bin.lock().unwrap().clone();
+            if let Some((path, version)) = bin {
+                let fonts = crate::fontspector::collect_fonts(&self.cfg.build_dir.join("out").join(slug.replace('/', "__")));
+                if !fonts.is_empty() {
+                    // niced fontspector so it yields to the build workers
+                    if let Ok(res) = crate::fontspector::run_one(&path, &self.cfg, &slug, &fonts, &version, true) {
+                        let resfile = crate::persist::fontspector_dir(&self.cfg.build_dir).join(format!("{}.json", slug.replace('/', "__")));
+                        let _ = std::fs::write(&resfile, serde_json::to_string(&res.json).unwrap_or_default());
+                    }
+                }
+            }
+            let mut sh = self.shared.lock().unwrap();
+            sh.qa_active.retain(|s| s != &slug);
+            sh.qa_done.insert(slug);
+        }
+    }
+
+    /// Re-aggregate the per-family results into the live snapshot + _summary.json every few seconds.
+    fn qa_aggregator_loop(self: Arc<Self>) {
+        let fsdir = crate::persist::fontspector_dir(&self.cfg.build_dir);
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let (path, version) = match self.qa_bin.lock().unwrap().clone() {
+                Some(bv) => bv,
+                None => { thread::sleep(Duration::from_secs(2)); continue; }
+            };
+            let _ = path;
+            let view = crate::fontspector::aggregate(&fsdir, &self.cfg.fontspector_profile, &version);
+            let _ = std::fs::write(fsdir.join("_summary.json"), serde_json::to_string(&view).unwrap_or_default());
+            self.shared.lock().unwrap().fontspector = Some(view);
+            thread::sleep(Duration::from_secs(4));
+        }
     }
 
     /// Proactively mirror EVERY worklist repo into the archive, concurrent with the build, so the
@@ -547,6 +676,7 @@ impl Orchestrator {
             r.note = String::new();
         });
         self.emit("built", slug, serde_json::json!({"backend":"both","bytes":bytes,"vs":vs}));
+        self.enqueue_qa(slug);
     }
 
     /// Record an operation's duration (bottleneck timing): updates the global op aggregate and the
@@ -785,6 +915,7 @@ impl Orchestrator {
                 "DONE: backend={} bytes={} missing={}", backend, bytes, missing
             ));
             self.emit("built", slug, serde_json::json!({"backend": used, "bytes": bytes, "compare": cmp}));
+            self.enqueue_qa(slug);
             if !self.cfg.keep_fonts {
                 let _ = std::fs::remove_dir_all(&out_dir);
             }
@@ -987,7 +1118,8 @@ impl Orchestrator {
         thread::spawn(move || {
             let mut tick: u64 = 0;
             while !me.stop.load(Ordering::Relaxed) {
-                let snap = me.snapshot();
+                let mut snap = me.snapshot();
+                snap.fontspector = None; // kept out of status.json (large); monitors overlay _summary.json
                 persist::write_status(&me.cfg.build_dir, &snap);
                 if tick % 10 == 0 {
                     // derived reports consumed by the dashboard (refreshed every ~10 s, not every tick)
@@ -998,7 +1130,8 @@ impl Orchestrator {
                 thread::sleep(Duration::from_millis(1000));
             }
             // one last write so a monitor sees the final state
-            let snap = me.snapshot();
+            let mut snap = me.snapshot();
+            snap.fontspector = None;
             persist::write_status(&me.cfg.build_dir, &snap);
             persist::write_json_file(&me.cfg.build_dir, "migration.json", &me.migration_json());
             persist::write_json_file(&me.cfg.build_dir, "timings.json", &me.timings_json());
@@ -1053,7 +1186,18 @@ impl Orchestrator {
     /// Flush the final status + derived reports SYNCHRONOUSLY (so a short foreground run doesn't exit
     /// before the background status-writer thread gets to write them).
     pub fn finalize(&self) {
-        let snap = self.snapshot();
+        // a final QA aggregate so the summary reflects every per-family result, even if the periodic
+        // aggregator's last tick was before the last family finished (or the process exits promptly)
+        if self.cfg.fontspector_qa {
+            if let Some((_, version)) = self.qa_bin.lock().unwrap().clone() {
+                let fsdir = crate::persist::fontspector_dir(&self.cfg.build_dir);
+                let view = crate::fontspector::aggregate(&fsdir, &self.cfg.fontspector_profile, &version);
+                let _ = std::fs::write(fsdir.join("_summary.json"), serde_json::to_string(&view).unwrap_or_default());
+                self.shared.lock().unwrap().fontspector = Some(view);
+            }
+        }
+        let mut snap = self.snapshot();
+        snap.fontspector = None;
         persist::write_status(&self.cfg.build_dir, &snap);
         persist::write_json_file(&self.cfg.build_dir, "migration.json", &self.migration_json());
         persist::write_json_file(&self.cfg.build_dir, "timings.json", &self.timings_json());
@@ -1200,8 +1344,12 @@ impl Orchestrator {
 
         // done = nothing queued, nothing building, no worker in flight (correct with 0 families so a
         // daemon idle-exits; the active counter guards the build→built window). Computed before the
-        // struct literal moves `counts`.
-        let done = counts.queued == 0 && counts.building == 0 && self.active.load(Ordering::Relaxed) == 0;
+        // struct literal moves `counts`. When QA is on, also wait for the QA queue to drain so the
+        // daemon doesn't exit mid-QA.
+        let qa_pending = self.cfg.fontspector_qa
+            && (!sh.qa_init || !sh.qa_queue.is_empty() || !sh.qa_active.is_empty());
+        let done = counts.queued == 0 && counts.building == 0
+            && self.active.load(Ordering::Relaxed) == 0 && !qa_pending;
 
         let op_stats: BTreeMap<String, OpStat> = sh
             .op_stats
@@ -1277,7 +1425,7 @@ impl Orchestrator {
             dep_relaxations: self.venvs.as_ref().map(|v| v.relaxations()).unwrap_or_default(),
             config_path: self.cfg.data_dir.join("gflib-build.config").to_string_lossy().to_string(),
             pre_build: false, // a live build is never the setup wizard
-            fontspector: None, // QA is a separate pass; the monitor overlays results when viewing
+            fontspector: sh.fontspector.clone(), // live QA aggregate (async --fontspector orchestration)
             done,
             daemon_alive: true,
         }
