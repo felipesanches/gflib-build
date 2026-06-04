@@ -1,5 +1,10 @@
 # Rust port → drop-in replacement: parity plan
 
+> **DECISION (2026-06-04): Option A — full drop-in.** Felipe chose to faithfully port the entire
+> Python tool, **including the cohort venv machinery (R2)**, for a true 1:1 replacement. §4's
+> recommendation toward (B)/(C) is therefore overridden; R2 is in scope in full. Execution order is
+> unchanged: harness → R1 → R2 → … (R1 first because it closes the persistence gap at low risk).
+
 Goal: make `rust/` a **drop-in replacement** for `gflib_build.py` (4674 lines). This plan inventories
 every gap, grounds the effort in the actual Python subsystems, sequences the work into milestones,
 and — importantly — surfaces a **strategic decision** (§4) that should be made *before* the biggest

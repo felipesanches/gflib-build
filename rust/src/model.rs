@@ -217,6 +217,18 @@ pub struct Snapshot {
     #[serde(default)] pub daemon_alive: bool,
 }
 
+/// The full `state.json` document — byte-compatible with the Python tool so resume preserves the
+/// cohort map, the cumulative clock, and the per-family results across a Python→Rust migration (R1).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StateFile {
+    #[serde(default)] pub saved_at: f64,
+    #[serde(default)] pub build_dir: String,
+    #[serde(default)] pub elapsed_so_far: f64,
+    #[serde(default)] pub results: BTreeMap<String, Res>,
+    #[serde(default)] pub cohort_members: BTreeMap<String, Vec<String>>,
+    #[serde(default)] pub cohort_reqs: BTreeMap<String, String>,
+}
+
 /// A live-control message dropped into control.json by a monitor; the daemon applies it on the fly.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Control {

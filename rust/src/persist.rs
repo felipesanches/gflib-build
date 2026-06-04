@@ -5,7 +5,7 @@
 //!   failure-history.jsonl  append-only durable record of how families broke
 //!   daemon.pid             PID of a detached build daemon (for attach/stop)
 
-use crate::model::{Control, FailHist, Res, Snapshot};
+use crate::model::{Control, FailHist, Res, Snapshot, StateFile};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -61,34 +61,31 @@ pub fn write_control(build_dir: &Path, set: &crate::model::ControlSet) -> bool {
     false
 }
 
-/// Persist resumable per-family state. Stored as a slug->Res map under "results".
-pub fn write_state(build_dir: &Path, results: &BTreeMap<String, Res>) {
+/// Persist the FULL resumable state (results + cohort map + cumulative clock), byte-compatible with
+/// the Python tool — so nothing (cohorts, elapsed, per-family status) is lost across a restart/migration.
+pub fn write_state_full(build_dir: &Path, st: &StateFile) {
     let _ = std::fs::create_dir_all(build_dir);
-    let mut root = BTreeMap::<String, serde_json::Value>::new();
-    if let Ok(v) = serde_json::to_value(results) {
-        root.insert("results".into(), v);
-    }
     let tmp = build_dir.join("state.json.tmp");
-    if let Ok(txt) = serde_json::to_string(&root) {
+    if let Ok(txt) = serde_json::to_string(st) {
         if std::fs::write(&tmp, txt).is_ok() {
             let _ = std::fs::rename(&tmp, state_path(build_dir));
         }
     }
 }
 
-/// Load resumable state (slug->Res). Empty map if absent.
-pub fn read_state(build_dir: &Path) -> BTreeMap<String, Res> {
+/// Load the full state document (cohort map + clock + results). Default if absent/unparseable.
+pub fn read_state_full(build_dir: &Path) -> StateFile {
     let txt = match std::fs::read_to_string(state_path(build_dir)) {
         Ok(t) => t,
-        Err(_) => return BTreeMap::new(),
+        Err(_) => return StateFile::default(),
     };
-    let root: serde_json::Value = match serde_json::from_str(&txt) {
-        Ok(v) => v,
-        Err(_) => return BTreeMap::new(),
-    };
-    root.get("results")
-        .and_then(|r| serde_json::from_value(r.clone()).ok())
-        .unwrap_or_default()
+    serde_json::from_str(&txt).unwrap_or_default()
+}
+
+/// Convenience: just the per-family results (used by tests and simple callers).
+#[allow(dead_code)]
+pub fn read_state(build_dir: &Path) -> BTreeMap<String, Res> {
+    read_state_full(build_dir).results
 }
 
 /// Append one durable failure record (JSON line). Append-only — never erased by a later success.
@@ -150,4 +147,28 @@ extern "C" {
 }
 fn libc_kill(pid: i32, sig: i32) -> i32 {
     unsafe { kill(pid, sig) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Res, StateFile};
+    #[test]
+    fn state_full_roundtrip_preserves_cohorts_and_clock() {
+        let dir = std::env::temp_dir().join(format!("_stfull_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut st = StateFile { elapsed_so_far: 79249.0, build_dir: "/x".into(), ..Default::default() };
+        st.results.insert("ofl/x".into(), Res { slug: "ofl/x".into(), status: "failed".into(),
+            error: "venv: pip install rc=1".into(), ..Default::default() });
+        st.cohort_members.insert("base".into(), vec!["ofl/x".into(), "ofl/y".into()]);
+        st.cohort_members.insert("c-abc".into(), vec!["ofl/z".into()]);
+        st.cohort_reqs.insert("c-abc".into(), "gftools\ncompreffor".into());
+        write_state_full(&dir, &st);
+        let back = read_state_full(&dir);
+        assert_eq!(back.elapsed_so_far, 79249.0, "cumulative clock must survive");
+        assert_eq!(back.cohort_members.get("base").unwrap().len(), 2, "cohort members survive");
+        assert_eq!(back.cohort_reqs.get("c-abc").unwrap(), "gftools\ncompreffor", "cohort reqs survive");
+        assert_eq!(back.results.get("ofl/x").unwrap().status, "failed", "per-family status survives");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

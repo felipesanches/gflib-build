@@ -51,6 +51,10 @@ pub struct Shared {
     pub disk_archive_total: u64,
     pub disk_free: u64,
     pub archive_total: usize,
+    // cohort map (R1: preserved across resume/migration; populated by R2's VenvManager later)
+    pub cohort_members: BTreeMap<String, Vec<String>>,
+    pub cohort_reqs: BTreeMap<String, String>,
+    pub cached_cohorts: HashSet<String>, // cohorts with a venv on disk (off-thread; for the 'cached' flag)
 }
 
 pub struct Orchestrator {
@@ -96,7 +100,8 @@ impl Orchestrator {
             fams = discover::sample_evenly(fams, cfg.percent);
         }
 
-        let prior = persist::read_state(&cfg.build_dir);
+        let state = persist::read_state_full(&cfg.build_dir);
+        let prior = &state.results;
         let mut results = BTreeMap::new();
         let mut families = BTreeMap::new();
         // (slug, prior_duration) for queued families — sorted longest-first below to shrink the tail
@@ -105,14 +110,17 @@ impl Orchestrator {
             let slug = f.slug.clone();
             families.insert(slug.clone(), f);
             let prev = prior.get(&slug);
-            // resume: keep a prior success unless --rebuild; re-queue failures only on retry flags
+            // resume: keep a prior success unless --rebuild; re-queue a failure if the user forces it
+            // OR (self-heal, matching Python) its cause is in the AUTO_RETRY set — a fresh attempt can
+            // clear a rebuilt venv / retried clone / updated mirror, so the failure hints stay honest.
             let (status, kind) = match prev {
                 Some(p) if p.status == "built" && !cfg.rebuild => ("built", ""),
                 Some(p) if p.status == "failed" => {
+                    let (cause, _) = crate::classify::categorize_failure(&p.error);
                     let retry = cfg.rebuild
                         || cfg.retry_failed
-                        || (!cfg.retry_category.is_empty()
-                            && p.error.contains(&cfg.retry_category));
+                        || crate::classify::is_auto_retry(cause)
+                        || (!cfg.retry_category.is_empty() && cause == cfg.retry_category);
                     if retry {
                         ("queued", "retry")
                     } else {
@@ -164,6 +172,9 @@ impl Orchestrator {
             disk_archive_total: 0,
             disk_free: 0,
             archive_total: 0,
+            cohort_members: state.cohort_members,
+            cohort_reqs: state.cohort_reqs,
+            cached_cohorts: HashSet::new(),
         };
         Arc::new(Orchestrator {
             cfg,
@@ -171,7 +182,7 @@ impl Orchestrator {
             cond: Arc::new(Condvar::new()),
             stop: Arc::new(AtomicBool::new(false)),
             start_time: now(),
-            resumed_elapsed: 0.0,
+            resumed_elapsed: state.elapsed_so_far, // cumulative clock survives restart/migration (R1)
             active: AtomicUsize::new(0),
             spawned: Mutex::new(0),
         })
@@ -423,8 +434,8 @@ impl Orchestrator {
 
         if !built_any {
             let err = if last_err.is_empty() { "build failed".into() } else { last_err };
-            // remember fontc gap even when fontmake later succeeds (it didn't here)
-            self.fail(slug, &classify(&err), &err);
+            let (cause, _) = crate::classify::categorize_failure(&err);
+            self.fail(slug, cause, &err);
             let _ = fontc_err;
         }
         cleanup(&work, self.cfg.keep_work);
@@ -489,11 +500,18 @@ impl Orchestrator {
     }
 
     fn save_state(&self) {
-        let results = {
+        let st = {
             let sh = self.shared.lock().unwrap();
-            sh.results.clone()
+            crate::model::StateFile {
+                saved_at: now(),
+                build_dir: self.cfg.build_dir.to_string_lossy().to_string(),
+                elapsed_so_far: self.elapsed(),
+                results: sh.results.clone(),
+                cohort_members: sh.cohort_members.clone(),
+                cohort_reqs: sh.cohort_reqs.clone(),
+            }
         };
-        persist::write_state(&self.cfg.build_dir, &results);
+        persist::write_state_full(&self.cfg.build_dir, &st);
     }
 
     // ---- live config: a monitor writes control.json; we apply it on the fly ----
@@ -601,12 +619,14 @@ impl Orchestrator {
                 let archive_total = measure_archive(&me.cfg.build_dir, &me.cfg.archive);
                 let free = free_bytes(&me.cfg.build_dir);
                 let arc_count = count_archive(&me.cfg.archive);
+                let cached = cached_cohort_set(&me.cfg.build_dir);
                 {
                     let mut sh = me.shared.lock().unwrap();
                     sh.disk_build_total = build_total;
                     sh.disk_archive_total = archive_total;
                     sh.disk_free = free;
                     sh.archive_total = arc_count;
+                    sh.cached_cohorts = cached;
                 }
                 for _ in 0..10 {
                     if me.stop.load(Ordering::Relaxed) {
@@ -637,7 +657,7 @@ impl Orchestrator {
         let mut queued_list = Vec::new();
         let mut fails = Vec::new();
         let mut built = Vec::new();
-        let mut fail_cat: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
+        let mut fail_cat: BTreeMap<String, (usize, Vec<String>, &'static str)> = BTreeMap::new();
 
         for r in sh.results.values() {
             match r.status.as_str() {
@@ -698,9 +718,8 @@ impl Orchestrator {
                     builder: r.builder.clone(),
                     builder_version: r.builder_version.clone(),
                 });
-                let e = &r.error;
-                let cause = classify(e);
-                let ent = fail_cat.entry(cause).or_insert((0, Vec::new()));
+                let (cause, hint) = crate::classify::categorize_failure(&r.error);
+                let ent = fail_cat.entry(cause.to_string()).or_insert((0, Vec::new(), hint));
                 ent.0 += 1;
                 if ent.1.len() < 40 {
                     ent.1.push(r.slug.clone());
@@ -716,8 +735,8 @@ impl Orchestrator {
         let fail_categories = {
             let mut v: Vec<FailCategory> = fail_cat
                 .into_iter()
-                .map(|(cat, (count, families))| FailCategory {
-                    hint: hint_for(&cat),
+                .map(|(cat, (count, families, hint))| FailCategory {
+                    hint: hint.to_string(),
                     cat,
                     count,
                     families,
@@ -735,6 +754,21 @@ impl Orchestrator {
             .collect();
         let builders: BTreeMap<String, String> =
             sh.bver_cache.iter().map(|((b, _), v)| (b.clone(), v.clone())).collect();
+
+        // cohorts view (R1): from the preserved cohort map; 'cached' = a venv is on disk for that key.
+        // Largest cohorts first, matching the Python tool.
+        let mut cohorts_out: Vec<CohortView> = sh
+            .cohort_members
+            .iter()
+            .map(|(key, fams)| CohortView {
+                key: key.clone(),
+                count: fams.len(),
+                requirements: sh.cohort_reqs.get(key).cloned().unwrap_or_default(),
+                families: fams.clone(),
+                cached: sh.cached_cohorts.contains(key),
+            })
+            .collect();
+        cohorts_out.sort_by(|a, b| b.count.cmp(&a.count));
 
         let mut fail_hist: Vec<FailHist> = sh.failure_history.iter().rev().take(400).cloned().collect();
         fail_hist.reverse();
@@ -760,8 +794,8 @@ impl Orchestrator {
             built_recent: built,
             queued_list,
             fail_categories,
-            cohorts: Vec::new(),
-            cohorts_ready: 0,
+            cohorts_ready: cohorts_out.iter().filter(|c| c.cached).count(),
+            cohorts: cohorts_out,
             phase: sh.phase.clone(),
             phase_total: sh.library_total,
             phase_done: 0,
@@ -1144,39 +1178,19 @@ fn measure_archive(build_dir: &Path, archive: &Path) -> u64 {
     dir_size(&ar)
 }
 
-/// Classify a failure into a coarse cause bucket (for the failures summary).
-fn classify(err: &str) -> String {
-    let low = err.to_lowercase();
-    if low.contains("no module named gftools") || low.contains("modulenotfound") {
-        "broken venv / missing module".into()
-    } else if low.contains("no config.yaml") {
-        "no build config".into()
-    } else if low.contains("mirror") && low.contains("missing") {
-        "mirror missing".into()
-    } else if low.contains("produced no expected") {
-        "no output produced".into()
-    } else if low.contains("output name mismatch") {
-        "output name mismatch".into()
-    } else if low.contains("timed out") {
-        "timed out".into()
-    } else if low.contains("git archive") || low.contains("tar extract") {
-        "source extraction failed".into()
-    } else {
-        "build error".into()
+/// Cohort keys with a venv on disk (a `venvs/<key>/.gflib-installed` success marker) — the 'cached'
+/// flag in the cohorts view. Scanned off the render path (in the size thread), like the Python tool.
+fn cached_cohort_set(build_dir: &Path) -> HashSet<String> {
+    let mut set = HashSet::new();
+    let vroot = build_dir.join("venvs");
+    if let Ok(rd) = std::fs::read_dir(&vroot) {
+        for e in rd.flatten() {
+            if e.path().join(".gflib-installed").is_file() {
+                set.insert(e.file_name().to_string_lossy().to_string());
+            }
+        }
     }
-}
-
-fn hint_for(cat: &str) -> String {
-    match cat {
-        "broken venv / missing module" => "rebuild the cohort venv (retry)".into(),
-        "no build config" => "needs a config.yaml override".into(),
-        "mirror missing" => "mirror the upstream repo (--mirror-missing)".into(),
-        "no output produced" => "check the build log for the real error".into(),
-        "output name mismatch" => "config writes differently-named fonts".into(),
-        "timed out" => "raise --timeout or investigate a hang".into(),
-        "source extraction failed" => "git remote update the stale mirror".into(),
-        _ => "open the log for details".into(),
-    }
+    set
 }
 
 #[cfg(test)]
@@ -1188,13 +1202,6 @@ mod tests {
         assert_eq!(mirror_path(ar, "https://github.com/googlefonts/foo"), Path::new("/arch/googlefonts/foo.git"));
         assert_eq!(mirror_path(ar, "https://github.com/googlefonts/foo.git"), Path::new("/arch/googlefonts/foo.git"));
         assert_eq!(mirror_path(ar, "git@github.com:owner/bar.git"), Path::new("/arch/owner/bar.git"));
-    }
-    #[test]
-    fn classify_buckets() {
-        assert_eq!(classify("ModuleNotFoundError: No module named 'gftools'"), "broken venv / missing module");
-        assert_eq!(classify("no config.yaml found"), "no build config");
-        assert_eq!(classify("fontc: produced no expected font files"), "no output produced");
-        assert_eq!(classify("kaboom"), "build error");
     }
 }
 

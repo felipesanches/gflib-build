@@ -6,6 +6,7 @@
 //! interoperate: you can watch a Python daemon from this Rust TUI and vice-versa.
 
 mod build;
+mod classify;
 mod config;
 mod discover;
 mod model;
