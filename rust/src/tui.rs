@@ -34,6 +34,22 @@ struct Ui {
     tab: usize,
     sel: usize,
     detail: bool,
+    sel_key: Option<String>, // the SELECTED item's identity (stable selection: cursor follows it)
+}
+
+/// The identity (slug/key) of each item in the current tab's list, in display order — used for
+/// stable selection (the cursor tracks the item, not the row index, as lists reorder live).
+fn list_keys(snap: &Snapshot, tab: usize) -> Vec<String> {
+    match TABS[tab] {
+        "config" => CONFIG_FIELDS.iter().map(|s| s.to_string()).collect(),
+        "queue" => snap.queued_list.iter().map(|q| q.slug.clone()).collect(),
+        "cohorts" => snap.cohorts.iter().map(|c| c.key.clone()).collect(),
+        "built" => snap.built_recent.iter().map(|b| b.slug.clone()).collect(),
+        "failures" => snap.failures_recent.iter().map(|f| f.slug.clone()).collect(),
+        "stats" => snap.fail_categories.iter().map(|c| c.cat.clone()).collect(),
+        "archive" => snap.archive.pending.clone(),
+        _ => snap.building.iter().map(|b| b.slug.clone()).collect(),
+    }
 }
 
 pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
@@ -42,9 +58,20 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
     queue!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
     out.flush()?;
 
-    let mut ui = Ui { tab: 1, sel: 0, detail: false };
+    let mut ui = Ui { tab: 1, sel: 0, detail: false, sel_key: None };
     let res = loop {
         let snap = source.snapshot();
+        // stable selection: re-resolve the row index from the remembered item key each frame, so a
+        // list reordering (failed→building→built) keeps the cursor on the SAME item.
+        let keys = list_keys(&snap, ui.tab);
+        if let Some(k) = &ui.sel_key {
+            if let Some(i) = keys.iter().position(|x| x == k) {
+                ui.sel = i;
+            }
+        }
+        if ui.sel >= keys.len() {
+            ui.sel = keys.len().saturating_sub(1);
+        }
         render(&mut out, &snap, &ui, &*source)?;
 
         if event::poll(Duration::from_millis(250))? {
@@ -58,20 +85,24 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
                     KeyCode::Tab => {
                         ui.tab = (ui.tab + 1) % TABS.len();
                         ui.sel = 0;
+                        ui.sel_key = None;
                         ui.detail = false;
                     }
                     KeyCode::BackTab => {
                         ui.tab = (ui.tab + TABS.len() - 1) % TABS.len();
                         ui.sel = 0;
+                        ui.sel_key = None;
                         ui.detail = false;
                     }
                     KeyCode::Up => {
                         if ui.sel > 0 {
                             ui.sel -= 1;
                         }
+                        ui.sel_key = list_keys(&snap, ui.tab).get(ui.sel).cloned();
                     }
                     KeyCode::Down => {
                         ui.sel = (ui.sel + 1).min(list_len(&snap, ui.tab).saturating_sub(1));
+                        ui.sel_key = list_keys(&snap, ui.tab).get(ui.sel).cloned();
                     }
                     KeyCode::Left => {
                         if TABS[ui.tab] == "config" {
@@ -341,19 +372,50 @@ fn render(out: &mut Stdout, snap: &Snapshot, ui: &Ui, src: &dyn Source) -> std::
     out.flush()
 }
 
+/// Share `avail` rows fairly across sections wanting `desired[i]` rows each: a section that needs
+/// fewer than its fair share releases the surplus to the others (water-fill), so a small section
+/// shows in full while a large one expands to take the rest. Converges in a few rounds.
+fn water_fill(desired: &[usize], avail: usize) -> Vec<usize> {
+    let n = desired.len();
+    let mut alloc = vec![0usize; n];
+    let mut remaining = avail;
+    loop {
+        let unsat: Vec<usize> = (0..n).filter(|&i| alloc[i] < desired[i]).collect();
+        if unsat.is_empty() || remaining == 0 {
+            break;
+        }
+        let share = (remaining / unsat.len()).max(1);
+        let mut used = 0;
+        for &i in &unsat {
+            if used >= remaining {
+                break;
+            }
+            let give = (desired[i] - alloc[i]).min(share).min(remaining - used);
+            alloc[i] += give;
+            used += give;
+        }
+        if used == 0 {
+            break;
+        }
+        remaining -= used;
+    }
+    alloc
+}
+
 fn render_overview(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u16) {
+    // water-fill the two sections so they fill the available height (header + items each)
+    let desired = [snap.building.len() + 1, snap.failures_recent.len() + 1];
+    let alloc = water_fill(&desired, avail as usize);
     let mut row = top;
     put(out, row, 0, &format!(" Now building ({})", snap.building.len()), Color::DarkYellow, w);
     row += 1;
-    for b in snap.building.iter().take((avail / 3).max(1) as usize) {
+    for b in snap.building.iter().take(alloc[0].saturating_sub(1)) {
         put(out, row, 1, &format!("w{} {:<44} {:>6} {}", b.worker, b.slug, hms(b.dur), b.note), Color::Grey, w);
         row += 1;
     }
-    row += 1;
     put(out, row, 0, &format!(" Recent failures ({})", snap.failures_recent.len()), Color::Red, w);
     row += 1;
-    let end = avail.saturating_sub(row - top);
-    for f in snap.failures_recent.iter().take(end as usize) {
+    for f in snap.failures_recent.iter().take(alloc[1].saturating_sub(1)) {
         put(out, row, 1, &format!("{:<36} {}", f.slug, f.error), Color::Grey, w);
         row += 1;
     }
@@ -460,21 +522,49 @@ fn render_stats(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u16)
 
 fn render_archive(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u16) {
     let a = &snap.archive;
+    let unreachable = a.recent.iter().filter(|r| r.status == "failed").count();
     put(out, top, 0, &format!(" {} repos mirrored on disk", a.total), Color::Cyan, w);
-    let mut row = top + 1;
-    if !a.active.is_empty() {
-        put(out, row, 0, &format!("  {} cloning now", a.active.len()), Color::Yellow, w);
-        row += 1;
+    put(out, top + 1, 0, &format!("  {} cloning now   {} queued   {} unreachable",
+        a.active.len(), a.pending_total, unreachable), Color::Grey, w);
+    let mut row = top + 3;
+
+    // multi-column grid: cloning-now (yellow) · recently-archived (green) · queued-next (cyan), to
+    // fit as many repo slugs on screen as possible. Each section is a labelled colour block.
+    let colw: usize = 30;
+    let cols = (w as usize / colw).max(1);
+    let grid = |out: &mut Stdout, row: &mut u16, items: &[String], color: Color, label: &str, maxrows: u16| {
+        if items.is_empty() || maxrows == 0 { return; }
+        put(out, *row, 0, label, color, w);
+        *row += 1;
+        let mut shown = 0;
+        let cap = (maxrows as usize - 1).saturating_mul(cols);
+        for chunk in items.iter().take(cap).collect::<Vec<_>>().chunks(cols) {
+            let line: String = chunk.iter().map(|s| format!("{:<width$}", trunc(s, colw - 1), width = colw)).collect();
+            put(out, *row, 1, &line, color, w);
+            *row += 1;
+            shown += chunk.len();
+        }
+        if items.len() > shown {
+            put(out, *row, 1, &format!("… +{} more", items.len() - shown), Color::DarkGrey, w);
+            *row += 1;
+        }
+        *row += 1;
+    };
+    let budget = avail.saturating_sub(3);
+    let recent_added: Vec<String> = a.recent.iter().filter(|r| r.status != "failed").map(|r| r.repo.clone()).collect();
+    let unreach: Vec<String> = a.recent.iter().filter(|r| r.status == "failed")
+        .map(|r| format!("{} ({})", r.repo, trunc(&r.reason, 16))).collect();
+    grid(out, &mut row, &a.active, Color::Yellow, " cloning now", budget / 4);
+    grid(out, &mut row, &recent_added, Color::Green, " recently archived (last 30 min)", budget / 3);
+    grid(out, &mut row, &a.pending, Color::Cyan, " queued next", budget / 3);
+    grid(out, &mut row, &unreach, Color::Red, " unreachable (git reason)", budget / 4);
+    if a.active.is_empty() && a.recent.is_empty() && a.pending.is_empty() {
+        put(out, row, 1, "(archive idle — nothing being mirrored)", Color::DarkGrey, w);
     }
-    if a.pending_total > 0 {
-        put(out, row, 0, &format!("  {} queued", a.pending_total), Color::Cyan, w);
-        row += 1;
-    }
-    for r in a.recent.iter().take(avail.saturating_sub(row - top) as usize) {
-        let color = if r.status == "failed" { Color::Red } else { Color::Green };
-        put(out, row, 1, &format!("{} {} {}", if r.status == "failed" { "✗" } else { "+" }, r.repo, r.reason), color, w);
-        row += 1;
-    }
+}
+
+fn trunc(s: &str, n: usize) -> String {
+    if s.chars().count() <= n { s.to_string() } else { s.chars().take(n.saturating_sub(1)).collect::<String>() + "…" }
 }
 
 fn render_config(out: &mut Stdout, snap: &Snapshot, sel: usize, top: u16, w: u16) {
@@ -617,5 +707,21 @@ fn scroll_start(sel: usize, view: usize, total: usize) -> usize {
         0
     } else {
         (sel + 1 - view).min(total - view)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::water_fill;
+    #[test]
+    fn water_fill_shares_and_releases_surplus() {
+        assert_eq!(water_fill(&[2, 3], 10), vec![2, 3]); // both fit -> exact
+        let a = water_fill(&[1, 100], 10); // small section releases surplus to the large one
+        assert_eq!(a[0], 1);
+        assert_eq!(a[1], 9);
+        let b = water_fill(&[50, 50], 10); // both want more than half -> shared, sum == avail
+        assert_eq!(b[0] + b[1], 10);
+        assert!(b[0] >= 4 && b[1] >= 4);
+        assert_eq!(water_fill(&[5], 0), vec![0]); // no room
     }
 }

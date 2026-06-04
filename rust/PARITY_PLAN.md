@@ -103,10 +103,10 @@ reexec-wizard on `C`.*
 - **Accept:** `q` leaves it running; re-run reattaches; `--stop` ends cleanly; survives terminal close.
 - **Risk:** fork + threads + signals in Rust — fork first, minimal async-signal-safe handler.
 
-### R5 — TUI full fidelity · L–XL · 🔶 PARTIAL
-*Editable config tab (↑↓ pick, ←→ change, applied live via control.json) ✅, completion/stopped
-banner ✅. Remaining: section water-fill layout, the live archive multi-column grid, stable
-selection (track item not row index), detail-overlay parity.*
+### R5 — TUI full fidelity · L–XL · ✅ DONE
+*Editable config tab (live via control.json) ✅, completion/stopped banner ✅, section water-fill
+layout ✅, live archive multi-column grid (cloning/recent/queued/unreachable, colour-coded) ✅,
+stable selection (cursor tracks the item, not the row) ✅, detail overlays ✅.*
 Port the parts of `CursesFrontend` (2637–3861, ~1225 lines) the Rust TUI doesn't have yet:
 - **editable config tab** (fields, text cursor, ±step, choice cycle, checkbox→conditional reveal);
   live apply via `control.json` (✓ apply changes); first-run ▶ Start / Cancel.
