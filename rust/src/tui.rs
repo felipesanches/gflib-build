@@ -448,10 +448,15 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
     }
     put(scr, 4, x.saturating_add(2).max(w.saturating_sub(24)), "[Tab]/[⇧Tab] switch tabs", Color::DarkGrey, w);
 
+    // ---- always-on status panel: compute the focus info first, since it reserves body rows ----
+    // (matches Python: panel_h = 1 separator + N info lines, body renders above it.)
+    let info = focus_info(snap, ui);
+    let panel_h = if info.is_empty() { 0 } else { 1 + info.len() as u16 };
+    let footer_row = h.saturating_sub(1);
+    let sep_row = footer_row.saturating_sub(panel_h);
+
     // ---- pinned now-building (on every tab) ----
     let body_top = 6u16;
-    let footer_row = h.saturating_sub(2);
-    let panel_row = h.saturating_sub(3);
     let mut row = body_top;
     if !snap.building.is_empty() && TABS[ui.tab] != "overview" {
         put(scr, row, 0, &format!(" Now building ({})", snap.building.len()), Color::DarkYellow, w);
@@ -471,13 +476,10 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
     }
 
     // ---- body per tab ----
-    let avail = panel_row.saturating_sub(row);
+    let avail = sep_row.saturating_sub(row);
     match TABS[ui.tab] {
         "overview" => render_overview(scr, snap, row, avail, w),
-        "queue" => render_list_simple(
-            scr, row, avail, w, ui.sel, "Queue",
-            snap.queued_list.iter().map(|q| format!("{:<48} {}", q.slug, q.kind)).collect(),
-        ),
+        "queue" => render_queue(scr, snap, row, avail, w, ui.sel),
         "cohorts" => render_cohorts(scr, snap, row, avail, w, ui.sel),
         "built" => render_built(scr, snap, row, avail, w, ui.sel),
         "failures" => render_failures(scr, snap, row, avail, w, ui.sel),
@@ -486,9 +488,13 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
         _ => render_config(scr, snap, ui.sel, row, w),
     }
 
-    // ---- status panel ----
-    put(scr, panel_row, 0, &"─".repeat(w as usize), Color::DarkGrey, w);
-    put(scr, panel_row, 0, &status_panel(snap, ui), Color::White, w);
+    // ---- status panel (separator + up to 3 context lines) ----
+    if !info.is_empty() {
+        put(scr, sep_row, 0, &"─".repeat(w as usize), Color::DarkGrey, w);
+        for (i, ln) in info.iter().enumerate() {
+            put(scr, sep_row + 1 + i as u16, 0, ln, Color::White, w);
+        }
+    }
 
     // ---- footer (mode-dependent, matching the Python help strings) ----
     let footer = if ui.detail {
@@ -555,22 +561,38 @@ fn render_overview(scr: &mut Screen, snap: &Snapshot, top: u16, avail: u16, w: u
     }
 }
 
-fn render_list_simple(
-    scr: &mut Screen,
-    top: u16,
-    avail: u16,
-    w: u16,
-    sel: usize,
-    title: &str,
-    items: Vec<String>,
-) {
-    put(scr, top, 0, &format!(" {} ({})", title, items.len()), Color::Cyan, w);
+/// A focused section header: " ▼ {title} ({count}) " padded with dashes, reverse-video — matching
+/// the Python `draw_sections` focused-section header.
+fn section_header(scr: &mut Screen, row: u16, title: &str, count: usize, w: u16) {
+    let mut hdr = format!(" ▼ {} ({}) ", title, count);
+    while hdr.chars().count() < (w as usize).saturating_sub(1) {
+        hdr.push('-');
+    }
+    put_rev(scr, row, 0, &hdr, Color::White, true);
+}
+
+/// Python-style `s[:n]` slice (no ellipsis), used by the fixed-width row columns.
+fn head(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+fn render_queue(scr: &mut Screen, snap: &Snapshot, top: u16, avail: u16, w: u16, sel: usize) {
+    section_header(scr, top, "Queued — priority order (variable + larger families first)", snap.queued_list.len(), w);
     let mut row = top + 1;
-    let start = scroll_start(sel, avail as usize - 1, items.len());
-    for (i, it) in items.iter().enumerate().skip(start).take(avail as usize - 1) {
-        let color = if i == sel { Color::Yellow } else { Color::Grey };
-        let marker = if i == sel { "▸ " } else { "  " };
-        put(scr, row, 0, &format!("{}{}", marker, it), color, w);
+    let view = (avail as usize).saturating_sub(1);
+    let start = scroll_start(sel, view, snap.queued_list.len());
+    for (i, q) in snap.queued_list.iter().enumerate().skip(start).take(view) {
+        // kind column coloured (new=green, retry=yellow, rebuild=cyan), slug plain — mirrors kcol
+        let kc = match q.kind.as_str() {
+            "retry" => Color::Yellow,
+            "rebuild" => Color::Cyan,
+            _ => Color::Green,
+        };
+        let segs = vec![
+            (format!("  {:<8} ", q.kind), kc),
+            (q.slug.clone(), Color::Grey),
+        ];
+        put_segments(scr, row, 1, &segs, i == sel);
         row += 1;
     }
 }
@@ -602,12 +624,7 @@ fn cohort_segments(co: &crate::model::CohortView) -> Vec<(String, Color)> {
 }
 
 fn render_cohorts(scr: &mut Screen, snap: &Snapshot, top: u16, avail: u16, w: u16, sel: usize) {
-    // section header (reverse-video, dash-filled) like the Python focused section
-    let mut hdr = format!(" ▼ Dependency cohorts  (● = venv cached on disk, reused next run) ({}) ", snap.cohorts.len());
-    while hdr.chars().count() < (w as usize).saturating_sub(1) {
-        hdr.push('-');
-    }
-    put_rev(scr, top, 0, &hdr, Color::White, true);
+    section_header(scr, top, "Dependency cohorts  (● = venv cached on disk, reused next run)", snap.cohorts.len(), w);
     let mut row = top + 1;
     let view = (avail as usize).saturating_sub(1);
     let start = scroll_start(sel, view, snap.cohorts.len());
@@ -618,40 +635,35 @@ fn render_cohorts(scr: &mut Screen, snap: &Snapshot, top: u16, avail: u16, w: u1
 }
 
 fn render_built(scr: &mut Screen, snap: &Snapshot, top: u16, avail: u16, w: u16, sel: usize) {
-    put(
-        scr,
-        top,
-        0,
-        &format!(" Built — successes ({})  slug · compiler · builder · size", snap.built_recent.len()),
-        Color::Green,
-        w,
-    );
+    section_header(scr, top, "Built — successes  (slug · compiler+version · size · vs-shipped)", snap.built_recent.len(), w);
     let mut row = top + 1;
-    let start = scroll_start(sel, avail as usize - 1, snap.built_recent.len());
-    for (i, b) in snap.built_recent.iter().enumerate().skip(start).take(avail as usize - 1) {
-        let color = if i == sel { Color::Yellow } else { Color::Green };
-        let prov = prov_str(&b.compiler_version, &b.backend, &b.builder_version);
-        let marker = if i == sel { "▸ " } else { "  " };
-        put(
-            scr,
-            row,
-            0,
-            &format!("{}{:<30} {:<34} {}", marker, b.slug, prov, human(b.bytes)),
-            color,
-            w,
-        );
+    let view = (avail as usize).saturating_sub(1);
+    let start = scroll_start(sel, view, snap.built_recent.len());
+    for (i, b) in snap.built_recent.iter().enumerate().skip(start).take(view) {
+        // slug (green) · compiler+version (cyan) · size + vs-shipped (plain) — mirrors the Python fmt
+        let comp = if !b.compiler_version.is_empty() { b.compiler_version.clone() } else { b.backend.clone() };
+        let segs = vec![
+            (format!("{:<32} ", head(&b.slug, 32)), Color::Green),
+            (format!("{:<26} ", head(&comp, 26)), Color::Cyan),
+            (format!("{:>9}  {}", human(b.bytes), b.compare), Color::Grey),
+        ];
+        put_segments(scr, row, 1, &segs, i == sel);
         row += 1;
     }
 }
 
 fn render_failures(scr: &mut Screen, snap: &Snapshot, top: u16, avail: u16, w: u16, sel: usize) {
-    put(scr, top, 0, &format!(" Failures ({})", snap.failures_recent.len()), Color::Red, w);
+    section_header(scr, top, "Failures — newest first (current)", snap.failures_recent.len(), w);
     let mut row = top + 1;
-    let start = scroll_start(sel, avail as usize - 1, snap.failures_recent.len());
-    for (i, f) in snap.failures_recent.iter().enumerate().skip(start).take(avail as usize - 1) {
-        let color = if i == sel { Color::Yellow } else { Color::Grey };
-        let marker = if i == sel { "▸ " } else { "  " };
-        put(scr, row, 0, &format!("{}{:<32} {}", marker, f.slug, f.error), color, w);
+    let view = (avail as usize).saturating_sub(1);
+    let start = scroll_start(sel, view, snap.failures_recent.len());
+    for (i, f) in snap.failures_recent.iter().enumerate().skip(start).take(view) {
+        // family slug (red) + error (dim red) so the slug reads clearly — mirrors the Python fmt
+        let segs = vec![
+            (format!("{:<34} ", f.slug), Color::Red),
+            (f.error.clone(), Color::DarkRed),
+        ];
+        put_segments(scr, row, 1, &segs, i == sel);
         row += 1;
     }
 }
@@ -799,28 +811,72 @@ fn render_config(scr: &mut Screen, snap: &Snapshot, sel: usize, top: u16, w: u16
     }
 }
 
-fn status_panel(snap: &Snapshot, ui: &Ui) -> String {
+/// Per-field help text for the config tab status panel — mirrors the Python FIELD_HELP map.
+fn field_help(key: &str) -> &str {
+    match key {
+        "jobs" => "how many families build in parallel",
+        "percent" => "build only this % of the library (evenly-spaced sample); raise it live to build more",
+        "backend" => "auto = fontc first then fall back to fontmake · fontc/fontmake = that one · both = build & compare",
+        "compare" => "sha256-compare each built font to the shipped one (metadata source only)",
+        "paused" => "pause / resume the worker pool",
+        _ => "edit with ←/→ or type",
+    }
+}
+
+/// A short, context-sensitive description of the focused item for the always-on status panel —
+/// a faithful port of the Python `_focus_info` (returns 1-3 lines, keyed on the current tab/item).
+fn focus_info(snap: &Snapshot, ui: &Ui) -> Vec<String> {
+    let sel = ui.sel;
     match TABS[ui.tab] {
-        "failures" => snap
-            .failures_recent
-            .get(ui.sel)
-            .map(|f| format!(" {}  FAILED [{}]: {}", f.slug, prov_str(&f.compiler_version, &f.backend, &f.builder_version), f.error))
-            .unwrap_or_else(|| " no failures".into()),
-        "built" => snap
-            .built_recent
-            .get(ui.sel)
-            .map(|b| format!(" {} ✓ built with {} — {}", b.slug, prov_str(&b.compiler_version, &b.backend, &b.builder_version), human(b.bytes)))
-            .unwrap_or_else(|| " nothing built yet".into()),
-        _ => {
-            if snap.done {
-                format!(
-                    " done — built {} · failed {} · skipped {} of {}",
-                    snap.counts.built, snap.counts.failed, snap.counts.skipped, snap.total
-                )
-            } else {
-                format!(" building — {} queued, {} in flight", snap.counts.queued, snap.counts.building)
-            }
+        "config" => {
+            let f = CONFIG_FIELDS.get(sel).copied().unwrap_or("");
+            vec![format!(" {} — {}", f, field_help(f))]
         }
+        "overview" => snap.building.get(sel).map(|b| {
+            let step = if !b.note.is_empty() { &b.note } else if !b.backend.is_empty() { &b.backend } else { "starting" };
+            vec![format!(" building {} — step '{}'  (worker {}, {})", b.slug, step, b.worker, hms(b.dur))]
+        }).unwrap_or_default(),
+        "queue" => snap.queued_list.get(sel).map(|q| {
+            let why = match q.kind.as_str() {
+                "retry" => "re-attempt after a previous build failure",
+                "rebuild" => "rebuild of a family that already built (--rebuild / [R])",
+                _ => "a fresh target — never built before",
+            };
+            vec![format!(" queued: {}  —  {}", q.slug, q.kind), format!("   {}", why)]
+        }).unwrap_or_default(),
+        "cohorts" => snap.cohorts.get(sel).map(|c| {
+            let l1 = match c.requirements.lines().next() {
+                Some(r) => format!(" cohort {}: {} families — needs {}", c.key, c.count, r),
+                None => format!(" cohort {}: {} families (base — no extra requirements)", c.key, c.count),
+            };
+            let l2 = if c.families.is_empty() { "   (none assigned yet)".to_string() } else { format!("   {}", c.families.join(" | ")) };
+            vec![l1, l2]
+        }).unwrap_or_default(),
+        "archive" => snap.archive.pending.get(sel).map(|r| {
+            vec![format!(" + {} — queued to be mirrored into the archive (a fresh bare clone)", r)]
+        }).unwrap_or_default(),
+        "built" => snap.built_recent.get(sel).map(|b| {
+            let pv = prov_str(&b.compiler_version, &b.backend, &b.builder_version);
+            let pv = if pv.is_empty() { "?".to_string() } else { pv };
+            vec![format!(" {} ✓ built with {} — {}, vs shipped: {}", b.slug, pv, human(b.bytes),
+                if b.compare.is_empty() { "not compared" } else { &b.compare })]
+        }).unwrap_or_default(),
+        "failures" => snap.failures_recent.get(sel).map(|f| {
+            let pv = prov_str(&f.compiler_version, &f.backend, &f.builder_version);
+            let head = if pv.is_empty() { format!(" {}  FAILED:", f.slug) } else { format!(" {}  FAILED [{}]:", f.slug, pv) };
+            vec![head, format!("   {}", f.error)]
+        }).unwrap_or_default(),
+        "stats" => snap.fail_categories.get(sel).map(|fc| {
+            let l1 = format!(" {} families failed: {}", fc.count, fc.cat);
+            if fc.families.is_empty() {
+                vec![l1, format!("   → {}", fc.hint)]
+            } else {
+                let shown: Vec<&str> = fc.families.iter().take(6).map(|s| s.as_str()).collect();
+                let more = if fc.families.len() > 6 { " …" } else { "" };
+                vec![l1, format!("   {}{}", shown.join(", "), more), format!("   → {}", fc.hint)]
+            }
+        }).unwrap_or_default(),
+        _ => vec![],
     }
 }
 
