@@ -860,6 +860,38 @@ def relax_requirements(lines: List[str], relax: set) -> List[str]:
     return out
 
 
+# Forced version overrides applied UP FRONT to every cohort (unlike auto-relaxation, which only
+# fires after a pip failure). For packages whose upstream-pinned version simply cannot build in our
+# environment, the override replaces the pinned line wholesale (dropping any extras). Each is the
+# result of root-causing real build failures from the 22h full-library run — see the failure
+# assessment (compreffor accounts for ~110 of the failures, all at venv-setup before any font built).
+PIN_OVERRIDES = {
+    # compreffor <0.5.6 has no cp313 wheel; its sdist imports pkg_resources inside pip's isolated
+    # PEP-517 build overlay (where modern setuptools no longer provides it) and dies before any font
+    # is compiled. 0.5.6+ ships a prebuilt cp313 wheel, so no source build is attempted.
+    "compreffor": "compreffor>=0.5.6",
+    # fontbakery[googlefonts] / gftools[qa] pull a nonexistent extra that sends pip into endless
+    # backtracking ("resolution too deep"). fontbakery is QA-only (not needed to BUILD a font), so we
+    # drop the extra + pin and let pip pick a recent wheel.
+    "fontbakery": "fontbakery",
+}
+
+
+def apply_pin_overrides(lines: List[str]):
+    """Rewrite any requirement whose package is in PIN_OVERRIDES to the override spec. Returns
+    (lines, applied_packages) so the override can be recorded once for the UI/log."""
+    out, applied = [], []
+    for ln in lines:
+        pkg = _req_pkg_name(ln)
+        if pkg and pkg in PIN_OVERRIDES:
+            out.append(f"{PIN_OVERRIDES[pkg]}    # gflib-build: forced ({pkg}'s pinned version "
+                       f"cannot build in this environment)")
+            applied.append(pkg)
+        else:
+            out.append(ln)
+    return out, applied
+
+
 class VenvManager:
     """Create and reuse one venv per distinct dependency cohort.
 
@@ -878,6 +910,7 @@ class VenvManager:
         self._locks: Dict[str, threading.Lock] = {}
         self._ready: Dict[str, str] = {}
         self._relaxed: set = set()               # base pins auto-relaxed once, shared by cohorts
+        self._override_recorded: set = set()     # forced pin overrides already logged (record once)
         self.relaxations: List[str] = []         # human-readable record (surfaced to the UI)
 
     def cohort_key(self, req_text: str) -> str:
@@ -935,7 +968,14 @@ class VenvManager:
         if not any(_req_pkg_name(l) for l in requested):
             return "", ("no build requirements — the toolchain (gftools/fontmake/…) would be missing; "
                         "manage-venvs needs a base requirements file")
-        want_hash = hashlib.sha256("\n".join(requested).encode()).hexdigest()[:16]
+        # Fold any active pin override into the readiness hash, so a cohort whose pinned package we
+        # now force-override rebuilds, while cohorts with no overridden package keep their old hash
+        # (their good venv is still reused — no needless full rebuild).
+        _ov = sorted(p for p in {_req_pkg_name(l) for l in requested} if p in PIN_OVERRIDES)
+        _key_text = "\n".join(requested)
+        if _ov:
+            _key_text += "|ov:" + ",".join(f"{p}={PIN_OVERRIDES[p]}" for p in _ov)
+        want_hash = hashlib.sha256(_key_text.encode()).hexdigest()[:16]
 
         # Reuse only a venv whose marker matches THESE requirements (so an empty/stale/different
         # install — e.g. one built under a wrong base_requirements path — is rebuilt, not reused).
@@ -956,13 +996,22 @@ class VenvManager:
 
         base_pkgs = {_req_pkg_name(l) for l in base_lines} - {""}
         eff_path = vdir / "effective-requirements.txt"
+        # Forced pin overrides applied up front (compreffor/fontbakery — see PIN_OVERRIDES): these
+        # pinned versions can't build here, so no amount of retrying the original pin would help.
+        src_lines, overridden = apply_pin_overrides(base_lines + cohort_lines)
+        with self._global:
+            for p in sorted(set(overridden)):
+                if p not in self._override_recorded:   # record each override once, for the UI/log
+                    self._override_recorded.add(p)
+                    self.relaxations.append(f"forced pin override: {p} → {PIN_OVERRIDES[p]} "
+                                            f"(upstream pin can't build here)")
         with self._global:
             relax = set(self._relaxed)            # start from base pins already known-broken
         conflict_relax = set()                    # cohort-local (don't poison the shared base pins)
         # SELF-HEALING install: drop a pin pip can't satisfy (stale/dev pin absent from PyPI) OR a
         # base pin a cohort's own dep conflicts with (ResolutionImpossible), then retry.
         for attempt in range(8):
-            eff = relax_requirements(base_lines + cohort_lines, relax)
+            eff = relax_requirements(src_lines, relax)
             eff_path.write_text("\n".join(eff) + "\n")
             install = [str(py), "-m", "pip", "install", "--disable-pip-version-check",
                        "--cache-dir", str(self.pip_cache), "-r", str(eff_path)]
@@ -1128,8 +1177,21 @@ def collect_outputs(work: Path, out_dir: Path, shipped: List[str], since: float 
     want = set(shipped)
     cutoff = (since - 30) if since else 0.0       # generous slack; committed fonts are months older
     seen = set()
-    for f in sorted(set(work.rglob("*.ttf")) | set(work.rglob("*.otf"))
-                    | set(work.rglob("*.TTF")) | set(work.rglob("*.OTF"))):
+    # Also scan the stray `../fonts` dir: a google/fonts OVERRIDE config.yaml expects to run from the
+    # repo's sources/ dir and writes to `../fonts`, so when staged at the work root the builder emits
+    # to work.parent/fonts — OUTSIDE the per-family work tree, where the recursive scan below misses
+    # it (the fonts build fine but were reported "produced no expected font files"). The fresh-mtime +
+    # shipped-name filters keep this safe under parallelism: only THIS family's freshly-built,
+    # name-matching fonts are collected from the shared dir.
+    search_roots = [work]
+    stray = work.parent / "fonts"
+    if stray.is_dir():
+        search_roots.append(stray)
+    candidates = set()
+    for root in search_roots:
+        for ext in ("*.ttf", "*.otf", "*.TTF", "*.OTF"):
+            candidates |= set(root.rglob(ext))
+    for f in sorted(candidates):
         try:
             if not f.is_file():
                 continue
