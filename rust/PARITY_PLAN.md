@@ -56,8 +56,11 @@ This is the backbone — each item is "done" only when the harness diff shrinks.
 - Round-trip the extra `Res` fields (`config_used`, `fontc_ok`/`fontmake_ok`/`vs`, `retries`).
 - **Accept:** monitor-parity green; resume keeps the cumulative clock + full cohort/timing/cause views.
 
-### R2 — Cohort venv management (build-correctness core) · XL · highest value & risk
-*The reason the dependency-heavy failures exist; see the strategic note in §4 first.*
+### R2 — Cohort venv management (build-correctness core) · XL · ✅ CORE DONE
+*Implemented in `src/venv.rs` + wired into the orchestrator. `cohort_key`/marker hashes are
+byte-identical to the Python tool (verified), so the Rust port **reuses the existing `venvs/`** rather
+than rebuilding 172 of them. Remaining polish: surface relaxations in the TUI config tab; expose
+`--cohorts-report`; verify a full create-from-empty venv install end-to-end on a non-live build dir.*
 Port `VenvManager` (863–1010) + `scan_cohorts` + `relax_requirements`:
 - hash-keyed `cohort_key`; `venvs/<key>/` shared venvs; shared `pip-cache/`.
 - per-cohort install **lock** (install once under full parallelism); `ensure_base` up front.

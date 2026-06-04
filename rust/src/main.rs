@@ -15,6 +15,7 @@ mod persist;
 mod provenance;
 mod tui;
 mod util;
+mod venv;
 mod web;
 
 use config::Mode;

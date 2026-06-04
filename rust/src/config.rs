@@ -18,6 +18,8 @@ pub struct Config {
     pub fontc_bin: Option<String>,
     pub builder3_bin: Option<String>,
     pub build_python: String,
+    pub base_python: String,            // interpreter used to CREATE cohort venvs
+    pub base_requirements: Option<PathBuf>, // pinned base toolchain (gftools/fontmake/…)
     pub manage_venvs: bool,
     pub jobs: usize,
     pub timeout: Option<u64>,
@@ -50,6 +52,8 @@ impl Default for Config {
             fontc_bin: None,
             builder3_bin: None,
             build_python: "python3".into(),
+            base_python: "python3".into(),
+            base_requirements: None,
             manage_venvs: false,
             jobs: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
             timeout: None,
@@ -142,6 +146,8 @@ pub fn parse(args: &[String]) -> Parsed {
             "--fontc-bin" => cfg.fontc_bin = Some(next(&mut i, a)),
             "--builder3-bin" => cfg.builder3_bin = Some(next(&mut i, a)),
             "--build-python" => cfg.build_python = next(&mut i, a),
+            "--base-python" => cfg.base_python = next(&mut i, a),
+            "--base-requirements" => cfg.base_requirements = Some(PathBuf::from(next(&mut i, a))),
             "--manage-venvs" => cfg.manage_venvs = true,
             "--no-manage-venvs" => cfg.manage_venvs = false,
             "--jobs" => cfg.jobs = next(&mut i, a).parse().unwrap_or(cfg.jobs).max(1),

@@ -10,7 +10,8 @@ use crate::config::{config_map, Config};
 use crate::model::*;
 use crate::provenance::{builder_version_str, compiler_version_str};
 use crate::util::{dir_size, free_bytes, now, slug_to_logname};
-use crate::{discover, persist};
+use crate::venv::VenvManager;
+use crate::{discover, persist, venv};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -67,6 +68,7 @@ pub struct Orchestrator {
     pub resumed_elapsed: f64,
     pub active: AtomicUsize,
     pub spawned: Mutex<usize>,
+    pub venvs: Option<VenvManager>, // cohort venv manager (R2); None unless --manage-venvs
 }
 
 impl Orchestrator {
@@ -178,6 +180,11 @@ impl Orchestrator {
             cohort_reqs: state.cohort_reqs,
             cached_cohorts: HashSet::new(),
         };
+        let venvs = if cfg.manage_venvs {
+            Some(VenvManager::new(&cfg.build_dir, &cfg.base_python, cfg.base_requirements.clone()))
+        } else {
+            None
+        };
         Arc::new(Orchestrator {
             cfg,
             shared: Arc::new(Mutex::new(shared)),
@@ -187,6 +194,7 @@ impl Orchestrator {
             resumed_elapsed: state.elapsed_so_far, // cumulative clock survives restart/migration (R1)
             active: AtomicUsize::new(0),
             spawned: Mutex::new(0),
+            venvs,
         })
     }
 
@@ -194,6 +202,20 @@ impl Orchestrator {
     pub fn start(self: &Arc<Self>) {
         let _ = std::fs::create_dir_all(&self.cfg.build_dir);
         let _ = std::fs::create_dir_all(self.cfg.build_dir.join("logs"));
+        // Build the base cohort venv up front (on a background thread so it doesn't block startup) —
+        // avoids a stampede where every base-cohort worker tries to create it at once. Workers that
+        // reach a base-cohort family before it's ready just wait on the per-cohort lock (correct).
+        if self.venvs.is_some() {
+            let me = Arc::clone(self);
+            thread::spawn(move || {
+                if let Some(v) = &me.venvs {
+                    if let Err(e) = v.ensure_base() {
+                        let mut sh = me.shared.lock().unwrap();
+                        sh.control_log.push(format!("base venv: {}", e));
+                    }
+                }
+            });
+        }
         let jobs = self.shared.lock().unwrap().jobs;
         self.ensure_workers(jobs);
         self.spawn_status_writer();
@@ -256,16 +278,17 @@ impl Orchestrator {
         }
     }
 
-    /// Cached exact compiler version (run once per backend/venv).
-    fn compiler_version(&self, backend: &str) -> String {
-        let key = (backend.to_string(), self.cfg.build_python.clone());
+    /// Cached exact compiler version (run once per backend/venv — the cohort python matters because
+    /// different cohorts can carry different fontmake/gftools versions).
+    fn compiler_version(&self, backend: &str, python: &str) -> String {
+        let key = (backend.to_string(), python.to_string());
         {
             let sh = self.shared.lock().unwrap();
             if let Some(v) = sh.cver_cache.get(&key) {
                 return v.clone();
             }
         }
-        let v = compiler_version_str(backend, &self.cfg.build_python, self.cfg.fontc_bin.as_deref());
+        let v = compiler_version_str(backend, python, self.cfg.fontc_bin.as_deref());
         let mut sh = self.shared.lock().unwrap();
         sh.cver_cache.entry(key).or_insert_with(|| v.clone());
         v
@@ -280,18 +303,29 @@ impl Orchestrator {
     }
 
     /// Cached exact orchestrator version (run once per builder/venv).
-    fn builder_version(&self, builder: &str) -> String {
-        let key = (builder.to_string(), self.cfg.build_python.clone());
+    fn builder_version(&self, builder: &str, python: &str) -> String {
+        let key = (builder.to_string(), python.to_string());
         {
             let sh = self.shared.lock().unwrap();
             if let Some(v) = sh.bver_cache.get(&key) {
                 return v.clone();
             }
         }
-        let v = builder_version_str(builder, &self.cfg.build_python, self.cfg.builder3_bin.as_deref());
+        let v = builder_version_str(builder, python, self.cfg.builder3_bin.as_deref());
         let mut sh = self.shared.lock().unwrap();
         sh.bver_cache.entry(key).or_insert_with(|| v.clone());
         v
+    }
+
+    /// Record a family's cohort assignment into the live cohort map (R2 — populates the cohorts view).
+    fn note_cohort(&self, slug: &str, cohort: &str, req_text: &str) {
+        let mut sh = self.shared.lock().unwrap();
+        let members = sh.cohort_members.entry(cohort.to_string()).or_default();
+        if !members.iter().any(|m| m == slug) {
+            members.push(slug.to_string());
+            members.sort();
+        }
+        sh.cohort_reqs.entry(cohort.to_string()).or_insert_with(|| req_text.to_string());
     }
 
     fn backend_order(&self) -> Vec<String> {
@@ -332,9 +366,34 @@ impl Orchestrator {
             return;
         }
 
+        // Cohort venv (R2): read the family's requirements read-only from the mirror, create/reuse the
+        // shared cohort venv, and build with ITS python. A venv failure (broken deps) fails the family
+        // with the cohort error (self-heal will rebuild it on the next start). Without --manage-venvs,
+        // every family builds with the single --build-python.
+        let python = if let Some(v) = &self.venvs {
+            let req = venv::read_requirements_from_mirror(&mirror, &fam.commit);
+            self.set_result(slug, |r| r.note = "installing deps".into());
+            let (py, cohort, verr) = v.get_python(&req, |_k| {});
+            if !verr.is_empty() {
+                let msg = format!("venv: {}", verr);
+                let (cause, _) = crate::classify::categorize_failure(&msg);
+                self.fail(slug, cause, &msg);
+                cleanup(&work, self.cfg.keep_work);
+                return;
+            }
+            self.note_cohort(slug, &cohort, &req);
+            self.set_result(slug, |r| {
+                r.cohort = cohort.clone();
+                r.note = String::new();
+            });
+            py
+        } else {
+            self.cfg.build_python.clone()
+        };
+
         let order = self.backend_order();
         let builder = self.builder_name();
-        let bver = self.builder_version(&builder);
+        let bver = self.builder_version(&builder, &python);
         let mut last_err = String::new();
         let mut fontc_err = String::new();
         let mut built_any = false;
@@ -354,7 +413,7 @@ impl Orchestrator {
                     break; // no config -> trying another backend won't help
                 }
             };
-            let cver = self.compiler_version(backend);
+            let cver = self.compiler_version(backend, &python);
             self.set_result(slug, |r| {
                 r.backend = backend.clone();
                 r.compiler_version = cver.clone();
@@ -368,7 +427,7 @@ impl Orchestrator {
             ));
             let t0 = now();
             let run = run_builder(
-                &self.cfg.build_python,
+                &python,
                 &cfg_path,
                 &work,
                 &log_path,
@@ -806,7 +865,11 @@ impl Orchestrator {
             built_recent: built,
             queued_list,
             fail_categories,
-            cohorts_ready: cohorts_out.iter().filter(|c| c.cached).count(),
+            cohorts_ready: self
+                .venvs
+                .as_ref()
+                .map(|v| v.ready_count())
+                .unwrap_or_else(|| cohorts_out.iter().filter(|c| c.cached).count()),
             cohorts: cohorts_out,
             phase: sh.phase.clone(),
             phase_total: sh.library_total,
@@ -822,6 +885,7 @@ impl Orchestrator {
             archive,
             config: config_map(&self.cfg),
             control_log: sh.control_log.clone(),
+            dep_relaxations: self.venvs.as_ref().map(|v| v.relaxations()).unwrap_or_default(),
             config_path: self.cfg.data_dir.join("gflib-build.config").to_string_lossy().to_string(),
             done: sh.done,
             daemon_alive: true,

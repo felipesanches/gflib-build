@@ -213,6 +213,7 @@ pub struct Snapshot {
     #[serde(default)] pub archive: ArchiveView,
     #[serde(default)] pub config: BTreeMap<String, serde_json::Value>,
     #[serde(default)] pub control_log: Vec<String>,
+    #[serde(default)] pub dep_relaxations: Vec<String>, // auto-relaxed pins / forced overrides (R2)
     #[serde(default)] pub config_path: String,
     #[serde(default)] pub done: bool,
     #[serde(default)] pub daemon_alive: bool,
