@@ -99,7 +99,8 @@ impl Orchestrator {
         let prior = persist::read_state(&cfg.build_dir);
         let mut results = BTreeMap::new();
         let mut families = BTreeMap::new();
-        let mut queue = VecDeque::new();
+        // (slug, prior_duration) for queued families — sorted longest-first below to shrink the tail
+        let mut queued_with_dur: Vec<(String, f64)> = Vec::new();
         for f in fams {
             let slug = f.slug.clone();
             families.insert(slug.clone(), f);
@@ -120,6 +121,10 @@ impl Orchestrator {
                 }
                 _ => ("queued", "new"),
             };
+            let prior_dur = prev
+                .map(|p| (p.ended - p.started).max(0.0))
+                .filter(|d| *d > 0.0)
+                .unwrap_or(0.0);
             let mut r = prev.cloned().unwrap_or_else(|| Res {
                 slug: slug.clone(),
                 ..Default::default()
@@ -128,10 +133,13 @@ impl Orchestrator {
             r.status = status.into();
             if status == "queued" {
                 r.queued_kind = if cfg.rebuild { "rebuild".into() } else { kind.into() };
-                queue.push_back(slug.clone());
+                queued_with_dur.push((slug.clone(), prior_dur));
             }
             results.insert(slug, r);
         }
+        // longest-first: families with a known long prior build go first; never-built (dur 0) last
+        queued_with_dur.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let queue: VecDeque<String> = queued_with_dur.into_iter().map(|(s, _)| s).collect();
 
         let failure_history = persist::read_failure_history(&cfg.build_dir);
         let jobs = cfg.jobs.clamp(1, MAX_JOBS);
@@ -383,6 +391,16 @@ impl Orchestrator {
                 .iter()
                 .filter(|f| !found.contains_key(*f))
                 .count();
+            // optional sha256 vs-shipped comparison (metadata mode, --compare): the Rust-migration
+            // signal — did this backend reproduce exactly what GF ships?
+            let cmp = if self.cfg.compare {
+                match &self.cfg.google_fonts {
+                    Some(gf) => compare_to_shipped(gf, &fam, &found),
+                    None => String::new(),
+                }
+            } else {
+                String::new()
+            };
             let used = backend.clone();
             self.set_result(slug, |r| {
                 r.status = "built".into();
@@ -390,6 +408,7 @@ impl Orchestrator {
                 r.out_bytes = bytes;
                 r.out_missing = missing;
                 r.backend = used.clone();
+                r.compare = cmp.clone();
                 r.note = String::new();
             });
             log_line(&log_path, &format!(
@@ -1047,6 +1066,52 @@ fn cleanup(work: &Path, keep: bool) {
     }
 }
 
+/// sha256 of a file via `sha256sum` (coreutils — dependency-free). None on failure.
+fn sha256_file(path: &Path) -> Option<String> {
+    let out = std::process::Command::new("sha256sum").arg(path).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(|s| s.to_string())
+}
+
+/// Compare built fonts to the binaries GF ships (in the family dir): identical / differ / missing.
+/// Ported from the Python `compare_to_shipped`.
+fn compare_to_shipped(google_fonts: &Path, fam: &Family, built: &BTreeMap<String, PathBuf>) -> String {
+    if fam.shipped_fonts.is_empty() {
+        return String::new();
+    }
+    let fam_dir = google_fonts.join(&fam.slug);
+    let mut all_identical = true;
+    let mut any_present = false;
+    for fname in &fam.shipped_fonts {
+        let refp = fam_dir.join(fname);
+        if !refp.is_file() {
+            continue;
+        }
+        let b = match built.get(fname) {
+            Some(b) => b,
+            None => return "missing".into(),
+        };
+        any_present = true;
+        if sha256_file(&refp) != sha256_file(b) {
+            all_identical = false;
+        }
+    }
+    if any_present {
+        if all_identical {
+            "identical".into()
+        } else {
+            "differ".into()
+        }
+    } else {
+        "missing".into()
+    }
+}
+
 /// Count repos in the whole archive on disk ({owner}/{repo}.git).
 fn count_archive(archive: &Path) -> usize {
     let mut n = 0;
@@ -1130,5 +1195,40 @@ mod tests {
         assert_eq!(classify("no config.yaml found"), "no build config");
         assert_eq!(classify("fontc: produced no expected font files"), "no output produced");
         assert_eq!(classify("kaboom"), "build error");
+    }
+}
+
+#[cfg(test)]
+mod compare_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    #[test]
+    fn compare_identical_differ_missing() {
+        let root = std::env::temp_dir().join(format!("_cmp_{}", std::process::id()));
+        let gf = root.join("gf");
+        let slug = "ofl/x";
+        let fam_dir = gf.join(slug);
+        std::fs::create_dir_all(&fam_dir).unwrap();
+        std::fs::write(fam_dir.join("X.ttf"), b"FONTDATA").unwrap();
+        let fam = Family { slug: slug.into(), shipped_fonts: vec!["X.ttf".into()], ..Default::default() };
+
+        // identical: built byte-for-byte equal to shipped
+        let bdir = root.join("built");
+        std::fs::create_dir_all(&bdir).unwrap();
+        let bp = bdir.join("X.ttf");
+        std::fs::write(&bp, b"FONTDATA").unwrap();
+        let mut built = BTreeMap::new();
+        built.insert("X.ttf".to_string(), bp.clone());
+        assert_eq!(compare_to_shipped(&gf, &fam, &built), "identical");
+
+        // differ: built differs
+        std::fs::write(&bp, b"OTHERDATA").unwrap();
+        assert_eq!(compare_to_shipped(&gf, &fam, &built), "differ");
+
+        // missing: built lacks a shipped font
+        let empty: BTreeMap<String, PathBuf> = BTreeMap::new();
+        assert_eq!(compare_to_shipped(&gf, &fam, &empty), "missing");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
