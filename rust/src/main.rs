@@ -146,6 +146,7 @@ fn run_build(mut cfg: config::Config) {
         _ => run_plain(&source),
     }
 
+    orch.finalize(); // synchronous final status + migration.json + timings.json before we exit
     orch.request_stop();
     persist::clear_pid(&cfg.build_dir);
 }

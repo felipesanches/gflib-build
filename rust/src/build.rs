@@ -57,6 +57,7 @@ pub struct Shared {
     pub cohort_members: BTreeMap<String, Vec<String>>,
     pub cohort_reqs: BTreeMap<String, String>,
     pub cached_cohorts: HashSet<String>, // cohorts with a venv on disk (off-thread; for the 'cached' flag)
+    pub op_stats: HashMap<String, (f64, usize, f64)>, // op -> (total_secs, count, max) for timings.json
 }
 
 pub struct Orchestrator {
@@ -183,6 +184,7 @@ impl Orchestrator {
             cohort_members: state.cohort_members,
             cohort_reqs: state.cohort_reqs,
             cached_cohorts: HashSet::new(),
+            op_stats: HashMap::new(),
         };
         let venvs = if cfg.manage_venvs {
             Some(VenvManager::new(&cfg.build_dir, &cfg.base_python, cfg.base_requirements.clone()))
@@ -342,6 +344,23 @@ impl Orchestrator {
         persist::append_event(&self.cfg.build_dir, &ev);
     }
 
+    /// Build timings.json ({elapsed, operations, families}) — per-op timing for bottleneck analysis.
+    fn timings_json(&self) -> serde_json::Value {
+        let snap = self.snapshot();
+        let sh = self.shared.lock().unwrap();
+        let families: BTreeMap<&String, &BTreeMap<String, f64>> = sh
+            .results
+            .iter()
+            .filter(|(_, r)| !r.timings.is_empty())
+            .map(|(s, r)| (s, &r.timings))
+            .collect();
+        serde_json::json!({
+            "elapsed": (snap.elapsed * 10.0).round() / 10.0,
+            "operations": snap.op_stats,
+            "families": families,
+        })
+    }
+
     /// Build the Python-format migration.json (fontc / fontmake-fallback blockers / both-agreement).
     fn migration_json(&self) -> serde_json::Value {
         let sh = self.shared.lock().unwrap();
@@ -437,6 +456,27 @@ impl Orchestrator {
         self.emit("built", slug, serde_json::json!({"backend":"both","bytes":bytes,"vs":vs}));
     }
 
+    /// Record an operation's duration (bottleneck timing): updates the global op aggregate and the
+    /// family's per-op timings (→ timings.json + the stats tab). Returns the elapsed for logging.
+    fn record_op(&self, slug: &str, op: &str, dt: f64) {
+        let mut sh = self.shared.lock().unwrap();
+        let e = sh.op_stats.entry(op.to_string()).or_insert((0.0, 0, 0.0));
+        e.0 += dt;
+        e.1 += 1;
+        e.2 = e.2.max(dt);
+        if let Some(r) = sh.results.get_mut(slug) {
+            *r.timings.entry(op.to_string()).or_insert(0.0) += dt;
+        }
+    }
+
+    /// Time a closure and record it as `op` for `slug`.
+    fn timed<T, F: FnOnce() -> T>(&self, slug: &str, op: &str, f: F) -> T {
+        let t0 = std::time::Instant::now();
+        let r = f();
+        self.record_op(slug, op, t0.elapsed().as_secs_f64());
+        r
+    }
+
     /// Record a family's cohort assignment into the live cohort map (R2 — populates the cohorts view).
     fn note_cohort(&self, slug: &str, cohort: &str, req_text: &str) {
         let mut sh = self.shared.lock().unwrap();
@@ -516,7 +556,7 @@ impl Orchestrator {
         let python = if let Some(v) = &self.venvs {
             let req = venv::read_requirements_from_mirror(&mirror, &fam.commit);
             self.set_result(slug, |r| r.note = "installing deps".into());
-            let (py, cohort, verr) = v.get_python(&req, |_k| {});
+            let (py, cohort, verr) = self.timed(slug, "venv", || v.get_python(&req, |_k| {}));
             if !verr.is_empty() {
                 let msg = format!("venv: {}", verr);
                 let (cause, _) = crate::classify::categorize_failure(&msg);
@@ -553,7 +593,7 @@ impl Orchestrator {
         for (i, backend) in order.iter().enumerate() {
             // fresh extraction for each backend attempt (a previous attempt may have dirtied work/)
             self.set_result(slug, |r| r.note = "checkout".into());
-            if let Err(e) = extract_tree(&mirror, &fam.commit, &work, EXTRACT_TIMEOUT, &log_path) {
+            if let Err(e) = self.timed(slug, "extract", || extract_tree(&mirror, &fam.commit, &work, EXTRACT_TIMEOUT, &log_path)) {
                 last_err = e;
                 continue;
             }
@@ -570,7 +610,7 @@ impl Orchestrator {
                 self.set_result(slug, |r| r.note = String::new());
             }
             preclean_outputs(&work);
-            let (cfg_path, label) = match resolve_config(self.cfg.google_fonts.as_deref(), &fam, &work) {
+            let (cfg_path, label) = match self.timed(slug, "config", || resolve_config(self.cfg.google_fonts.as_deref(), &fam, &work)) {
                 Ok(v) => v,
                 Err(e) => {
                     last_err = e;
@@ -590,7 +630,7 @@ impl Orchestrator {
                 backend, backend, cver, bver, label, builder
             ));
             let t0 = now();
-            let run = run_builder(
+            let run = self.timed(slug, "build", || run_builder(
                 &python,
                 &cfg_path,
                 &work,
@@ -599,7 +639,7 @@ impl Orchestrator {
                 backend,
                 self.cfg.fontc_bin.as_deref(),
                 self.cfg.builder3_bin.as_deref(),
-            );
+            ));
             if let Err(e) = run {
                 last_err = format!("{}: {}", backend, e);
                 if backend == "fontc" {
@@ -608,7 +648,7 @@ impl Orchestrator {
                 continue;
             }
             // collect only fonts written during THIS build (mtime gate), recursively
-            let (bytes, found, extras) = collect_outputs(&work, &out_dir, &fam.shipped_fonts, t0);
+            let (bytes, found, extras) = self.timed(slug, "collect", || collect_outputs(&work, &out_dir, &fam.shipped_fonts, t0));
             if !fam.shipped_fonts.is_empty() && found.is_empty() {
                 last_err = if extras.is_empty() {
                     format!("{}: produced no expected font files", backend)
@@ -857,8 +897,9 @@ impl Orchestrator {
                 let snap = me.snapshot();
                 persist::write_status(&me.cfg.build_dir, &snap);
                 if tick % 10 == 0 {
-                    // derived report consumed by the dashboard (refreshed every ~10 s, not every tick)
+                    // derived reports consumed by the dashboard (refreshed every ~10 s, not every tick)
                     persist::write_json_file(&me.cfg.build_dir, "migration.json", &me.migration_json());
+                    persist::write_json_file(&me.cfg.build_dir, "timings.json", &me.timings_json());
                 }
                 tick += 1;
                 thread::sleep(Duration::from_millis(1000));
@@ -867,6 +908,7 @@ impl Orchestrator {
             let snap = me.snapshot();
             persist::write_status(&me.cfg.build_dir, &snap);
             persist::write_json_file(&me.cfg.build_dir, "migration.json", &me.migration_json());
+            persist::write_json_file(&me.cfg.build_dir, "timings.json", &me.timings_json());
         });
     }
 
@@ -913,6 +955,15 @@ impl Orchestrator {
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
         self.cond.notify_all();
+    }
+
+    /// Flush the final status + derived reports SYNCHRONOUSLY (so a short foreground run doesn't exit
+    /// before the background status-writer thread gets to write them).
+    pub fn finalize(&self) {
+        let snap = self.snapshot();
+        persist::write_status(&self.cfg.build_dir, &snap);
+        persist::write_json_file(&self.cfg.build_dir, "migration.json", &self.migration_json());
+        persist::write_json_file(&self.cfg.build_dir, "timings.json", &self.timings_json());
     }
 
     /// Build the live snapshot rendered by every frontend and written to status.json.
@@ -1046,6 +1097,20 @@ impl Orchestrator {
         // struct literal moves `counts`.
         let done = counts.queued == 0 && counts.building == 0 && self.active.load(Ordering::Relaxed) == 0;
 
+        let op_stats: BTreeMap<String, OpStat> = sh
+            .op_stats
+            .iter()
+            .map(|(op, (total, count, max))| {
+                let r2 = |x: f64| (x * 100.0).round() / 100.0;
+                (op.clone(), OpStat {
+                    total: r2(*total),
+                    count: *count,
+                    mean: if *count > 0 { (total / *count as f64 * 1000.0).round() / 1000.0 } else { 0.0 },
+                    max: r2(*max),
+                })
+            })
+            .collect();
+
         let archive = ArchiveView {
             total: sh.archive_total,
             ..Default::default()
@@ -1083,6 +1148,10 @@ impl Orchestrator {
             tooling,
             builders,
             migration,
+            op_stats,
+            phase_durations: [("build".to_string(), (self.elapsed() * 10.0).round() / 10.0)]
+                .into_iter()
+                .collect(),
             tasks: Vec::new(),
             archive_recent: Vec::new(),
             archive,

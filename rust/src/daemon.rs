@@ -98,6 +98,7 @@ pub fn run_daemon(orch: &Arc<Orchestrator>, linger: Duration) {
         }
         std::thread::sleep(Duration::from_secs(2));
     }
+    orch.finalize(); // synchronous final status + reports before the daemon exits
     orch.request_stop();
     persist::clear_pid(&orch.cfg.build_dir);
 }

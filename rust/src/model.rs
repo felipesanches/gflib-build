@@ -61,6 +61,8 @@ pub struct Res {
     pub ended: f64,
     #[serde(default)]
     pub retries: u32,
+    #[serde(default)]
+    pub timings: BTreeMap<String, f64>, // per-operation seconds for this family (extract/venv/build/…)
 }
 
 // ---- snapshot sub-records (mirrors of the dicts Python's snapshot() emits) ----
@@ -177,6 +179,15 @@ pub struct TaskItem {
     #[serde(default)] pub detail: String,
 }
 
+/// Per-operation timing aggregate (bottleneck analysis), matching the Python `op_stats` shape.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OpStat {
+    #[serde(default)] pub total: f64,
+    #[serde(default)] pub count: usize,
+    #[serde(default)] pub mean: f64,
+    #[serde(default)] pub max: f64,
+}
+
 /// The live full snapshot — what both UIs render and the daemon writes to status.json each ~1 s.
 /// Defaulted everywhere so a partial/foreign status.json still deserializes.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -208,6 +219,8 @@ pub struct Snapshot {
     #[serde(default)] pub tooling: BTreeMap<String, String>,   // M0: compiler -> version
     #[serde(default)] pub builders: BTreeMap<String, String>,  // M0: builder2/builder3 -> version
     #[serde(default)] pub migration: BTreeMap<String, usize>,
+    #[serde(default)] pub op_stats: BTreeMap<String, OpStat>,       // per-op timing (stats tab)
+    #[serde(default)] pub phase_durations: BTreeMap<String, f64>,
     #[serde(default)] pub tasks: Vec<TaskItem>,
     #[serde(default)] pub archive_recent: Vec<ArchiveRecent>,
     #[serde(default)] pub archive: ArchiveView,

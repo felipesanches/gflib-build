@@ -437,6 +437,18 @@ fn render_stats(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u16)
         put(out, row, 1, &format!("builders in use:   {}", b.join("   ")), Color::Cyan, w);
         row += 1;
     }
+    if !snap.op_stats.is_empty() {
+        row += 1;
+        put(out, row, 0, " Per-operation timing (total · count · mean · max)", Color::Cyan, w);
+        row += 1;
+        let mut ops: Vec<_> = snap.op_stats.iter().collect();
+        ops.sort_by(|a, b| b.1.total.partial_cmp(&a.1.total).unwrap_or(std::cmp::Ordering::Equal));
+        for (op, s) in ops.iter().take(7) {
+            put(out, row, 1, &format!("{:<10} {:>8.1}s  n={:<5} mean {:.2}s  max {:.1}s",
+                op, s.total, s.count, s.mean, s.max), Color::Grey, w);
+            row += 1;
+        }
+    }
     row += 1;
     put(out, row, 0, &format!(" Failure causes ({})", snap.fail_categories.len()), Color::Red, w);
     row += 1;
