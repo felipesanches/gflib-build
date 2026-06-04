@@ -127,8 +127,11 @@ Charts that need *change over time*, not just the current snapshot.
    all snapshot-derived (no backend change): overview outcome donut + top-causes bars; failures
    by-cause bars; stats op-timing bars + backend-mix donut; cohort-size bars; archive mirroring ring.
    Verified by an adversarial chart-review workflow (0 confirmed bugs).
-3. **W3 = Part C1–C3** (detail panel + `/api/log` + config form) — the only backend addition
-   (`/api/log`) lands here.
+3. **W3 = Part C1–C3** ✅ **DONE (2026-06-05, commits b9dfb0a + 4310a3e).** Click-to-detail panel for
+   every row (incl. cohorts, mirroring the TUI build_detail); the new `GET /api/log` endpoint
+   (traversal-safe) feeds the log tail; the config form edits the live keys (backend/jobs/percent/
+   compare) via `/api/control`. Also: cohort family names are now coloured by build status in BOTH
+   UIs. Verified by an adversarial review workflow (0 confirmed bugs).
 4. **W4 = Part D1** (client-side timeseries) and **Part C4–C6** (tables/links/export).
 5. **W5 = Part E** (polish) and, if wanted, **Part D2** (daemon history).
 
