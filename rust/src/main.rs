@@ -10,6 +10,7 @@ mod classify;
 mod config;
 mod daemon;
 mod discover;
+mod mirror;
 mod model;
 mod monitor;
 mod persist;

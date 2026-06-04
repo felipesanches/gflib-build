@@ -71,6 +71,7 @@ pub struct Orchestrator {
     pub venvs: Option<VenvManager>, // cohort venv manager (R2); None unless --manage-venvs
     pub build_rules: std::collections::HashMap<String, Vec<String>>, // per-family pre-build (R3)
     pub all_families: Vec<Family>,  // full discovered list (R6: raising % enqueues more from here)
+    pub clone_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>, // per-repo clone lock (--mirror-missing)
 }
 
 impl Orchestrator {
@@ -205,6 +206,7 @@ impl Orchestrator {
             venvs,
             build_rules,
             all_families,
+            clone_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -405,9 +407,30 @@ impl Orchestrator {
         self.emit("started", slug, serde_json::json!({"worker": _worker}));
         let mirror = mirror_path(&self.cfg.archive, &fam.url);
         if !mirror.is_dir() {
-            self.fail(slug, "mirror-missing", &format!("no mirror in archive: {}", mirror.display()));
-            cleanup(&work, self.cfg.keep_work);
-            return;
+            if !self.cfg.mirror_missing {
+                self.fail(slug, "repo not mirrored", &format!("mirror absent: {}", mirror.display()));
+                cleanup(&work, self.cfg.keep_work);
+                return;
+            }
+            // --mirror-missing: clone it into the archive (append-only), one clone per repo at a time
+            let key = mirror.to_string_lossy().to_string();
+            let lock = {
+                let mut m = self.clone_locks.lock().unwrap();
+                m.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+            };
+            let _g = lock.lock().unwrap();
+            if !mirror.is_dir() {
+                // re-check under the lock (another worker may have just cloned it)
+                self.set_result(slug, |r| r.note = "cloning mirror".into());
+                if let Err(e) = crate::mirror::clone_mirror(&fam.url, &mirror, 1800, &self.stop, 3) {
+                    self.emit("archived", &fam.url, serde_json::json!({"status":"failed","reason":e}));
+                    self.fail(slug, "repo unreachable", &format!("mirror clone failed: {}", e));
+                    cleanup(&work, self.cfg.keep_work);
+                    return;
+                }
+                self.emit("archived", &fam.url, serde_json::json!({"status":"added"}));
+                self.set_result(slug, |r| r.note = String::new());
+            }
         }
 
         // Cohort venv (R2): read the family's requirements read-only from the mirror, create/reuse the
