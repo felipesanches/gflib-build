@@ -114,6 +114,32 @@ pub fn read_failure_history(build_dir: &Path) -> Vec<FailHist> {
         .collect()
 }
 
+/// Append one line to events.jsonl (started/built/failed/venv) — the append-only stream external
+/// web UIs tail. The value is a pre-built JSON object.
+pub fn append_event(build_dir: &Path, ev: &serde_json::Value) {
+    let _ = std::fs::create_dir_all(build_dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(build_dir.join("events.jsonl"))
+    {
+        if let Ok(line) = serde_json::to_string(ev) {
+            let _ = writeln!(f, "{}", line);
+        }
+    }
+}
+
+/// Atomically write a derived report file (migration.json / timings.json) next to status.json.
+pub fn write_json_file(build_dir: &Path, name: &str, value: &serde_json::Value) {
+    let _ = std::fs::create_dir_all(build_dir);
+    let tmp = build_dir.join(format!("{}.tmp", name));
+    if let Ok(txt) = serde_json::to_string_pretty(value) {
+        if std::fs::write(&tmp, txt).is_ok() {
+            let _ = std::fs::rename(&tmp, build_dir.join(name));
+        }
+    }
+}
+
 /// Write our PID so a later invocation can attach/stop us.
 pub fn write_pid(build_dir: &Path) {
     let _ = std::fs::create_dir_all(build_dir);

@@ -326,6 +326,39 @@ impl Orchestrator {
         v
     }
 
+    /// Append an event (started/built/failed/venv) to events.jsonl — the append-only stream external
+    /// web UIs tail. Matches the Python `_emit` shape: {t, type, slug, ...extra}.
+    fn emit(&self, etype: &str, slug: &str, extra: serde_json::Value) {
+        let mut ev = serde_json::json!({
+            "t": (self.elapsed() * 100.0).round() / 100.0, "type": etype, "slug": slug
+        });
+        if let (Some(obj), Some(ex)) = (ev.as_object_mut(), extra.as_object()) {
+            for (k, v) in ex {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        persist::append_event(&self.cfg.build_dir, &ev);
+    }
+
+    /// Build the Python-format migration.json (fontc / fontmake-fallback blockers / both-agreement).
+    fn migration_json(&self) -> serde_json::Value {
+        let sh = self.shared.lock().unwrap();
+        let built: Vec<&Res> = sh.results.values().filter(|r| r.status == "built").collect();
+        let fontc: Vec<&str> = built.iter().filter(|r| r.backend == "fontc").map(|r| r.slug.as_str()).collect();
+        let fm_only: Vec<&str> = built.iter().filter(|r| r.backend == "fontmake").map(|r| r.slug.as_str()).collect();
+        let failed: Vec<&str> = sh.results.values().filter(|r| r.status == "failed").map(|r| r.slug.as_str()).collect();
+        serde_json::json!({
+            "summary": {
+                "fontc": fontc.len(),
+                "fontmake_only": fm_only.len(),
+                "failed": failed.len(),
+            },
+            "fontc_built": fontc,
+            "fontmake_only": fm_only,
+            "failed": failed,
+        })
+    }
+
     /// Record a family's cohort assignment into the live cohort map (R2 — populates the cohorts view).
     fn note_cohort(&self, slug: &str, cohort: &str, req_text: &str) {
         let mut sh = self.shared.lock().unwrap();
@@ -369,6 +402,7 @@ impl Orchestrator {
         let out_dir = self.cfg.build_dir.join("out").join(&logname);
         self.set_result(slug, |r| r.log = log_path.to_string_lossy().to_string());
 
+        self.emit("started", slug, serde_json::json!({"worker": _worker}));
         let mirror = mirror_path(&self.cfg.archive, &fam.url);
         if !mirror.is_dir() {
             self.fail(slug, "mirror-missing", &format!("no mirror in archive: {}", mirror.display()));
@@ -509,6 +543,7 @@ impl Orchestrator {
             log_line(&log_path, &format!(
                 "DONE: backend={} bytes={} missing={}", backend, bytes, missing
             ));
+            self.emit("built", slug, serde_json::json!({"backend": used, "bytes": bytes, "compare": cmp}));
             if !self.cfg.keep_fonts {
                 let _ = std::fs::remove_dir_all(&out_dir);
             }
@@ -564,6 +599,7 @@ impl Orchestrator {
         }
         // append to durable jsonl outside the lock
         persist::append_failure(&self.cfg.build_dir, &entry);
+        self.emit("failed", slug, serde_json::json!({"error": msg.chars().take(200).collect::<String>(), "cause": cause}));
         // archive the failing log so a later success can't erase how it broke
         let logname = slug_to_logname(slug);
         let src = self.cfg.build_dir.join("logs").join(format!("{}.log", logname));
@@ -708,14 +744,21 @@ impl Orchestrator {
     fn spawn_status_writer(self: &Arc<Self>) {
         let me = Arc::clone(self);
         thread::spawn(move || {
+            let mut tick: u64 = 0;
             while !me.stop.load(Ordering::Relaxed) {
                 let snap = me.snapshot();
                 persist::write_status(&me.cfg.build_dir, &snap);
+                if tick % 10 == 0 {
+                    // derived report consumed by the dashboard (refreshed every ~10 s, not every tick)
+                    persist::write_json_file(&me.cfg.build_dir, "migration.json", &me.migration_json());
+                }
+                tick += 1;
                 thread::sleep(Duration::from_millis(1000));
             }
             // one last write so a monitor sees the final state
             let snap = me.snapshot();
             persist::write_status(&me.cfg.build_dir, &snap);
+            persist::write_json_file(&me.cfg.build_dir, "migration.json", &me.migration_json());
         });
     }
 

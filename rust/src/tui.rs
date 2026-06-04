@@ -240,10 +240,21 @@ fn render(out: &mut Stdout, snap: &Snapshot, ui: &Ui, src: &dyn Source) -> std::
         Color::Green,
         w,
     );
-    let barw = w.saturating_sub(8) as usize;
-    let fill = barw * pct / 100;
-    let bar: String = std::iter::repeat('#').take(fill).chain(std::iter::repeat('-').take(barw - fill)).collect();
-    put(out, 3, 0, &format!(" [{}] {:>3}%", bar, pct), Color::Cyan, w);
+    // completion banner (R5): when the build is done / the daemon died, say so prominently instead
+    // of leaving the dashboard looking frozen mid-flight.
+    if snap.done && snap.total > 0 {
+        let top = snap.fail_categories.first().map(|f| format!("  ·  top cause: {} ({})", f.cat, f.count)).unwrap_or_default();
+        put(out, 3, 0, &format!(" ✓ BUILD COMPLETE — built {} · failed {} · skipped {} of {}{}",
+            c.built, c.failed, c.skipped, snap.total, top), Color::Green, w);
+    } else if !src.is_live() && !snap.daemon_alive && snap.total > 0 {
+        put(out, 3, 0, &format!(" ■ DAEMON STOPPED — built {} · failed {} · queued {} (re-run to resume)",
+            c.built, c.failed, c.queued), Color::Yellow, w);
+    } else {
+        let barw = w.saturating_sub(8) as usize;
+        let fill = barw * pct / 100;
+        let bar: String = std::iter::repeat('#').take(fill).chain(std::iter::repeat('-').take(barw - fill)).collect();
+        put(out, 3, 0, &format!(" [{}] {:>3}%", bar, pct), Color::Cyan, w);
+    }
 
     // ---- tab bar ----
     let mut tabline = String::from(" ");
