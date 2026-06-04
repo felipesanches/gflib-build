@@ -8,6 +8,7 @@
 mod build;
 mod classify;
 mod config;
+mod daemon;
 mod discover;
 mod model;
 mod monitor;
@@ -83,16 +84,38 @@ fn run_build(mut cfg: config::Config) {
     }
     config::save_config(&cfg);
     let ui = pick_frontend(&cfg.ui);
+
+    // Detach by default for the interactive curses UI (quit the monitor, build keeps running);
+    // --detach forces it for any UI; --no-detach keeps curses in the foreground. daemonize() MUST
+    // run before Orchestrator::new (whose discovery spawns threads) so the daemon keeps the pool.
+    let want_detach = cfg.detach || (ui == "curses" && !cfg.no_detach);
+    if want_detach {
+        if daemon::daemonize(&cfg.build_dir) {
+            // DAEMON: run the build headless and linger ~30 min after completion (so a live retry works)
+            let orch = build::Orchestrator::new(cfg.clone());
+            orch.start();
+            daemon::run_daemon(&orch, std::time::Duration::from_secs(30 * 60));
+            return;
+        }
+        // PARENT: wait briefly for the daemon to write its pid, then attach a live monitor
+        eprintln!("gflib-build (Rust): build detached at {} — attaching a live monitor (q leaves it running; --stop to cancel).", cfg.build_dir.display());
+        for _ in 0..50 {
+            if persist::read_daemon_pid(&cfg.build_dir).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        return run_attach(&cfg);
+    }
+
+    // foreground (plain/json/none/web, or curses with --no-detach)
     eprintln!(
         "gflib-build (Rust): source={} backend={} jobs={} build_dir={}",
-        cfg.source,
-        cfg.backend,
-        cfg.jobs,
-        cfg.build_dir.display()
+        cfg.source, cfg.backend, cfg.jobs, cfg.build_dir.display()
     );
-
     let orch = build::Orchestrator::new(cfg.clone());
     persist::write_pid(&cfg.build_dir);
+    daemon::install_sigterm_handler();
     orch.start();
     let source: Arc<dyn Source> = orch.clone();
 
@@ -229,7 +252,7 @@ fn run_plain(source: &Arc<dyn Source>) {
             snap.phase,
             util::human(snap.disk_build_total + snap.disk_archive_total),
         );
-        if snap.done && source.is_live() {
+        if (snap.done || daemon::sigterm_received()) && source.is_live() {
             eprintln!(
                 "done — built {} · failed {} · skipped {}",
                 c.built, c.failed, c.skipped
@@ -250,7 +273,7 @@ fn run_json(source: &Arc<dyn Source>) {
         if let Ok(s) = serde_json::to_string(&snap) {
             println!("{}", s);
         }
-        if snap.done && source.is_live() {
+        if (snap.done || daemon::sigterm_received()) && source.is_live() {
             return;
         }
         if !source.is_live() && !snap.daemon_alive {
@@ -264,7 +287,7 @@ fn run_none(source: &Arc<dyn Source>) {
     // silent: keep the build alive until done (status/state files still written)
     loop {
         let snap = source.snapshot();
-        if snap.done && source.is_live() {
+        if (snap.done || daemon::sigterm_received()) && source.is_live() {
             return;
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -305,7 +328,8 @@ UI:
 LIFECYCLE:
   --list                        print the buildable worklist and exit
   --attach                      attach a read-only monitor to a build at --build-dir
-  --stop                        signal a build daemon at --build-dir to stop
+  --detach / --no-detach        run the build in a background daemon (default for curses) / force fg
+  --stop                        signal a build daemon at --build-dir to stop (graceful)
   --reset --yes                 delete the whole build dir (archive is NEVER touched)
 
 M0 provenance (compiler + builder, success or failure) is recorded for every attempt.

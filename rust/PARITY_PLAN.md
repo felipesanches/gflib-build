@@ -85,7 +85,12 @@ Port `VenvManager` (863–1010) + `scan_cohorts` + `relax_requirements`:
 - `--cohorts-report` (read-only cohort preview + `cohorts.json`).
 - **Accept:** each flag matches Python on a sample; populate clones only *missing* mirrors (append-only).
 
-### R4 — Daemon lifecycle & ops · L · medium-high risk
+### R4 — Daemon lifecycle & ops · L · ✅ CORE DONE
+*Implemented in `src/daemon.rs`: double-fork `daemonize()` (before any thread is spawned),
+detach-by-default for curses, a lingering daemon that idle-exits ~30 min after completion (so live
+`[R]` retry works), and a SIGTERM handler for graceful `--stop`. Verified end-to-end: detach →
+daemon writes pid+status, lingers, `--stop` exits it gracefully and clears the pidfile. Remaining:
+reexec-wizard on `C`.*
 - True detach: **double-fork** `daemonize()` (4176) — must run **before** any worker thread is spawned
   (fork-after-threads keeps only the forking thread); redirect stdio → `daemon.log`; write `daemon.pid`.
 - Lingering daemon after completion (status writer + control watcher stay alive; idle-exit after 30 min).

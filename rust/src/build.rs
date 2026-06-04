@@ -47,7 +47,6 @@ pub struct Shared {
     pub library_total: usize,
     #[allow(dead_code)] // library families outside the worklist (reported via --list / phase_total)
     pub skipped_total: usize,
-    pub done: bool,
     pub disk_build_total: u64,
     pub disk_archive_total: u64,
     pub disk_archive_nested: bool,
@@ -171,7 +170,6 @@ impl Orchestrator {
             control_log: Vec::new(),
             library_total,
             skipped_total: skipped,
-            done: false,
             disk_build_total: 0,
             disk_archive_total: 0,
             disk_archive_nested: false,
@@ -274,7 +272,6 @@ impl Orchestrator {
             self.build_one(&slug, id);
             self.active.fetch_sub(1, Ordering::Relaxed);
             self.save_state();
-            self.check_done();
         }
     }
 
@@ -568,16 +565,6 @@ impl Orchestrator {
         let _ = std::fs::copy(&src, fdir.join(format!("{}.log", logname)));
     }
 
-    fn check_done(&self) {
-        let mut sh = self.shared.lock().unwrap();
-        let pending = sh
-            .results
-            .values()
-            .filter(|r| r.status == "queued" || r.status == "building")
-            .count();
-        let working = self.active.load(Ordering::Relaxed);
-        sh.done = pending == 0 && working == 0 && sh.queue.is_empty();
-    }
 
     fn save_state(&self) {
         let st = {
@@ -862,6 +849,11 @@ impl Orchestrator {
         let mut fail_hist: Vec<FailHist> = sh.failure_history.iter().rev().take(400).cloned().collect();
         fail_hist.reverse();
 
+        // done = nothing queued, nothing building, no worker in flight (correct with 0 families so a
+        // daemon idle-exits; the active counter guards the build→built window). Computed before the
+        // struct literal moves `counts`.
+        let done = counts.queued == 0 && counts.building == 0 && self.active.load(Ordering::Relaxed) == 0;
+
         let archive = ArchiveView {
             total: sh.archive_total,
             ..Default::default()
@@ -906,7 +898,7 @@ impl Orchestrator {
             control_log: sh.control_log.clone(),
             dep_relaxations: self.venvs.as_ref().map(|v| v.relaxations()).unwrap_or_default(),
             config_path: self.cfg.data_dir.join("gflib-build.config").to_string_lossy().to_string(),
-            done: sh.done,
+            done,
             daemon_alive: true,
         }
     }

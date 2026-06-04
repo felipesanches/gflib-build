@@ -37,6 +37,8 @@ pub struct Config {
     pub web_port: u16,
     pub ui: String,            // auto | curses | plain | json | none | web
     pub yes: bool,
+    pub detach: bool,          // run the build in a detached background daemon
+    pub no_detach: bool,       // force foreground even for curses (which detaches by default)
 }
 
 impl Default for Config {
@@ -72,6 +74,8 @@ impl Default for Config {
             web_port: 8765,
             ui: "auto".into(),
             yes: false,
+            detach: false,
+            no_detach: false,
         }
     }
 }
@@ -171,6 +175,8 @@ pub fn parse(args: &[String]) -> Parsed {
             "--web-port" => cfg.web_port = next(&mut i, a).parse().unwrap_or(8765),
             "--ui" => cfg.ui = next(&mut i, a),
             "--yes" | "-y" => cfg.yes = true,
+            "--detach" => cfg.detach = true,
+            "--no-detach" => cfg.no_detach = true,
             "--list" => mode = Mode::List,
             "--attach" => mode = Mode::Attach,
             "--stop" => mode = Mode::Stop,
