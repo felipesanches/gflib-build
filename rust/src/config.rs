@@ -212,7 +212,8 @@ fn merge_persisted(cfg: &mut Config, loaded: &BTreeMap<String, serde_json::Value
             "percent" => if let Some(x) = v.as_f64() { cfg.percent = x },
             "compare" => if let Some(x) = v.as_bool() { cfg.compare = x },
             "manage_venvs" => if let Some(x) = v.as_bool() { cfg.manage_venvs = x },
-            "ui" => if let Some(x) = s(v) { cfg.ui = x },
+            // NOTE: 'ui' is deliberately NOT loaded — it's a per-invocation choice, not a saved
+            // preference. (A prior `--ui none` must never silence a later interactive run.)
             "web_port" => if let Some(x) = v.as_u64() { cfg.web_port = x as u16 },
             _ => {}
         }
@@ -238,7 +239,7 @@ pub fn save_config(cfg: &Config) {
     m.insert("percent".into(), json!(cfg.percent));
     m.insert("compare".into(), json!(cfg.compare));
     m.insert("manage_venvs".into(), json!(cfg.manage_venvs));
-    m.insert("ui".into(), json!(cfg.ui));
+    // 'ui' is intentionally NOT persisted (per-invocation choice — see merge_persisted).
     m.insert("web_port".into(), json!(cfg.web_port));
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
