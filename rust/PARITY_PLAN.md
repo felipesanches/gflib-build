@@ -76,7 +76,10 @@ Port `VenvManager` (863–1010) + `scan_cohorts` + `relax_requirements`:
 - **Accept:** the dependency-heavy families that fail today build; parity harness shows Rust
   built-count ≈ Python on a dependency-mixed sample; venvs reused across runs (cached marker shown).
 
-### R3 — Build-path completeness · L · medium risk
+### R3 — Build-path completeness · L · ✅ MOSTLY DONE
+*build_rules pre-build ✅, `--cohorts-report` ✅, `--mirror-missing`/clone (abortable+retry) ✅,
+`--backend both` + sha256 compare ✅. Remaining: the streaming archive pre-warmer + the
+table-tag-level compare diff (sha256-level done).*
 - `build_rules.json` pre-build (`run_pre_build`): ordered shell cmds, `cwd`=work, venv bin on PATH,
   *before* the builder; non-zero exit → `pre-build` failure.
 - `--backend both` + `compare_backends` (sha256 + `diff_font_tables` OT-table diff) → the `vs` column.
@@ -100,7 +103,10 @@ reexec-wizard on `C`.*
 - **Accept:** `q` leaves it running; re-run reattaches; `--stop` ends cleanly; survives terminal close.
 - **Risk:** fork + threads + signals in Rust — fork first, minimal async-signal-safe handler.
 
-### R5 — TUI full fidelity · L–XL · medium risk (mostly mechanical)
+### R5 — TUI full fidelity · L–XL · 🔶 PARTIAL
+*Editable config tab (↑↓ pick, ←→ change, applied live via control.json) ✅, completion/stopped
+banner ✅. Remaining: section water-fill layout, the live archive multi-column grid, stable
+selection (track item not row index), detail-overlay parity.*
 Port the parts of `CursesFrontend` (2637–3861, ~1225 lines) the Rust TUI doesn't have yet:
 - **editable config tab** (fields, text cursor, ±step, choice cycle, checkbox→conditional reveal);
   live apply via `control.json` (✓ apply changes); first-run ▶ Start / Cancel.
@@ -111,7 +117,10 @@ Port the parts of `CursesFrontend` (2637–3861, ~1225 lines) the Rust TUI doesn
 - completion/stopped **banner**; **stable selection** (track item, not row index); detail-overlay parity.
 - **Accept:** Rust equivalents of `tests/pty_*.py` pass.
 
-### R6 — Live-config parity · M · medium risk
+### R6 — Live-config parity · M · ✅ DONE
+*Raising `--percent` live enqueues the newly-included families (all_families kept) ✅; jobs/percent/
+backend/compare/pause all live ✅; prior-run reconcile is implicit (only the current worklist is
+materialised) ✅.*
 - `apply_live`: raising **percent** enqueues newly-included families (fetch/cohort/build live);
   backend/compare/timeout/populate live; surface dependency relaxations; `control_log` parity.
 - reconcile a prior higher-percent run's leftover `queued`/`building` → `skipped (not selected)`.
