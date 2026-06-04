@@ -1028,9 +1028,20 @@ fn head(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// The cohort row as coloured segments, mirroring the Python `cohorts` section formatter:
-/// a cached/uncached dot, `count + key` in the cohort colour (CYAN, or default for "base"), then the
-/// family names in GREEN with CYAN " | " separators.
+/// Colour for a cohort member by build status: built=green, failed=red, building=yellow,
+/// not-yet-attempted (queued/pending/…)=grey. Shared by the TUI cohort row and the detail overlay.
+fn fam_color(status: &str) -> Color {
+    match status {
+        "built" => Color::Green,
+        "failed" => Color::Red,
+        "building" => Color::Yellow,
+        _ => Color::DarkGrey,
+    }
+}
+
+/// The cohort row as coloured segments: a cached/uncached dot, `count + key` in the cohort colour
+/// (CYAN, or default for "base"), then the family NAMES coloured by build status with CYAN " | "
+/// separators.
 fn cohort_segments(co: &crate::model::CohortView) -> Vec<(String, Color)> {
     let mut segs: Vec<(String, Color)> = Vec::new();
     segs.push((
@@ -1042,13 +1053,13 @@ fn cohort_segments(co: &crate::model::CohortView) -> Vec<(String, Color)> {
         if co.key == "base" { Color::White } else { Color::Cyan },
     ));
     if co.families.is_empty() {
-        segs.push(("(no families yet)".into(), Color::Green));
+        segs.push(("(no families yet)".into(), Color::DarkGrey));
     } else {
-        for (i, n) in co.families.iter().enumerate() {
+        for (i, f) in co.families.iter().enumerate() {
             if i > 0 {
                 segs.push((" | ".into(), Color::Cyan));
             }
-            segs.push((n.clone(), Color::Green));
+            segs.push((f.name.clone(), fam_color(&f.status)));
         }
     }
     segs
@@ -1307,7 +1318,8 @@ fn focus_info(snap: &Snapshot, ui: &Ui) -> Vec<String> {
                 Some(r) => format!(" cohort {}: {} families — needs {}", c.key, c.count, r),
                 None => format!(" cohort {}: {} families (base — no extra requirements)", c.key, c.count),
             };
-            let l2 = if c.families.is_empty() { "   (none assigned yet)".to_string() } else { format!("   {}", c.families.join(" | ")) };
+            let names: Vec<&str> = c.families.iter().map(|f| f.name.as_str()).collect();
+            let l2 = if names.is_empty() { "   (none assigned yet)".to_string() } else { format!("   {}", names.join(" | ")) };
             vec![l1, l2]
         }).unwrap_or_default(),
         "built" => snap.built_recent.get(sel).map(|b| {
@@ -1449,13 +1461,18 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, build_d
             if let Some(c) = snap.cohorts.get(sel) {
                 o.push(format!("Cohort: {}", c.key));
                 o.push(format!("families: {}", c.count));
+                // per-status tally so the overlay summarizes the cohort's progress at a glance
+                let tally = |st: &str| c.families.iter().filter(|f| f.status == st).count();
+                o.push(format!("status: {} built · {} failed · {} building · {} queued",
+                    tally("built"), tally("failed"), tally("building"),
+                    c.families.iter().filter(|f| !matches!(f.status.as_str(), "built" | "failed" | "building")).count()));
                 o.push(String::new());
-                o.push("family names:".into());
+                o.push("family names (with build status):".into());
                 if c.families.is_empty() {
                     o.push("  (none assigned yet)".into());
                 }
-                for n in &c.families {
-                    o.push(format!("  {}", n));
+                for f in &c.families {
+                    o.push(format!("  {} [{}]", f.name, f.status));
                 }
                 o.push(String::new());
                 o.push("requirements:".into());

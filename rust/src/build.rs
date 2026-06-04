@@ -1176,21 +1176,19 @@ impl Orchestrator {
                 key: key.clone(),
                 count: fams.len(),
                 requirements: sh.cohort_reqs.get(key).cloned().unwrap_or_default(),
-                // show the family DISPLAY NAME (from METADATA.pb), falling back to the slug — matches
-                // the Python _rebuild_cohorts (`self.families[s].name if s in self.families else s`)
+                // each member as {display NAME (from METADATA.pb, falling back to slug), build STATUS}
+                // — the name matches Python's _rebuild_cohorts; the status lets both UIs colour it
                 families: {
-                    let mut names: Vec<String> = fams
+                    let mut fl: Vec<crate::model::CohortFam> = fams
                         .iter()
                         .map(|s| {
-                            sh.families
-                                .get(s)
-                                .map(|f| f.name.clone())
-                                .filter(|n| !n.is_empty())
-                                .unwrap_or_else(|| s.clone())
+                            let name = sh.families.get(s).map(|f| f.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| s.clone());
+                            let status = sh.results.get(s).map(|r| r.status.clone()).filter(|st| !st.is_empty()).unwrap_or_else(|| "pending".into());
+                            crate::model::CohortFam { name, status }
                         })
                         .collect();
-                    names.sort();
-                    names
+                    fl.sort_by(|a, b| a.name.cmp(&b.name));
+                    fl
                 },
                 cached: sh.cached_cohorts.contains(key),
             })

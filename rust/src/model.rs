@@ -135,8 +135,15 @@ pub struct CohortView {
     #[serde(default)] pub key: String,
     #[serde(default)] pub count: usize,
     #[serde(default)] pub requirements: String,
-    #[serde(default)] pub families: Vec<String>,
+    #[serde(default)] pub families: Vec<CohortFam>,
     #[serde(default)] pub cached: bool,
+}
+
+/// A cohort member: its display name + current build status (so both UIs can colour it).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CohortFam {
+    #[serde(default)] pub name: String,
+    #[serde(default)] pub status: String, // built | failed | building | queued | pending
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

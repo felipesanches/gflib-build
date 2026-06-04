@@ -217,8 +217,11 @@ function taskRow(t){const m=TASK_MARK[t.status]||'?',cl=TASK_CLS[t.status]||'gr'
  return {segs:[[m+' '+L(t.name,26)+' '+L(prog,11)+Rp(el,8)+'  '+(t.detail||''),cl]]}}
 function failRow(f){return {segs:[[L(f.slug,34)+' ','r'],[f.error||'','dr']],rt:f.slug}}
 function qRow(q){const kc={retry:'y',rebuild:'c'}[q.kind]||'g';return {segs:[['  '+L(q.kind,8)+' ',kc],[q.slug||'','gr']],rt:q.slug}}
+// cohort member colour by build status: built=green, failed=red, building=yellow, else grey
+function famCls(st){return {built:'g',failed:'r',building:'y'}[st]||'muted'}
 function cohortRow(c){const segs=[[c.cached?'● ':'○ ',c.cached?'g':'muted'],[Rp(c.count,4)+'  '+L(c.key,14)+' ',c.key=='base'?'w':'c']];
- const f=c.families||[];if(!f.length)segs.push(['(no families yet)','g']);else f.forEach((n,i)=>{if(i)segs.push([' | ','c']);segs.push([n,'g'])});return {segs}}
+ const f=c.families||[];if(!f.length)segs.push(['(no families yet)','muted']);else f.forEach((m,i)=>{if(i)segs.push([' | ','c']);segs.push([m.name,famCls(m.status)])});
+ return {segs,coh:c.key}}
 function builtRow(b){const comp=b.compiler_version||b.backend||'';
  return {segs:[[L(b.slug,32)+' ','g'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9)+'  '+(b.compare||''),'gr']],rt:b.slug}}
 function failcatRow(c){return {segs:[[Rp(c.count,4)+'  ','w'],[L(c.cat,24),'c'],[' '+(c.hint||''),'muted']]}}
@@ -398,7 +401,8 @@ function charts(t){
  }
  if(t=='cohorts'){
   const co=(snap.cohorts||[]).slice().sort((a,b)=>b.count-a.count).slice(0,12).map(x=>({label:x.key,value:x.count,color:x.cached?'#22c55e':'#475569'}));
-  return co.length?'<div class="chartrow">'+chartCard('cohort sizes (green = venv cached on disk)',barChart(co))+'</div>':'';
+  const leg='<div class="legend" style="margin:6px 2px">family name colour: <span><i style="background:#86efac"></i>built</span><span><i style="background:#fca5a5"></i>failed</span><span><i style="background:#fde68a"></i>building</span><span><i style="background:#7c8aa0"></i>not yet attempted</span> · click a cohort row for details</div>';
+  return (co.length?'<div class="chartrow">'+chartCard('cohort sizes (green = venv cached on disk)',barChart(co))+'</div>':'')+leg;
  }
  if(t=='archive'){
   const a=snap.archive||{},mir=a.total||0,pend=a.pending_total||0;
