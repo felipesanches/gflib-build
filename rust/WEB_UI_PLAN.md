@@ -123,7 +123,10 @@ Charts that need *change over time*, not just the current snapshot.
    schema, and real controls (no fabricated jobs±). Verified by a spec-extraction workflow + an
    adversarial review workflow (12 divergences found & fixed). The `PAGE`-splitting refactor was
    deferred (the page is still one `const` — split it when W2's charts grow it).
-2. **W2 = Part B** (derived charts). Big perceived value, no backend change.
+2. **W2 = Part B** ✅ **DONE (2026-06-05, commit d78d9ef).** Inline-SVG donuts/rings + CSS bars,
+   all snapshot-derived (no backend change): overview outcome donut + top-causes bars; failures
+   by-cause bars; stats op-timing bars + backend-mix donut; cohort-size bars; archive mirroring ring.
+   Verified by an adversarial chart-review workflow (0 confirmed bugs).
 3. **W3 = Part C1–C3** (detail panel + `/api/log` + config form) — the only backend addition
    (`/api/log`) lands here.
 4. **W4 = Part D1** (client-side timeseries) and **Part C4–C6** (tables/links/export).
