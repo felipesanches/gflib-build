@@ -19,6 +19,11 @@ const TABS: [&str; 8] = [
     "config", "overview", "queue", "cohorts", "built", "failures", "stats", "archive",
 ];
 
+// The live-editable config fields (R5): ←/→ adjusts the selected one and applies it to the running
+// build via control.json (the same channel the web UI uses). Mirrors the Python config tab's live set.
+const CONFIG_FIELDS: [&str; 5] = ["jobs", "percent", "backend", "compare", "paused"];
+const BACKENDS: [&str; 4] = ["auto", "fontc", "fontmake", "both"];
+
 /// Outcome of the TUI loop: the user quit, or pressed C to reconfigure (re-show setup).
 pub enum TuiResult {
     Quit,
@@ -68,6 +73,21 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
                     KeyCode::Down => {
                         ui.sel = (ui.sel + 1).min(list_len(&snap, ui.tab).saturating_sub(1));
                     }
+                    KeyCode::Left => {
+                        if TABS[ui.tab] == "config" {
+                            adjust_config(&snap, ui.sel, -1, &*source);
+                        }
+                    }
+                    KeyCode::Right => {
+                        if TABS[ui.tab] == "config" {
+                            adjust_config(&snap, ui.sel, 1, &*source);
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        if TABS[ui.tab] == "config" {
+                            adjust_config(&snap, ui.sel, 1, &*source); // space toggles bools / steps
+                        }
+                    }
                     KeyCode::Enter => ui.detail = !ui.detail,
                     KeyCode::Esc => ui.detail = false,
                     KeyCode::Char('p') | KeyCode::Char('P') => {
@@ -115,6 +135,7 @@ pub fn run(source: Arc<dyn Source>) -> std::io::Result<TuiResult> {
 
 fn list_len(snap: &Snapshot, tab: usize) -> usize {
     match TABS[tab] {
+        "config" => CONFIG_FIELDS.len(),
         "queue" => snap.queued_list.len(),
         "cohorts" => snap.cohorts.len(),
         "built" => snap.built_recent.len(),
@@ -123,6 +144,34 @@ fn list_len(snap: &Snapshot, tab: usize) -> usize {
         "archive" => snap.archive.pending.len(),
         _ => snap.building.len(),
     }
+}
+
+/// Read the selected config field, adjust it by `delta` (or toggle a bool / cycle a choice), and
+/// apply it live to the running build via control.json.
+fn adjust_config(snap: &Snapshot, field: usize, delta: i64, src: &dyn Source) {
+    let cf = &snap.config;
+    let getf = |k: &str| cf.get(k).and_then(|v| v.as_f64());
+    let gets = |k: &str| cf.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let getb = |k: &str| cf.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut set = ControlSet::default();
+    match CONFIG_FIELDS.get(field).copied().unwrap_or("") {
+        "jobs" => set.jobs = Some(((snap.jobs as i64 + delta).max(1)) as usize),
+        "percent" => {
+            let cur = getf("percent").unwrap_or(snap.config.get("percent").and_then(|v| v.as_f64()).unwrap_or(100.0));
+            set.percent = Some((cur + delta as f64 * 5.0).clamp(0.0, 100.0));
+        }
+        "backend" => {
+            let cur = gets("backend");
+            let i = BACKENDS.iter().position(|b| *b == cur).unwrap_or(0) as i64;
+            let n = BACKENDS.len() as i64;
+            let ni = ((i + delta) % n + n) % n;
+            set.backend = Some(BACKENDS[ni as usize].to_string());
+        }
+        "compare" => set.compare = Some(!getb("compare")),
+        "paused" => set.paused = Some(!snap.paused),
+        _ => {}
+    }
+    src.control(&set);
 }
 
 fn selected_slug(snap: &Snapshot, tab: usize, sel: usize) -> Option<String> {
@@ -255,7 +304,7 @@ fn render(out: &mut Stdout, snap: &Snapshot, ui: &Ui, src: &dyn Source) -> std::
         "failures" => render_failures(out, snap, row, avail, w, ui.sel),
         "stats" => render_stats(out, snap, row, avail, w),
         "archive" => render_archive(out, snap, row, avail, w),
-        _ => render_config(out, snap, src, row, avail, w),
+        _ => render_config(out, snap, ui.sel, row, w),
     }
 
     // ---- status panel ----
@@ -405,24 +454,56 @@ fn render_archive(out: &mut Stdout, snap: &Snapshot, top: u16, avail: u16, w: u1
     }
 }
 
-fn render_config(out: &mut Stdout, snap: &Snapshot, _src: &dyn Source, top: u16, _avail: u16, w: u16) {
+fn render_config(out: &mut Stdout, snap: &Snapshot, sel: usize, top: u16, w: u16) {
     let mut row = top;
-    put(out, row, 0, " Configuration (read-only in this port — edit via CLI flags / control.json)", Color::Cyan, w);
+    put(out, row, 0, " Configuration — ↑/↓ pick a field · ←/→ change it (applied live)", Color::Cyan, w);
     row += 2;
-    let mut keys: Vec<_> = snap.config.keys().collect();
-    keys.sort();
-    for k in keys {
-        let v = snap.config.get(k).map(|x| x.to_string()).unwrap_or_default();
-        put(out, row, 1, &format!("{:<16} {}", k, v.trim_matches('"')), Color::Grey, w);
+    let cf = &snap.config;
+    let val = |k: &str| -> String {
+        match cf.get(k) {
+            Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
+            Some(v) if v.is_boolean() => if v.as_bool().unwrap_or(false) { "[x] yes".into() } else { "[ ] no".into() },
+            Some(v) if v.is_f64() => format!("{}", v.as_f64().unwrap_or(0.0)),
+            Some(v) => v.to_string(),
+            None => String::new(),
+        }
+    };
+    // editable live fields first (selected one highlighted with ‹ › / ▸)
+    for (i, f) in CONFIG_FIELDS.iter().enumerate() {
+        let v = if *f == "jobs" { snap.jobs.to_string() }
+                else if *f == "paused" { if snap.paused { "[x] yes".into() } else { "[ ] no".into() } }
+                else { val(f) };
+        let active = i == sel;
+        let marker = if active { "▸ " } else { "  " };
+        let shown = if active { format!("‹ {} ›", v) } else { v };
+        let color = if active { Color::Yellow } else { Color::Grey };
+        put(out, row, 0, &format!("{}{:<14} {}", marker, f, shown), color, w);
         row += 1;
     }
     row += 1;
-    put(out, row, 1, &format!("config file: {}", snap.config_path), Color::DarkGrey, w);
+    // the rest of the config (read-only paths/source), for context
+    put(out, row, 0, " (paths — restart to change)", Color::DarkGrey, w);
+    row += 1;
+    for k in ["source", "build_dir", "archive", "manage_venvs"] {
+        if cf.contains_key(k) {
+            put(out, row, 1, &format!("{:<14} {}", k, val(k)), Color::DarkGrey, w);
+            row += 1;
+        }
+    }
+    if !snap.dep_relaxations.is_empty() {
+        row += 1;
+        put(out, row, 0, " Dependency relaxations / overrides", Color::Cyan, w);
+        row += 1;
+        for l in snap.dep_relaxations.iter().take(4) {
+            put(out, row, 1, l, Color::Grey, w);
+            row += 1;
+        }
+    }
     if !snap.control_log.is_empty() {
-        row += 2;
+        row += 1;
         put(out, row, 0, " Recent live changes", Color::Cyan, w);
         row += 1;
-        for l in snap.control_log.iter().rev().take(5) {
+        for l in snap.control_log.iter().rev().take(4) {
             put(out, row, 1, l, Color::Grey, w);
             row += 1;
         }

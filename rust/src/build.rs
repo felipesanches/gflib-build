@@ -40,6 +40,7 @@ pub struct Shared {
     pub jobs: usize,
     pub percent: f64,
     pub backend: String,
+    pub compare: bool,
     pub cver_cache: HashMap<(String, String), String>,
     pub bver_cache: HashMap<(String, String), String>,
     pub failure_history: Vec<FailHist>,
@@ -166,6 +167,7 @@ impl Orchestrator {
             jobs,
             percent: cfg.percent,
             backend: cfg.backend.clone(),
+            compare: cfg.compare,
             cver_cache: HashMap::new(),
             bver_cache: HashMap::new(),
             failure_history,
@@ -336,7 +338,8 @@ impl Orchestrator {
     }
 
     fn backend_order(&self) -> Vec<String> {
-        match self.cfg.backend.as_str() {
+        let backend = self.shared.lock().unwrap().backend.clone(); // live (editable via config tab)
+        match backend.as_str() {
             "fontc" => vec!["fontc".into()],
             "fontmake" => vec!["fontmake".into()],
             "both" => vec!["fontc".into(), "fontmake".into()],
@@ -484,7 +487,8 @@ impl Orchestrator {
                 .count();
             // optional sha256 vs-shipped comparison (metadata mode, --compare): the Rust-migration
             // signal — did this backend reproduce exactly what GF ships?
-            let cmp = if self.cfg.compare {
+            let live_compare = self.shared.lock().unwrap().compare;
+            let cmp = if live_compare {
                 match &self.cfg.google_fonts {
                     Some(gf) => compare_to_shipped(gf, &fam, &found),
                     None => String::new(),
@@ -654,6 +658,10 @@ impl Orchestrator {
             if let Some(b) = &set.backend {
                 sh.backend = b.clone();
                 log.push(format!("backend → {}", b));
+            }
+            if let Some(c) = set.compare {
+                sh.compare = c;
+                log.push(format!("compare → {}", if c { "on" } else { "off" }));
             }
             if let Some(retry) = &set.retry {
                 for slug in retry {
@@ -927,7 +935,15 @@ impl Orchestrator {
             tasks: Vec::new(),
             archive_recent: Vec::new(),
             archive,
-            config: config_map(&self.cfg),
+            config: {
+                // reflect the LIVE (config-tab-editable) values so the form shows current state
+                let mut c = config_map(&self.cfg);
+                c.insert("jobs".into(), serde_json::json!(sh.jobs));
+                c.insert("percent".into(), serde_json::json!(sh.percent));
+                c.insert("backend".into(), serde_json::json!(sh.backend));
+                c.insert("compare".into(), serde_json::json!(sh.compare));
+                c
+            },
             control_log: sh.control_log.clone(),
             dep_relaxations: self.venvs.as_ref().map(|v| v.relaxations()).unwrap_or_default(),
             config_path: self.cfg.data_dir.join("gflib-build.config").to_string_lossy().to_string(),
