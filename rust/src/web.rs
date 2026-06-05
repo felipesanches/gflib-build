@@ -305,6 +305,7 @@ const SCHEMA=[
  {k:'retry_failed',l:'retry ALL failed (incl. genuine errors)',t:'bool',live:false},
  {k:'compare',l:'compare to shipped',t:'bool',live:true},
  {k:'fontspector_qa',l:'fontspector QA on green builds',t:'bool',live:false},
+ {k:'build_debs',l:'build .deb packages (auto-package built families)',t:'bool',live:true},
 ];
 function human(n){n=n||0;const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return (i?n.toFixed(1):n)+u[i]}
 function hms(s){s=Math.max(0,s|0);return [s/3600|0,(s%3600)/60|0,s%60].map(x=>String(x).padStart(2,'0')).join(':')}
@@ -454,7 +455,7 @@ function showIf(k,cf){const s=x=>(cf[x]==null?'':''+cf[x]);
  return true}
 const CHOICES={source:['metadata','archive'],backend:['auto','fontc','fontmake','both']};
 // the keys the daemon actually honours live (same set as the TUI's cfg_apply_live) → editable form controls
-const LIVE_APPLY={backend:1,jobs:1,percent:1,compare:1};
+const LIVE_APPLY={backend:1,jobs:1,percent:1,compare:1,build_debs:1};
 function cfgView(){const cf=snap.config||{};
  let h='<div class="sec">Configuration — edit settings (live where possible)</div><table class="cfg">';
  SCHEMA.filter(f=>showIf(f.k,cf)).forEach(f=>{

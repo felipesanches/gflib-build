@@ -64,6 +64,8 @@ pub struct Shared {
     pub qa_active: Vec<String>,               // families being QA'd right now
     pub qa_done: HashSet<String>,             // families QA'd this run (de-dup)
     pub qa_init: bool,                        // QA subsystem ready (binary resolved + queue seeded, or disabled)
+    pub build_debs: bool,                     // SETTING (live): auto-draft+build .debs for built families
+    pub packaged: HashSet<String>,            // families already packaged this session (de-dup; cleared on rebuild)
     pub fontspector: Option<crate::model::FontspectorView>, // live aggregate (also written to _summary.json)
     // cohort map (R1: preserved across resume/migration; populated by R2's VenvManager later)
     pub cohort_members: BTreeMap<String, Vec<String>>,
@@ -212,6 +214,8 @@ impl Orchestrator {
             qa_active: Vec::new(),
             qa_done: HashSet::new(),
             qa_init: false,
+            build_debs: cfg.build_debs,
+            packaged: HashSet::new(),
             fontspector: None,
             cohort_members: state.cohort_members,
             cohort_reqs: state.cohort_reqs,
@@ -284,6 +288,7 @@ impl Orchestrator {
         self.ensure_workers(jobs);
         self.spawn_archive_prewarmer();
         self.spawn_qa();
+        self.spawn_package_worker(); // parks until build_debs is on; then packages built families live
         self.spawn_status_writer();
         self.spawn_size_thread();
         self.spawn_control_watcher();
@@ -566,6 +571,7 @@ impl Orchestrator {
                     r.started = now();
                     r.note = "checkout".into();
                 }
+                sh.packaged.remove(&slug); // a (re)build supersedes any prior package → repackage it
                 slug
             };
             self.active.fetch_add(1, Ordering::Relaxed);
@@ -1040,7 +1046,9 @@ impl Orchestrator {
             ));
             self.emit("built", slug, serde_json::json!({"backend": used, "bytes": bytes, "compare": cmp}));
             self.enqueue_qa(slug);
-            if !self.cfg.keep_fonts {
+            // keep the built fonts when deb-packaging is on: the live package worker needs them on
+            // disk (otherwise --discard-fonts would prune them before it can assemble the .deb).
+            if !self.cfg.keep_fonts && !self.shared.lock().unwrap().build_debs {
                 let _ = std::fs::remove_dir_all(&out_dir);
             }
             let _ = i;
@@ -1142,6 +1150,7 @@ impl Orchestrator {
         let mut log = Vec::new();
         let mut new_jobs = None;
         let mut freeze_sig = None;
+        let mut persist_build_debs = None;
         {
             let mut sh = self.shared.lock().unwrap();
             if let Some(j) = set.jobs {
@@ -1202,6 +1211,11 @@ impl Orchestrator {
                 sh.compare = c;
                 log.push(format!("compare → {}", if c { "on" } else { "off" }));
             }
+            if let Some(b) = set.build_debs {
+                sh.build_debs = b;
+                persist_build_debs = Some(b);
+                log.push(format!("build .deb packages → {}", if b { "on" } else { "off" }));
+            }
             if let Some(retry) = &set.retry {
                 for slug in retry {
                     if let Some(r) = sh.results.get_mut(slug) {
@@ -1241,6 +1255,13 @@ impl Orchestrator {
         // freeze/thaw the in-flight builds AFTER releasing the shared lock (signalling never holds it)
         if let Some(sig) = freeze_sig {
             self.signal_running(sig);
+        }
+        // persist a live build_debs toggle so the next run / a bare `--export-deb` agrees on disk
+        if let Some(b) = persist_build_debs {
+            let path = self.cfg.data_dir.join("gflib-build.config");
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("build_debs".to_string(), serde_json::json!(b));
+            let _ = crate::config::save_config_map(&path, &m);
         }
         if let Some(j) = new_jobs {
             self.ensure_workers(j);
@@ -1311,6 +1332,97 @@ impl Orchestrator {
 
     pub fn elapsed(&self) -> f64 {
         self.resumed_elapsed + (now() - self.start_time)
+    }
+
+    fn spawn_package_worker(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        thread::spawn(move || me.package_worker_loop());
+    }
+
+    /// Live incremental packaging (the auto path that retires manual `--export-deb`): while build_debs
+    /// is on, draft + build + validate the .deb for each built family not yet packaged, writing
+    /// packaging/index.json + build-results.json as it goes. Parks while paused (frozen) so a
+    /// resource-freeing pause also pauses packaging.
+    fn package_worker_loop(self: Arc<Self>) {
+        if self.cfg.dry_run {
+            return; // the mockup writes nothing persistent
+        }
+        let pkg_root = self.cfg.build_dir.join("packaging");
+        // Append to any prior index/results across restarts; seed `packaged` so we don't redo them.
+        let mut index = read_pkg_index(&pkg_root);
+        let mut results = read_deb_results(&pkg_root);
+        {
+            let mut sh = self.shared.lock().unwrap();
+            for k in index.keys() {
+                sh.packaged.insert(k.clone());
+            }
+            for k in results.keys() {
+                sh.packaged.insert(k.clone());
+            }
+        }
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            if self.frozen.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(300)); // paused: also pause packaging
+                continue;
+            }
+            // pick the next built-but-unpackaged family (only while build_debs is on)
+            let pick = {
+                let sh = self.shared.lock().unwrap();
+                if !sh.build_debs {
+                    None
+                } else {
+                    sh.results
+                        .values()
+                        .find(|r| r.status == "built" && !sh.packaged.contains(&r.slug))
+                        .map(|r| r.slug.clone())
+                }
+            };
+            let slug = match pick {
+                Some(s) => s,
+                None => {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            };
+            // gather inputs under the lock, then package OUTSIDE it (dpkg-deb is slow)
+            let (res, fam, cohort_req) = {
+                let sh = self.shared.lock().unwrap();
+                let res = sh.results.get(&slug).cloned();
+                let fam = sh.families.get(&slug).cloned();
+                let creq = res.as_ref().and_then(|r| sh.cohort_reqs.get(&r.cohort).cloned());
+                (res, fam, creq)
+            };
+            let (res, fam) = match (res, fam) {
+                (Some(r), Some(f)) => (r, f),
+                _ => {
+                    self.shared.lock().unwrap().packaged.insert(slug.clone());
+                    continue;
+                }
+            };
+            let lint = crate::deb::on_path("lintian");
+            let o = crate::deb::package_one_family(
+                &self.cfg.build_dir,
+                &slug,
+                &res,
+                &fam,
+                self.cfg.google_fonts.as_deref(),
+                cohort_req.as_ref(),
+                true,
+                lint,
+            );
+            if let Some(e) = o.index_entry {
+                index.insert(slug.clone(), e);
+            }
+            if let Some(d) = o.deb_result {
+                results.insert(slug.clone(), d);
+            }
+            self.shared.lock().unwrap().packaged.insert(slug.clone());
+            write_pkg_index(&pkg_root, &index);
+            write_deb_results(&pkg_root, &results);
+        }
     }
 
     pub fn request_stop(&self) {
@@ -1830,6 +1942,66 @@ fn resolve_config(google_fonts: Option<&Path>, fam: &Family, work: &Path) -> Res
     Err("no config.yaml found (no override, no in-repo config)".into())
 }
 
+// ---- incremental packaging index/results I/O (the live package worker appends across restarts) ----
+
+fn read_pkg_index(pkg_root: &Path) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut m = std::collections::BTreeMap::new();
+    if let Ok(txt) = std::fs::read_to_string(pkg_root.join("index.json")) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+            if let Some(arr) = v.get("packages").and_then(|p| p.as_array()) {
+                for e in arr {
+                    if let Some(slug) = e.get("slug").and_then(|s| s.as_str()) {
+                        m.insert(slug.to_string(), e.clone());
+                    }
+                }
+            }
+        }
+    }
+    m
+}
+
+fn write_pkg_index(pkg_root: &Path, index: &std::collections::BTreeMap<String, serde_json::Value>) {
+    let _ = std::fs::create_dir_all(pkg_root);
+    let packages: Vec<&serde_json::Value> = index.values().collect();
+    let doc = serde_json::json!({ "schema_version": 1, "count": packages.len(), "packages": packages });
+    if let Ok(txt) = serde_json::to_string_pretty(&doc) {
+        atomic_write(&pkg_root.join("index.json"), &txt);
+    }
+}
+
+fn read_deb_results(pkg_root: &Path) -> serde_json::Map<String, serde_json::Value> {
+    if let Ok(txt) = std::fs::read_to_string(pkg_root.join("build-results.json")) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+            if let Some(r) = v.get("results").and_then(|r| r.as_object()) {
+                return r.clone();
+            }
+        }
+    }
+    serde_json::Map::new()
+}
+
+fn write_deb_results(pkg_root: &Path, results: &serde_json::Map<String, serde_json::Value>) {
+    let _ = std::fs::create_dir_all(pkg_root);
+    let built = results
+        .values()
+        .filter(|d| d.get("built").and_then(|b| b.as_bool()).unwrap_or(false))
+        .count();
+    let failed = results.len().saturating_sub(built);
+    let doc = serde_json::json!({ "schema_version": 1, "built": built, "failed": failed, "results": results });
+    if let Ok(txt) = serde_json::to_string_pretty(&doc) {
+        atomic_write(&pkg_root.join("build-results.json"), &txt);
+    }
+}
+
+/// Write `txt` to `path` atomically (temp + rename) so a concurrent reader (the snapshot's deb_status
+/// scan, ~1 Hz) never sees a torn file.
+fn atomic_write(path: &Path, txt: &str) {
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, txt).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 // POSIX signal numbers (Linux). Builders run as their own process-group leaders so these reach the
 // whole tree (python -> fontmake -> ninja/ttx). Freeze=SIGSTOP, thaw=SIGCONT, reap-on-stop=SIGKILL.
 const SIGKILL: i32 = 9;
@@ -2216,6 +2388,32 @@ mod tests {
         assert_eq!(mirror_path(ar, "https://github.com/googlefonts/foo"), Path::new("/arch/googlefonts/foo.git"));
         assert_eq!(mirror_path(ar, "https://github.com/googlefonts/foo.git"), Path::new("/arch/googlefonts/foo.git"));
         assert_eq!(mirror_path(ar, "git@github.com:owner/bar.git"), Path::new("/arch/owner/bar.git"));
+    }
+
+    #[test]
+    fn packaging_io_roundtrips_and_counts() {
+        let dir = std::env::temp_dir().join(format!("gflib-debio-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // build-results.json: round-trips per-slug and recomputes built/failed
+        let mut results = serde_json::Map::new();
+        results.insert("ofl/a".into(), serde_json::json!({"built": true, "package": "fonts-gf-a"}));
+        results.insert("ofl/b".into(), serde_json::json!({"built": false, "error": "x"}));
+        write_deb_results(&dir, &results);
+        let back = read_deb_results(&dir);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back["ofl/a"]["built"], serde_json::json!(true));
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("build-results.json")).unwrap()).unwrap();
+        assert_eq!(doc["built"], serde_json::json!(1));
+        assert_eq!(doc["failed"], serde_json::json!(1));
+        // index.json: keyed by slug, round-trips
+        let mut index = std::collections::BTreeMap::new();
+        index.insert("ofl/a".to_string(), serde_json::json!({"slug":"ofl/a","package":"fonts-gf-a"}));
+        write_pkg_index(&dir, &index);
+        let bi = read_pkg_index(&dir);
+        assert_eq!(bi.len(), 1);
+        assert_eq!(bi["ofl/a"]["package"], serde_json::json!("fonts-gf-a"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

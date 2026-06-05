@@ -345,6 +345,7 @@ pub struct ControlSet {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub compare: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_all: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub build_debs: Option<bool>,
 }
 
 #[cfg(test)]

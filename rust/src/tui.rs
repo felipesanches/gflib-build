@@ -96,7 +96,7 @@ fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
         ("retry_failed", "retry ALL failed (incl. genuine errors)", CfgKind::Bool, false),
         ("compare", "compare to shipped", CfgKind::Bool, true),
         ("fontspector_qa", "fontspector QA on green builds", CfgKind::Bool, false),
-        ("build_debs", "build .deb packages (during --export-deb)", CfgKind::Bool, false),
+        ("build_debs", "build .deb packages (auto-package built families)", CfgKind::Bool, true),
     ]
 }
 
@@ -314,6 +314,11 @@ fn cfg_apply_live(fields: &[CfgField], snap: &Snapshot, src: &dyn Source) -> Str
     if changed("compare") {
         if let Some(c) = new.get("compare").and_then(|v| v.as_bool()) {
             set.compare = Some(c);
+        }
+    }
+    if changed("build_debs") {
+        if let Some(b) = new.get("build_debs").and_then(|v| v.as_bool()) {
+            set.build_debs = Some(b); // live: starts/stops the auto-packaging worker
         }
     }
     src.control(&set);

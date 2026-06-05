@@ -741,7 +741,8 @@ pub fn package_metadata(build_dir: &Path, slug: &str) -> String {
             out.push('\n');
         }
         None => out.push_str(
-            "══ binary package ══\n(not built yet — turn on the build_debs setting and run --export-deb)\n\n",
+            "══ binary package ══\n(not built yet — enable 'build .deb packages' in the config tab; \
+             the daemon then auto-packages built families)\n\n",
         ),
     }
     let dpath = pkg_root.join(slug.replace('/', "__")).join("debian");
@@ -795,7 +796,7 @@ const DEB_TOOLS: [(&str, &str, &str); 5] = [
 ];
 
 /// Is `prog` an executable on PATH? Scans PATH directly — no subprocess.
-fn on_path(prog: &str) -> bool {
+pub fn on_path(prog: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let path = match std::env::var("PATH") {
         Ok(p) => p,
