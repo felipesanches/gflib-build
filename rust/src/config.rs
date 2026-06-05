@@ -252,7 +252,7 @@ fn merge_persisted(cfg: &mut Config, loaded: &BTreeMap<String, serde_json::Value
             "fontc_bin" => cfg.fontc_bin = s(v),
             "builder3_bin" => cfg.builder3_bin = s(v),
             "build_python" => if let Some(x) = s(v) { cfg.build_python = x },
-            "jobs" => if let Some(x) = v.as_u64() { cfg.jobs = x as usize },
+            "jobs" => if let Some(x) = v.as_u64() { if x > 0 { cfg.jobs = x as usize } }, // ignore a stale persisted 0
             "percent" => if let Some(x) = v.as_f64() { cfg.percent = x },
             "compare" => if let Some(x) = v.as_bool() { cfg.compare = x },
             "manage_venvs" => if let Some(x) = v.as_bool() { cfg.manage_venvs = x },
@@ -281,7 +281,7 @@ pub fn save_config(cfg: &Config) {
     m.insert("fontc_bin".into(), json!(cfg.fontc_bin));
     m.insert("builder3_bin".into(), json!(cfg.builder3_bin));
     m.insert("build_python".into(), json!(cfg.build_python));
-    m.insert("jobs".into(), json!(cfg.jobs));
+    m.insert("jobs".into(), json!(cfg.jobs.max(1))); // never persist a transient --jobs 0 (inspect-only)
     m.insert("percent".into(), json!(cfg.percent));
     m.insert("compare".into(), json!(cfg.compare));
     m.insert("manage_venvs".into(), json!(cfg.manage_venvs));
