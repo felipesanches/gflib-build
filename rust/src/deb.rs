@@ -1,14 +1,14 @@
 //! `--export-deb`: draft a Debian source-package tree (`debian/`) for every successfully-built
 //! family, so gflib-build's results can feed the self-hosted complementary apt repo. Read-only
-//! w.r.t. the archive and the build outputs; only writes under
-//! `<build_dir>/packaging/<slug__>/debian/`. See `docs/debian-packaging-plan.md`.
+//! w.r.t. the archive and the build outputs; only writes under `<build_dir>/packaging/`.
+//! See `docs/debian-packaging-plan.md`.
 //!
 //! A family is drafted only when it BOTH (a) has `status=="built"` in state.json AND (b) still has
 //! >=1 `.ttf`/`.otf` on disk under `<build_dir>/out/<logname>/` — out dirs are deleted after a build
 //! that ran without `--keep-fonts`, so "built" alone does NOT imply fonts are present.
 
 use crate::{config, discover, model, persist, util};
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 const MAINTAINER: &str = "Google Fonts Deb-Packaging (gflib-build) <juca@members.fsf.org>";
@@ -31,10 +31,15 @@ pub fn run_export_deb(cfg: &config::Config) {
             }
         },
     };
-    let by_slug: BTreeMap<&str, &model::Family> =
+    let by_slug: std::collections::BTreeMap<&str, &model::Family> =
         fams.iter().map(|f| (f.slug.as_str(), f)).collect();
 
+    // Re-runs must be idempotent: wipe the packaging tree so stale dirs from a previous, larger
+    // run never linger (the index would otherwise diverge from disk). It is pure generated output
+    // under the build dir; fully reproducible from state + sources.
     let pkg_root = cfg.build_dir.join("packaging");
+    let _ = std::fs::remove_dir_all(&pkg_root);
+
     let gf = cfg.google_fonts.clone();
     let mut index: Vec<serde_json::Value> = Vec::new();
     let (mut exported, mut no_fam, mut no_fonts, mut lic_fallback) = (0usize, 0usize, 0usize, 0usize);
@@ -58,10 +63,14 @@ pub fn run_export_deb(cfg: &config::Config) {
             no_fonts += 1;
             continue;
         }
-        let font_names: Vec<String> = fonts
+        // De-duplicate by basename: `--backend both` writes the SAME basename under out/.../fontc/
+        // and out/.../fontmake/, so a naive walk would list every font twice.
+        let mut font_names: Vec<String> = fonts
             .iter()
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
             .collect();
+        let mut seen = BTreeSet::new();
+        font_names.retain(|n| seen.insert(n.clone()));
         let has_ttf = font_names.iter().any(|n| n.to_ascii_lowercase().ends_with(".ttf"));
         let has_otf = font_names.iter().any(|n| n.to_ascii_lowercase().ends_with(".otf"));
 
@@ -71,7 +80,9 @@ pub fn run_export_deb(cfg: &config::Config) {
         }
         let pkg = pkg_name(slug);
         let short = short_commit(&fam.commit);
-        let epoch = if res.ended > 0.0 { res.ended } else { util::now() };
+        // Deterministic: a missing build timestamp (ended==0) yields 1970-01-01 rather than churning
+        // the version on every run via wall-clock now().
+        let epoch = res.ended.max(0.0);
         let version = format!("0~gf{}.g{}-1", ymd(epoch), short);
 
         let debian = pkg_root.join(util::slug_to_logname(slug)).join("debian");
@@ -79,49 +90,56 @@ pub fn run_export_deb(cfg: &config::Config) {
             eprintln!("skip {}: cannot create {}", slug, debian.display());
             continue;
         }
+        let rules_path = debian.join("rules");
+        let holder = copyright_holder(gf.as_deref(), slug);
 
-        write(&debian.join("control"), &control(&pkg, fam, spdx));
-        let r = debian.join("rules");
-        write(&r, &rules(&pkg, has_ttf, has_otf));
-        set_exec(&r);
-        write(
-            &debian.join("copyright"),
-            &copyright(fam, dep5, &copyright_holder(gf.as_deref(), slug)),
-        );
-        write(
-            &debian.join("changelog"),
-            &changelog(&pkg, &version, slug, &fam.commit, epoch),
-        );
-        write(&debian.join("watch"), &watch(&fam.url));
-        write(&debian.join("source/format"), "3.0 (quilt)\n");
-        write(
-            &debian.join("gflib-provenance"),
-            &provenance(slug, &pkg, spdx, fam, res, st.cohort_reqs.get(&res.cohort), &font_names),
-        );
+        // Write every file, checking each result; on ANY failure skip the family entirely (do not
+        // count it as exported or index it — a half-written tree is not a real package).
+        let writes: Vec<(PathBuf, String)> = vec![
+            (debian.join("control"), control(&pkg, fam, spdx)),
+            (rules_path.clone(), rules(&pkg, has_ttf, has_otf)),
+            (debian.join("copyright"), copyright(fam, dep5, &holder)),
+            (debian.join("changelog"), changelog(&pkg, &version, slug, &fam.commit, epoch)),
+            (debian.join("watch"), watch(&fam.url)),
+            (debian.join("source/format"), "3.0 (quilt)\n".to_string()),
+            (
+                debian.join("gflib-provenance"),
+                provenance(slug, &pkg, spdx, fallback, fam, res, st.cohort_reqs.get(&res.cohort), &font_names),
+            ),
+        ];
+        let mut ok = true;
+        for (p, content) in &writes {
+            if std::fs::write(p, content).is_err() {
+                eprintln!("skip {}: cannot write {}", slug, p.display());
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        set_exec(&rules_path);
 
         index.push(serde_json::json!({
             "slug": slug, "package": pkg, "version": version, "license": spdx,
-            "fonts": font_names.len(), "backend": res.backend,
+            "license_assumed": fallback, "fonts": font_names.len(), "backend": res.backend,
             "compiler_version": res.compiler_version,
         }));
         exported += 1;
     }
 
     let _ = std::fs::create_dir_all(&pkg_root);
-    if let Ok(txt) = serde_json::to_string_pretty(&index) {
+    let doc = serde_json::json!({ "schema_version": 1, "count": index.len(), "packages": index });
+    if let Ok(txt) = serde_json::to_string_pretty(&doc) {
         let _ = std::fs::write(pkg_root.join("index.json"), txt);
     }
-    eprintln!(
-        "export-deb: drafted {} package(s) under {}",
-        exported,
-        pkg_root.display()
-    );
+    eprintln!("export-deb: drafted {} package(s) under {}", exported, pkg_root.display());
     eprintln!(
         "  skipped: {} built-but-not-in-worklist, {} built-but-no-fonts-on-disk (pruned without --keep-fonts){}",
         no_fam,
         no_fonts,
         if lic_fallback > 0 {
-            format!(", {} license-fallback (prefix not ofl/ufl/apache -> OFL-1.1, review)", lic_fallback)
+            format!(", {} license-ASSUMED OFL-1.1 (prefix not ofl/ufl/apache -> VERIFY)", lic_fallback)
         } else {
             String::new()
         }
@@ -131,6 +149,8 @@ pub fn run_export_deb(cfg: &config::Config) {
 // ---- helpers ----
 
 /// Recursively collect .ttf/.otf files under `dir` (out/<logname>/ may nest fontc/ + fontmake/).
+/// Uses `file_type()` (no symlink follow) so a stray symlink can't send the walk on an infinite
+/// upward chase.
 fn collect_fonts(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -140,13 +160,19 @@ fn collect_fonts(dir: &Path) -> Vec<PathBuf> {
             Err(_) => continue,
         };
         for ent in rd.flatten() {
+            let ft = match ent.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
             let path = ent.path();
-            if path.is_dir() {
+            if ft.is_dir() {
                 stack.push(path);
-            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let e = ext.to_ascii_lowercase();
-                if e == "ttf" || e == "otf" {
-                    out.push(path);
+            } else if ft.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    let e = ext.to_ascii_lowercase();
+                    if e == "ttf" || e == "otf" {
+                        out.push(path);
+                    }
                 }
             }
         }
@@ -161,11 +187,11 @@ fn license_for(slug: &str) -> (&'static str, &'static str, bool) {
         "ofl" => ("OFL-1.1", "OFL-1.1", false),
         "ufl" => ("UFL-1.0", "UFL-1.0", false),
         "apache" => ("Apache-2.0", "Apache-2.0", false),
-        _ => ("OFL-1.1", "OFL-1.1", true), // dominant GF license; flagged for review
+        _ => ("OFL-1.1", "OFL-1.1", true), // dominant GF license; flagged + marked for review
     }
 }
 
-/// Debian binary package name `fonts-gf-<family>` (lowercase, [a-z0-9.+-]; must start alnum).
+/// Debian binary package name `fonts-gf-<family>` (lowercase, [a-z0-9.+-]; must start AND end alnum).
 fn pkg_name(slug: &str) -> String {
     let fam = slug.splitn(2, '/').nth(1).unwrap_or(slug);
     let mut s: String = fam
@@ -179,23 +205,36 @@ fn pkg_name(slug: &str) -> String {
             }
         })
         .collect();
+    while s.contains("--") {
+        s = s.replace("--", "-");
+    }
     while s.chars().next().map(|c| !c.is_ascii_alphanumeric()).unwrap_or(false) {
         s.remove(0);
+    }
+    while s.chars().last().map(|c| !c.is_ascii_alphanumeric()).unwrap_or(false) {
+        s.pop();
+    }
+    if s.is_empty() {
+        // all-symbol / non-ASCII family name (not producible from real ASCII GF/GitHub slugs, but
+        // never emit the invalid "fonts-gf-"): a deterministic, collision-resistant token.
+        let h = slug.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+        s = format!("x{:08x}", h);
     }
     format!("fonts-gf-{}", s)
 }
 
 fn short_commit(c: &str) -> String {
-    let n = c.len().min(7);
-    if n == 0 {
+    let s: String = c.chars().take(7).collect(); // char-safe (never splits a UTF-8 boundary)
+    if s.is_empty() {
         "0000000".to_string()
     } else {
-        c[..n].to_string()
+        s
     }
 }
 
-fn write(p: &Path, s: &str) {
-    let _ = std::fs::write(p, s);
+/// Collapse to a single safe line (defensive: control/copyright fields must not contain raw CR/LF).
+fn oneline(s: &str) -> String {
+    s.replace(['\r', '\n'], " ").trim().to_string()
 }
 
 fn set_exec(p: &Path) {
@@ -209,15 +248,27 @@ fn set_exec(p: &Path) {
 
 fn copyright_holder(google_fonts: Option<&Path>, slug: &str) -> String {
     if let Some(gf) = google_fonts {
-        // OFL.txt/UFL.txt carry the real holder on their first "Copyright" line; the Apache LICENSE
-        // is the license TEXT (its appendix has a "Copyright [yyyy] [name of copyright owner]"
-        // placeholder), so skip placeholder lines and try a NOTICE file for Apache families.
+        // OFL.txt/UFL.txt carry the real holder on their first "Copyright" line(s); the Apache
+        // LICENSE is the license TEXT (placeholder "Copyright [yyyy] [name of copyright owner]"),
+        // and a bare OFL license body has the template "Copyright (c) <dates>, <Copyright Holder>".
+        // Skip placeholder lines; join the copyright's continuation lines (the "with Reserved Font
+        // Name" clause) so it is not truncated.
         for lf in ["OFL.txt", "UFL.txt", "NOTICE", "LICENSE.txt", "LICENSE"] {
-            if let Ok(txt) = std::fs::read_to_string(gf.join(slug).join(lf)) {
-                for line in txt.lines() {
+            if let Ok(raw) = std::fs::read_to_string(gf.join(slug).join(lf)) {
+                let txt = raw.strip_prefix('\u{feff}').unwrap_or(&raw); // strip UTF-8 BOM
+                let lines: Vec<&str> = txt.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
                     let t = line.trim();
                     if t.starts_with("Copyright") && !is_license_placeholder(t) {
-                        return t.to_string();
+                        let mut parts = vec![t.to_string()];
+                        for nxt in lines[i + 1..].iter().take(2) {
+                            let n = nxt.trim();
+                            if n.is_empty() {
+                                break;
+                            }
+                            parts.push(n.to_string());
+                        }
+                        return oneline(parts.join(" ").trim_end_matches(',').trim());
                     }
                 }
             }
@@ -229,13 +280,17 @@ fn copyright_holder(google_fonts: Option<&Path>, slug: &str) -> String {
 /// True for boilerplate "Copyright" lines that are license-template placeholders, not a real holder.
 fn is_license_placeholder(s: &str) -> bool {
     let l = s.to_ascii_lowercase();
-    l.contains("[yyyy]") || l.contains("[name of copyright owner]") || l.contains("[year]") || l.contains("<year>")
+    l.contains("[yyyy]")
+        || l.contains("[name of copyright owner]")
+        || l.contains("[year]")
+        || (l.contains('<') && l.contains('>')) // <dates>, <Copyright Holder>, <URL|email>, <year>
 }
 
 fn control(pkg: &str, fam: &model::Family, spdx: &str) -> String {
     // Built line-by-line (NOT via `\n\` continuation, which strips the leading whitespace that
     // control-file field folding and the long Description require).
-    let name = if fam.name.is_empty() { pkg } else { fam.name.as_str() };
+    let name = oneline(if fam.name.is_empty() { pkg } else { fam.name.as_str() });
+    let url = oneline(&fam.url);
     let mut v: Vec<String> = vec![
         format!("Source: {}", pkg),
         "Section: fonts".into(),
@@ -248,9 +303,9 @@ fn control(pkg: &str, fam: &model::Family, spdx: &str) -> String {
         "Standards-Version: 4.6.2".into(),
         "Rules-Requires-Root: no".into(),
     ];
-    if !fam.url.is_empty() {
-        v.push(format!("Homepage: {}", fam.url));
-        v.push(format!("Vcs-Browser: {}", fam.url));
+    if !url.is_empty() {
+        v.push(format!("Homepage: {}", url));
+        v.push(format!("Vcs-Browser: {}", url));
     }
     v.push(String::new()); // blank line between source and binary paragraph
     v.push(format!("Package: {}", pkg));
@@ -311,6 +366,9 @@ fn copyright(fam: &model::Family, dep5: &str, holder: &str) -> String {
         "UFL-1.0" => "License: UFL-1.0\n Licensed under the Ubuntu Font Licence 1.0. The full text is distributed with\n the upstream source (see Source) as UFL.txt.\n",
         _ => "License: OFL-1.1\n This Font Software is licensed under the SIL Open Font License, Version 1.1.\n Available with a FAQ at https://openfontlicense.org ; the full text is\n distributed with the upstream source (see Source) as OFL.txt.\n",
     };
+    let name = oneline(&fam.name);
+    let url = oneline(&fam.url);
+    let holder = oneline(holder);
     format!(
         "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n\
 Upstream-Name: {name}\n\
@@ -325,8 +383,8 @@ Copyright: {holder}\n\
 License: {dep5}\n\
 \n\
 {stanza}",
-        name = fam.name,
-        url = fam.url,
+        name = name,
+        url = url,
         holder = holder,
         dep5 = dep5,
         stanza = stanza,
@@ -348,6 +406,7 @@ fn changelog(pkg: &str, version: &str, slug: &str, commit: &str, epoch: f64) -> 
 }
 
 fn watch(url: &str) -> String {
+    let url = oneline(url);
     if url.is_empty() {
         return "version=4\n# no upstream URL recorded\n".to_string();
     }
@@ -361,10 +420,12 @@ opts=\"mode=git, pgpmode=none\" \\\n\
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn provenance(
     slug: &str,
     pkg: &str,
     spdx: &str,
+    license_assumed: bool,
     fam: &model::Family,
     res: &model::Res,
     cohort_reqs: Option<&String>,
@@ -375,8 +436,12 @@ fn provenance(
     s.push_str(&format!("family: {}\n", slug));
     s.push_str(&format!("package: {}\n", pkg));
     s.push_str(&format!("license: {}\n", spdx));
+    if license_assumed {
+        s.push_str("# WARNING: license ASSUMED -- slug prefix is not ofl/ufl/apache; VERIFY against upstream\n");
+        s.push_str("license_assumed: true\n");
+    }
     s.push_str("source:\n");
-    s.push_str(&format!("  repo: {}\n", fam.url));
+    s.push_str(&format!("  repo: {}\n", oneline(&fam.url)));
     s.push_str(&format!("  commit: {}\n", fam.commit));
     let cfgp = if !fam.config_yaml.is_empty() {
         fam.config_yaml.clone()
@@ -473,17 +538,23 @@ mod tests {
     fn package_names_sanitize() {
         assert_eq!(pkg_name("ofl/oswald"), "fonts-gf-oswald");
         assert_eq!(pkg_name("apache/roboto_slab"), "fonts-gf-roboto-slab");
+        assert_eq!(pkg_name("ofl/abc-"), "fonts-gf-abc"); // trailing separator stripped
+        assert_eq!(pkg_name("ofl/a--b"), "fonts-gf-a-b"); // runs collapsed
+        assert!(pkg_name("ofl/日本語").starts_with("fonts-gf-x")); // non-empty deterministic token
+        assert_ne!(pkg_name("ofl/日本語"), pkg_name("ofl/한국어")); // no collision
     }
 
     #[test]
     fn short_commit_caps() {
         assert_eq!(short_commit("abc1234deadbeef"), "abc1234");
         assert_eq!(short_commit(""), "0000000");
+        assert_eq!(short_commit("café567"), "café567".chars().take(7).collect::<String>()); // no panic
     }
 
     #[test]
     fn rejects_license_placeholder_holder() {
         assert!(is_license_placeholder("Copyright [yyyy] [name of copyright owner]"));
+        assert!(is_license_placeholder("Copyright (c) <dates>, <Copyright Holder> (<URL|email>)"));
         assert!(!is_license_placeholder(
             "Copyright 2011 The ABeeZee Project Authors, with Reserved Font Name 'ABeeZee'"
         ));
@@ -494,6 +565,7 @@ mod tests {
         // 1700000000 = Tue, 14 Nov 2023 22:13:20 UTC
         assert_eq!(ymd(1700000000.0), "20231114");
         assert_eq!(rfc2822(1700000000.0), "Tue, 14 Nov 2023 22:13:20 +0000");
+        assert_eq!(ymd(0.0), "19700101"); // deterministic when ended==0
     }
 
     #[test]

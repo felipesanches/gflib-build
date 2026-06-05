@@ -1308,6 +1308,18 @@ impl Orchestrator {
 
     /// Build the live snapshot rendered by every frontend and written to status.json.
     pub fn snapshot(&self) -> Snapshot {
+        // packaging status: read packaging/ ONCE, BEFORE taking the central lock, so the readdir
+        // never stalls other threads on the mutex. "drafted" = a packaging/<slug__>/ directory
+        // exists (keep only real subdirectories, skipping index.json).
+        let drafted: std::collections::HashSet<String> =
+            std::fs::read_dir(self.cfg.build_dir.join("packaging"))
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
         let sh = self.shared.lock().unwrap();
         let mut counts = Counts::default();
         let mut backends = Backends::default();
@@ -1317,13 +1329,6 @@ impl Orchestrator {
         let mut fails = Vec::new();
         let mut built = Vec::new();
         let mut fail_cat: BTreeMap<String, (usize, Vec<String>, &'static str)> = BTreeMap::new();
-        // packaging status: a family is "drafted" when its debian/ tree exists under
-        // <build_dir>/packaging/<slug__>/. Read that dir ONCE per snapshot (cheap) into a set
-        // rather than stat-ing per built family in the render hot path.
-        let drafted: std::collections::HashSet<String> =
-            std::fs::read_dir(self.cfg.build_dir.join("packaging"))
-                .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
-                .unwrap_or_default();
 
         for r in sh.results.values() {
             match r.status.as_str() {
