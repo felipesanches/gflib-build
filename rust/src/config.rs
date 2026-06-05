@@ -289,12 +289,39 @@ pub fn save_config(cfg: &Config) {
     m.insert("build_debs".into(), json!(cfg.build_debs));
     // 'ui' is intentionally NOT persisted (per-invocation choice — see merge_persisted).
     m.insert("web_port".into(), json!(cfg.web_port));
+    let _ = save_config_map(&path, &m);
+}
+
+/// Read-merge-write the persisted config: overlay `overrides` onto the existing on-disk config and
+/// write it back atomically (temp + rename). This is the single low-level writer — both save_config
+/// and the TUI's live 'apply' go through it so the persisted key set never drifts from the loader's,
+/// and the merge preserves keys the caller didn't touch (e.g. absolute paths written at build start).
+pub fn save_config_map(
+    path: &std::path::Path,
+    overrides: &BTreeMap<String, serde_json::Value>,
+) -> std::io::Result<()> {
+    let mut m = load_config(path).unwrap_or_default();
+    for (k, v) in overrides {
+        let v = if k == "jobs" {
+            // never persist a transient --jobs 0 (inspect-only)
+            serde_json::json!(v.as_i64().unwrap_or(1).max(1))
+        } else {
+            v.clone()
+        };
+        m.insert(k.clone(), v);
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(txt) = serde_json::to_string_pretty(&m) {
-        let _ = std::fs::write(&path, txt);
-    }
+    let txt = serde_json::to_string_pretty(&m).unwrap_or_else(|_| "{}".into());
+    let tmp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "gflib-build.config".into())
+    ));
+    std::fs::write(&tmp, txt)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Show a path relative to the cwd when it lives under it (else absolute) — mirrors the TUI's
@@ -366,6 +393,36 @@ pub fn apply_setup_map(cfg: &mut Config, m: &BTreeMap<String, serde_json::Value>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn save_config_map_persists_merges_and_roundtrips_build_debs() {
+        // baseline on disk: build_debs off, plus an absolute path that the overlay must NOT clobber
+        let dir = std::env::temp_dir().join(format!("gflib-cfgtest-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("gflib-build.config");
+        let mut base = BTreeMap::new();
+        base.insert("build_debs".to_string(), serde_json::json!(false));
+        base.insert("fontc_bin".to_string(), serde_json::json!("/abs/path/to/fontc"));
+        std::fs::write(&path, serde_json::to_string_pretty(&base).unwrap()).unwrap();
+
+        // what the config-tab 'apply' does: overlay only the cwd-independent subset
+        let mut over = BTreeMap::new();
+        over.insert("build_debs".to_string(), serde_json::json!(true));
+        over.insert("jobs".to_string(), serde_json::json!(0)); // a transient 0 must clamp to >=1
+        save_config_map(&path, &over).unwrap();
+
+        // read it back the way `--export-deb` (config::parse) does
+        let loaded = load_config(&path).unwrap();
+        assert_eq!(loaded.get("build_debs"), Some(&serde_json::json!(true)), "build_debs persisted");
+        assert_eq!(loaded.get("fontc_bin"), Some(&serde_json::json!("/abs/path/to/fontc")), "path preserved");
+        assert_eq!(loaded.get("jobs"), Some(&serde_json::json!(1)), "jobs 0 clamped");
+
+        // and the loaded config resolves cfg.build_debs = true (what deb::run_export_deb reads)
+        let mut cfg = Config::default();
+        merge_persisted(&mut cfg, &loaded);
+        assert!(cfg.build_debs, "persisted build_debs=true must reach cfg via merge_persisted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn parses_core_flags() {
         let args: Vec<String> = ["--source","archive","--jobs","12","--percent","5","--backend","fontc","--only","a/b,c/d"]

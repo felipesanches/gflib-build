@@ -197,9 +197,7 @@ fn run_build(mut cfg: config::Config) {
             let _ = web::run(source, cfg.web_port);
         }
         "curses" => {
-            if let Ok(tui::TuiResult::Reconfigure) = tui::run(source) {
-                eprintln!("(reconfigure not yet implemented in the Rust port — re-run with new flags)");
-            }
+            let _ = tui::run(source);
         }
         "none" => run_none(&source),
         "json" => run_json(&source),

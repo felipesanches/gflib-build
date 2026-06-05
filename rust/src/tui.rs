@@ -270,9 +270,28 @@ fn cfg_actions(setup: bool) -> &'static [&'static str] {
     }
 }
 
-/// Live 'apply': write the changed live-editable fields to control.json (port of `_cfg_apply_live`).
-/// Only the keys the Rust daemon honours live (backend/jobs/percent/compare) are forwarded.
-fn cfg_apply_live(fields: &[CfgField], snap: &Snapshot, src: &dyn Source) {
+/// The cwd-independent settings the config tab may persist on 'apply' — a subset of save_config's
+/// keys that excludes every path, so a relative display-path can never be written back to disk. This
+/// also gates which non-live fields are editable on a running build: editable ⇔ appliable-live OR
+/// persistable, so the UI never invites an edit that 'apply' would silently drop.
+const TUI_PERSIST: &[&str] = &[
+    "source", "backend", "jobs", "percent", "compare", "manage_venvs", "fontspector_qa", "build_debs",
+];
+
+fn cfg_persistable(key: &str) -> bool {
+    TUI_PERSIST.contains(&key)
+}
+
+/// A config field is editable when we're in the setup wizard, OR it applies live to a running build,
+/// OR it is a cwd-independent setting we can persist for the next run.
+fn cfg_editable(setup: bool, f: &CfgField) -> bool {
+    setup || f.live || cfg_persistable(f.key)
+}
+
+/// Live 'apply': forward the live-honoured keys (backend/jobs/percent/compare) to control.json AND
+/// persist the cwd-independent subset (incl. build_debs) to gflib-build.config so a later
+/// `--export-deb` / next run sees them. Returns a short status line for the config-tab footer.
+fn cfg_apply_live(fields: &[CfgField], snap: &Snapshot, src: &dyn Source) -> String {
     let new = cfg_typed(fields);
     let cur = &snap.config;
     let changed = |k: &str| new.get(k) != cur.get(k);
@@ -298,13 +317,24 @@ fn cfg_apply_live(fields: &[CfgField], snap: &Snapshot, src: &dyn Source) {
         }
     }
     src.control(&set);
+    // persist the cwd-independent subset for the next run / --export-deb
+    if snap.config_path.is_empty() {
+        return "applied live — not saved (no config file; attach to a running build to persist)".into();
+    }
+    let overrides: BTreeMap<String, Value> = TUI_PERSIST
+        .iter()
+        .filter_map(|k| new.get(*k).map(|v| (k.to_string(), v.clone())))
+        .collect();
+    match crate::config::save_config_map(std::path::Path::new(&snap.config_path), &overrides) {
+        Ok(_) => format!("saved {} settings → {}", overrides.len(), snap.config_path),
+        Err(e) => format!("applied live; save failed: {}", e),
+    }
 }
 
-/// Outcome of the TUI loop: the user quit, pressed C to reconfigure, or (in first-run setup) chose
-/// ▶ Start build — which returns the typed config the caller should launch the build with.
+/// Outcome of the TUI loop: the user quit, or (in first-run setup) chose ▶ Start build — which
+/// returns the typed config the caller should launch the build with.
 pub enum TuiResult {
     Quit,
-    Reconfigure,
     StartBuild(BTreeMap<String, Value>),
 }
 
@@ -320,6 +350,7 @@ struct Ui {
     cfg_fields: Vec<CfgField>, // the editable Configuration fields (built once from the config)
     cfg_active: usize,       // selected config field, or an action-button index past the fields
     fc_sel: usize,           // failures tab: the selected 'by cause' index — filters the families list
+    cfg_flash: String,       // transient result of the last config 'apply' (shown on the config tab)
 }
 
 /// Number of sections on a tab (archive/config are single custom views → 1).
@@ -356,7 +387,7 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
     let mut ui = Ui {
         tab: if setup { 0 } else { 1 },
         section: 0, sel: 0, detail: false, sel_key: None, detail_lines: Vec::new(), dscroll: 0,
-        setup, cfg_fields: Vec::new(), cfg_active: 0, fc_sel: 0,
+        setup, cfg_fields: Vec::new(), cfg_active: 0, fc_sel: 0, cfg_flash: String::new(),
     };
     let mut prev: Option<Screen> = None;
     let res = loop {
@@ -411,15 +442,26 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
                         continue;
                     }
                     KeyCode::Char('q') | KeyCode::Char('Q') if !text_active => break TuiResult::Quit,
-                    KeyCode::Char('c') | KeyCode::Char('C') if !text_active && !ui.setup => break TuiResult::Reconfigure,
+                    KeyCode::Char('c') | KeyCode::Char('C') if !text_active && !ui.setup => {
+                        if on_config {
+                            // on the config tab, C applies+saves (same as the '✓ apply changes' action)
+                            ui.cfg_flash = cfg_apply_live(&ui.cfg_fields, &snap, &*source);
+                        } else {
+                            // elsewhere, C jumps to the config tab (as the footer advertises)
+                            ui.tab = TABS.iter().position(|&t| t == "config").unwrap_or(ui.tab);
+                            ui.section = 0; ui.sel = 0; ui.sel_key = None; ui.detail = false;
+                            ui.cfg_active = 0; ui.cfg_flash.clear();
+                        }
+                        continue;
+                    }
                     KeyCode::Tab if !ui.setup => {
                         ui.tab = (ui.tab + 1) % TABS.len();
-                        ui.section = 0; ui.sel = 0; ui.sel_key = None; ui.detail = false; ui.cfg_active = 0;
+                        ui.section = 0; ui.sel = 0; ui.sel_key = None; ui.detail = false; ui.cfg_active = 0; ui.cfg_flash.clear();
                         continue;
                     }
                     KeyCode::BackTab if !ui.setup => {
                         ui.tab = (ui.tab + TABS.len() - 1) % TABS.len();
-                        ui.section = 0; ui.sel = 0; ui.sel_key = None; ui.detail = false; ui.cfg_active = 0;
+                        ui.section = 0; ui.sel = 0; ui.sel_key = None; ui.detail = false; ui.cfg_active = 0; ui.cfg_flash.clear();
                         continue;
                     }
                     _ => {}
@@ -493,8 +535,7 @@ fn config_text_active(ui: &Ui) -> bool {
         return false; // an action button
     }
     let f = &ui.cfg_fields[vis[ui.cfg_active]];
-    let editable = ui.setup || f.live;
-    editable && matches!(f.kind, CfgKind::Path)
+    cfg_editable(ui.setup, f) && matches!(f.kind, CfgKind::Path)
 }
 
 /// Handle a keypress on the Configuration tab. Returns Some(result) when the loop should end
@@ -526,14 +567,14 @@ fn handle_config_key(ui: &mut Ui, code: KeyCode, snap: &Snapshot, src: &dyn Sour
                 if ui.setup {
                     return Some(TuiResult::StartBuild(cfg_typed(&ui.cfg_fields))); // ▶ Start build
                 }
-                cfg_apply_live(&ui.cfg_fields, snap, src); // ✓ apply changes → control.json
+                ui.cfg_flash = cfg_apply_live(&ui.cfg_fields, snap, src); // ✓ apply changes → control.json + persist
             }
             None
         }
         _ => {
-            // edit the selected field (only if editable: setup, or a live field on a running build)
+            // edit the selected field (only if editable: setup, a live field, or a persistable setting)
             let fi = vis[ui.cfg_active];
-            let editable = ui.setup || ui.cfg_fields[fi].live;
+            let editable = cfg_editable(ui.setup, &ui.cfg_fields[fi]);
             if editable && cfg_field_key(&mut ui.cfg_fields[fi], code) {
                 ui.cfg_active = (ui.cfg_active + 1) % nav_n; // Enter advances to the next field
             }
@@ -1171,11 +1212,14 @@ fn render_tabbar_body(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16
     } else if ui.setup {
         " [↑↓] field   [←→/space] edit   navigate to ▶ Start build and press ↵   [esc] cancel"
     } else if TABS[ui.tab] == "config" {
-        " [↑↓]field  [←→/space]edit  [↵]next/apply  [Tab/⇧Tab]tabs  [C]restart  [q]uit"
+        " [↑↓]field  [←→/space]edit  [↵ or C]apply+save  [Tab/⇧Tab]tabs  [q]uit"
     } else {
         " [Tab/⇧Tab]tabs  [↑↓]item  [←→]section  [↵]details  [p]ause  [R]etry  [C]onfig  [q]uit"
     };
     put(scr, footer_row, 0, footer, Color::DarkGrey, w);
+    if TABS[ui.tab] == "config" && !ui.cfg_flash.is_empty() {
+        put(scr, footer_row.saturating_sub(1), 0, &format!(" ⓘ {}", ui.cfg_flash), Color::Green, w);
+    }
 
     // detail overlay (drawn on top of the back-buffer)
     if ui.detail {
@@ -1376,7 +1420,7 @@ fn render_config(scr: &mut Screen, snap: &Snapshot, ui: &Ui, top: u16, bottom: u
     for idx in fstart..vis.len().min(fstart + field_budget) {
         let f = &ui.cfg_fields[vis[idx]];
         let active = ui.cfg_active == idx;
-        let editable = ui.setup || f.live;
+        let editable = cfg_editable(ui.setup, f);
         let valstr = match &f.kind {
             CfgKind::Bool => if f.bval { "[x] yes".to_string() } else { "[ ] no".to_string() },
             CfgKind::Choice(_) => format!("‹ {} ›", f.value),
@@ -1384,10 +1428,14 @@ fn render_config(scr: &mut Screen, snap: &Snapshot, ui: &Ui, top: u16, bottom: u
         };
         let mut tag = String::new();
         if !pre_build {
-            if f.live && vals.get(f.key) != cf.get(f.key) {
-                tag = "  *changed".into();
-            } else if !f.live {
-                tag = "  (restart: C)".into();
+            let changed = vals.get(f.key) != cf.get(f.key);
+            if f.live {
+                if changed { tag = "  *changed".into(); }
+            } else if cfg_persistable(f.key) {
+                // saved to disk on apply; takes effect on the next run / --export-deb
+                tag = if changed { "  *next run".into() } else { "  (next run)".into() };
+            } else {
+                tag = "  (start-only)".into(); // can't change without a fresh build invocation
             }
         }
         let lab_color = if active { Color::White } else if editable { Color::Grey } else { Color::DarkGrey };
