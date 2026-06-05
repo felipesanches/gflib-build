@@ -280,6 +280,7 @@ pub struct Snapshot {
     #[serde(default)] pub counts: Counts,
     #[serde(default)] pub backends: Backends,
     #[serde(default)] pub building: Vec<BuildingItem>,
+    #[serde(default)] pub running_builds: usize, // in-flight builder children (frozen by a pause)
     #[serde(default)] pub failures_recent: Vec<FailItem>,
     #[serde(default)] pub built_recent: Vec<BuiltItem>,
     #[serde(default)] pub packages: Vec<BuiltItem>, // ALL built families (uncapped) for the packaging tab

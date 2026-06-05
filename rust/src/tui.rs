@@ -1045,10 +1045,14 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
     let (w, h) = (scr.w, scr.h);
 
     // ---- header (row 0/1) — matches Python exactly: title + [PAUSED], elapsed at w-24 ----
-    let title = format!(
-        " Google Fonts library build{}",
-        if snap.paused { " [PAUSED · builds frozen]" } else { "" }
-    );
+    let pause_tag = if !snap.paused {
+        String::new()
+    } else if snap.running_builds > 0 {
+        format!(" [PAUSED · {} build(s) frozen]", snap.running_builds)
+    } else {
+        " [PAUSED]".to_string()
+    };
+    let title = format!(" Google Fonts library build{}", pause_tag);
     put(scr, 0, 0, &title, Color::White, w);
 
     // first-run setup: no disk/progress rows — just a one-line instruction (the config tab is below)

@@ -486,7 +486,7 @@ function render(){
  const pre=snap.pre_build;
  DET=[]; // reset the click-to-detail index map for this frame
  // ---- header (rows 0/1) ----
- let hdr='<div class="t"> Google Fonts library build'+(snap.paused?' [PAUSED · builds frozen]':'')+
+ let hdr='<div class="t"> Google Fonts library build'+(snap.paused?(snap.running_builds>0?' [PAUSED · '+snap.running_builds+' build(s) frozen]':' [PAUSED]'):'')+
    (pre?'<span class="right muted">first-time setup</span>':'<span class="right w">elapsed '+hms(snap.elapsed)+'</span>')+'</div>';
  if(pre){hdr+='<div class="sub"> configure your build below, then navigate to ▶ Start build</div>';}
  else{

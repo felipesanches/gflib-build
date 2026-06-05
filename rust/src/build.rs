@@ -386,6 +386,10 @@ impl Orchestrator {
             if self.stop.load(Ordering::Relaxed) {
                 return;
             }
+            if self.frozen.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(300)); // paused: don't start new QA runs (free CPU/RAM)
+                continue;
+            }
             let slug = {
                 let mut sh = self.shared.lock().unwrap();
                 match sh.qa_queue.pop_front() {
@@ -474,6 +478,10 @@ impl Orchestrator {
         loop {
             if self.stop.load(Ordering::Relaxed) {
                 return;
+            }
+            if self.frozen.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(300)); // paused: don't start new archive clones
+                continue;
             }
             let url = {
                 let mut sh = self.shared.lock().unwrap();
@@ -1341,6 +1349,8 @@ impl Orchestrator {
 
     /// Build the live snapshot rendered by every frontend and written to status.json.
     pub fn snapshot(&self) -> Snapshot {
+        // in-flight builder children (exactly the ones a pause SIGSTOP-freezes) — read before the lock
+        let running_builds = self.running.lock().unwrap().len();
         // packaging status: read packaging/ ONCE, BEFORE taking the central lock, so the readdir
         // never stalls other threads on the mutex. "drafted" = a packaging/<slug__>/ directory
         // exists (keep only real subdirectories, skipping index.json).
@@ -1618,6 +1628,7 @@ impl Orchestrator {
             disk_archive_nested: sh.disk_archive_nested,
             jobs: sh.jobs,
             paused: sh.paused,
+            running_builds,
             total: sh.results.len(),
             counts,
             backends,
@@ -1897,8 +1908,21 @@ fn run_builder(
 
     let mut child = cmd.spawn().map_err(|e| format!("could not launch builder: {}", e))?;
     let pgid = child.id() as i32; // == pid, since the child leads its own process group
-    // register for freeze/thaw/kill; the guard deregisters on EVERY exit path (incl. unwind)
-    running.lock().unwrap().insert(pgid);
+    // Register and (if a pause already landed) self-freeze ATOMICALLY against the signal sweeps. Holding
+    // `running` across the frozen-check-and-SIGSTOP means apply_live's SIGSTOP/SIGCONT sweep (which also
+    // locks `running`) cannot interleave between our check and our stop — so a pause→resume double-tap
+    // can never leave this build frozen-but-never-thawed (the resume sweep runs strictly before the
+    // insert, so we read frozen=false, or strictly after our SIGSTOP, so it SIGCONTs the stopped group).
+    {
+        let mut g = running.lock().unwrap();
+        g.insert(pgid);
+        if frozen.load(Ordering::Relaxed) {
+            signal_group(pgid, SIGSTOP);
+        }
+    }
+    // Deregister on every exit path (incl. unwind). The reap sites below also remove pgid the moment the
+    // child exits, shrinking the (already sub-ms) pid-reuse window in which a stale pgid could be
+    // signalled; this guard is the panic/early-return backstop (remove of an absent key is harmless).
     struct Dereg<'a>(&'a Mutex<HashSet<i32>>, i32);
     impl Drop for Dereg<'_> {
         fn drop(&mut self) {
@@ -1908,11 +1932,6 @@ fn run_builder(
         }
     }
     let _dereg = Dereg(running, pgid);
-    // if a pause landed between the worker's !paused check and here, freeze ourselves now (race-safe:
-    // registered above, so apply_live's SIGSTOP sweep either already hit us or this catches it)
-    if frozen.load(Ordering::Relaxed) {
-        signal_group(pgid, SIGSTOP);
-    }
 
     // timeout poll. Frozen (paused) time must NOT count toward the deadline, else a long read-the-data
     // pause would spuriously time the build out.
@@ -1926,12 +1945,14 @@ fn run_builder(
             }
             match child.try_wait() {
                 Ok(Some(st)) => {
+                    running.lock().unwrap().remove(&pgid); // exited+reaped → deregister before returning
                     return if st.success() { Ok(()) } else { Err(last_error_line(log_path)) };
                 }
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
                         signal_group(pgid, SIGKILL); // kill the whole group, then reap
                         let _ = child.wait();
+                        running.lock().unwrap().remove(&pgid);
                         return Err(format!("timed out after {}s", t));
                     }
                     thread::sleep(Duration::from_millis(300));
@@ -1942,6 +1963,7 @@ fn run_builder(
     } else {
         // no timeout: wait() blocks until exit; a frozen child simply keeps the worker parked here
         let st = child.wait().map_err(|e| format!("wait: {}", e))?;
+        running.lock().unwrap().remove(&pgid); // exited+reaped → deregister before returning
         if st.success() {
             Ok(())
         } else {
