@@ -500,7 +500,7 @@ WORKLIST:
 BUILD:
   --backend <auto|fontc|fontmake|both>   compiler (default auto = fontc-first)
   --fontc-bin <PATH>            fontc (Rust) binary (auto-detected)
-  --builder3-bin <PATH>         gftools-builder3 (Rust orchestrator) — M5/M7 path
+  --builder3-bin <PATH>         gftools-builder3 (Rust orchestrator)
   --build-python <PATH>         interpreter for builds (default python3)
   --jobs <N>                    parallel workers (default = CPU count)
   --timeout <SECS>              per-build timeout (default: none)
@@ -527,8 +527,6 @@ LIFECYCLE:
   --detach / --no-detach        run the build in a background daemon (default for curses) / force fg
   --stop                        signal a build daemon at --build-dir to stop (graceful)
   --reset --yes                 delete the whole build dir (archive is NEVER touched)
-
-M0 provenance (compiler + builder, success or failure) is recorded for every attempt.
-This is a Rust port; see README.md for parity with the Python tool and known gaps."#
+"#
     );
 }
