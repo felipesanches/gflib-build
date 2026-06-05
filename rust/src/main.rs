@@ -482,7 +482,7 @@ fn run_none(source: &Arc<dyn Source>) {
 
 fn print_help() {
     println!(
-        r#"gflib-build (Rust port) — build the Google Fonts library locally
+        r#"gflib-build — build the Google Fonts library locally
 
 USAGE:
   gflib-build [OPTIONS]
