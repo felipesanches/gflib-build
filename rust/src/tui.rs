@@ -783,7 +783,7 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
             }).collect();
             // section 2: per-family packaging status (reuses built_recent + the packaged flag;
             // dview "built" so ENTER opens the existing built detail overlay unchanged).
-            let rows = snap.built_recent.iter().map(|b| {
+            let rows = snap.packages.iter().map(|b| {
                 let (status, scol) = match b.deb_status.as_str() {
                     "validated" => ("validated", Color::Green),
                     "built" => ("built", Color::Cyan),
@@ -806,7 +806,7 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                 },
                 SectionR {
                     title: "Packaging — per-family status  (draftable → drafted → built → validated · ENTER = debian/ metadata)".into(),
-                    dview: "package", rows, keys: snap.built_recent.iter().map(|b| b.slug.clone()).collect(),
+                    dview: "package", rows, keys: snap.packages.iter().map(|b| b.slug.clone()).collect(),
                 },
             ]
         }
@@ -1666,7 +1666,7 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
             let slug = sections_for(snap, tab, fc_sel).get(section).and_then(|s| s.keys.get(sel).cloned());
             if let Some(slug) = slug {
                 o.push(format!("Package: {}", slug));
-                if let Some(b) = snap.built_recent.iter().find(|b| b.slug == slug) {
+                if let Some(b) = snap.packages.iter().find(|b| b.slug == slug) {
                     let st = if !b.deb_status.is_empty() {
                         b.deb_status.clone()
                     } else if b.packaged {
@@ -1676,20 +1676,9 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
                     };
                     o.push(format!("deb status: {}", st));
                 }
-                let dpath = build_dir.join("packaging").join(slug.replace('/', "__")).join("debian");
-                o.push(format!("debian/ tree: {}", dpath.display()));
                 o.push(String::new());
-                for f in ["control", "changelog", "copyright", "watch", "rules", "gflib-provenance"] {
-                    o.push(format!("── debian/{} ──", f));
-                    match std::fs::read_to_string(dpath.join(f)) {
-                        Ok(txt) => {
-                            for ln in txt.lines() {
-                                o.push(format!("  {}", ln));
-                            }
-                        }
-                        Err(_) => o.push("  (not drafted yet — run --export-deb)".into()),
-                    }
-                    o.push(String::new());
+                for ln in crate::deb::package_metadata(build_dir, &slug).lines() {
+                    o.push(ln.to_string());
                 }
             }
         }

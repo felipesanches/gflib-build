@@ -282,6 +282,7 @@ pub struct Snapshot {
     #[serde(default)] pub building: Vec<BuildingItem>,
     #[serde(default)] pub failures_recent: Vec<FailItem>,
     #[serde(default)] pub built_recent: Vec<BuiltItem>,
+    #[serde(default)] pub packages: Vec<BuiltItem>, // ALL built families (uncapped) for the packaging tab
     #[serde(default)] pub queued_list: Vec<QueuedItem>,
     #[serde(default)] pub fail_categories: Vec<FailCategory>,
     #[serde(default)] pub cohorts: Vec<CohortView>,

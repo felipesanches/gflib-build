@@ -100,24 +100,9 @@ fn read_body(req: &str, stream: &mut TcpStream, content_len: usize) -> String {
     String::from_utf8_lossy(&body).to_string()
 }
 
-/// Concatenate a drafted package's debian/ files for the metadata panel.
+/// Package metadata for the detail panel: the .deb's own control + contents, then the source recipe.
 fn read_debian_files(build_dir: &std::path::Path, slug: &str) -> String {
-    let dpath = build_dir.join("packaging").join(slug.replace('/', "__")).join("debian");
-    let mut out = String::new();
-    for f in ["control", "changelog", "copyright", "watch", "rules", "gflib-provenance"] {
-        out.push_str(&format!("── debian/{} ──\n", f));
-        match std::fs::read_to_string(dpath.join(f)) {
-            Ok(t) => {
-                out.push_str(&t);
-                if !t.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
-            Err(_) => out.push_str("(not drafted yet — run --export-deb)\n"),
-        }
-        out.push('\n');
-    }
-    out
+    crate::deb::package_metadata(build_dir, slug)
 }
 
 fn apply_control(source: &Arc<dyn Source>, body: &str) -> bool {
@@ -379,7 +364,7 @@ function sections(t){
  if(t=='queue')return [{title:'Queued — priority order (variable + larger families first)',rows:filterList(snap.queued_list,['slug','kind']).map(qRow)}];
  if(t=='cohorts')return [{title:'Dependency cohorts  (● = venv cached on disk, reused next run)',rows:filterList(snap.cohorts,['key']).map(cohortRow)}];
  if(t=='built')return [{title:'Built — successes  (slug · compiler+version · size · vs-shipped)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(builtRow)}];
- if(t=='packaging')return [{title:'Deb toolchain  (install any ✗ to enable deb building/validation — auto-detected, recovers in ~5s)',rows:(snap.deb_tools||[]).map(debToolRow)},{title:'Packaging — per-family status  (drafted = debian/ on disk · draftable = built, ready to draft)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(packagingRow)}];
+ if(t=='packaging')return [{title:'Deb toolchain  (install any ✗ to enable deb building/validation — auto-detected, recovers in ~5s)',rows:(snap.deb_tools||[]).map(debToolRow)},{title:'Packaging — per-family status  (drafted = debian/ on disk · draftable = built, ready to draft)',rows:filterList(snap.packages,['slug','compiler_version','backend']).map(packagingRow)}];
  if(t=='tools')return [{title:'Build-tool packages  (python = M5 blocker · rust = native · click = which families need it)',rows:filterList(snap.tool_packages,['name','lang','kind']).map(toolRow)},{title:'Migration milestones (M0–M7) — what the rungs mean',rows:MILESTONES.map(m=>({segs:[[L(m[0],4),'c'],[m[1],'gr']]}))}];
  if(t=='failures'){const s=[];const cats=snap.fail_categories||[];
   if(cats.length)s.push({title:'Failures by cause (click to filter)',rows:filterList(cats,['cat','hint']).map(failcatRow)});
@@ -671,7 +656,7 @@ function openFsFamily(slug){
 }
 // package metadata panel: deb-build status + the actual debian/ file contents (via /api/debian)
 function openPackage(slug){
- const b=findBy(snap.built_recent,'slug',slug)||{};
+ const b=findBy(snap.packages,'slug',slug)||{};
  const ds=b.deb_status||''; const st=ds||(b.packaged?'drafted':'draftable (built, not yet drafted)');
  const el=document.getElementById('detail');
  el.innerHTML='<div class="dhead">Package: '+E(slug)+' &nbsp;<span class="muted">deb status: '+E(st)+'</span><span class="dclose" onclick="closeDetail()">✕ close</span></div><pre class="dbody" id="pkgmeta">loading…</pre>';

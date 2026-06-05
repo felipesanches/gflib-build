@@ -1426,6 +1426,7 @@ impl Orchestrator {
         fails.sort_by(|a, b| b.ended.partial_cmp(&a.ended).unwrap_or(std::cmp::Ordering::Equal));
         built.sort_by(|a, b| b.ended.partial_cmp(&a.ended).unwrap_or(std::cmp::Ordering::Equal));
         fails.truncate(400);
+        let packages = built.clone(); // full, uncapped — the packaging tab needs every built family
         built.truncate(200);
 
         let fail_categories = {
@@ -1592,6 +1593,7 @@ impl Orchestrator {
             building,
             failures_recent: fails,
             built_recent: built,
+            packages,
             queued_list,
             fail_categories,
             cohorts_ready: self

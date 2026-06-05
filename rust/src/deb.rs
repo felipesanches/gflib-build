@@ -666,6 +666,67 @@ fn binary_control(pkg: &str, version: &str, fam: &model::Family, installed_kb: u
     v.join("\n") + "\n"
 }
 
+// ---- package metadata (the control INSIDE the built .deb, + the source recipe) ----
+
+/// Human-readable metadata for one family's package: the binary .deb's own control + installed
+/// files (via dpkg-deb), then the source debian/ recipe (control with Build-Depends, provenance, …).
+/// Used by both UIs so the package detail view is identical.
+pub fn package_metadata(build_dir: &Path, slug: &str) -> String {
+    let pkg_root = build_dir.join("packaging");
+    let mut out = String::new();
+    match find_built_deb(&pkg_root, slug) {
+        Some(p) => {
+            let fname = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            out.push_str(&format!("══ binary package: {} ══\n\n", fname));
+            out.push_str("# control (the DEBIAN/control inside the .deb)  ·  dpkg-deb --info\n");
+            out.push_str(&dpkg_deb("--info", &p));
+            out.push_str("\n# installed files  ·  dpkg-deb --contents\n");
+            out.push_str(&dpkg_deb("--contents", &p));
+            out.push('\n');
+        }
+        None => out.push_str(
+            "══ binary package ══\n(not built yet — turn on the build_debs setting and run --export-deb)\n\n",
+        ),
+    }
+    let dpath = pkg_root.join(slug.replace('/', "__")).join("debian");
+    for f in ["control", "gflib-provenance", "changelog", "copyright", "rules", "watch"] {
+        out.push_str(&format!("══ source debian/{} ══\n", f));
+        match std::fs::read_to_string(dpath.join(f)) {
+            Ok(t) => {
+                out.push_str(&t);
+                if !t.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            Err(_) => out.push_str("(not drafted — run --export-deb)\n"),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Locate the built .deb in pool/ for a slug, via packaging/build-results.json (package + version).
+fn find_built_deb(pkg_root: &Path, slug: &str) -> Option<PathBuf> {
+    let txt = std::fs::read_to_string(pkg_root.join("build-results.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    let r = v.get("results")?.get(slug)?;
+    if !r.get("built").and_then(|b| b.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    let pkg = r.get("package")?.as_str()?;
+    let ver = r.get("version")?.as_str()?;
+    let p = pkg_root.join("pool").join(format!("{}_{}_all.deb", pkg, ver));
+    p.is_file().then_some(p)
+}
+
+fn dpkg_deb(flag: &str, deb: &Path) -> String {
+    match std::process::Command::new("dpkg-deb").arg(flag).arg(deb).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        Ok(o) => format!("(dpkg-deb {} failed: {})\n", flag, String::from_utf8_lossy(&o.stderr).trim()),
+        Err(e) => format!("(dpkg-deb spawn failed: {})\n", e),
+    }
+}
+
 // ---- deb-build external toolchain detection (auto-recovers as tools appear) ----
 
 /// Required external programs for deb building/validation: (program, apt-package, purpose).
