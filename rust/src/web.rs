@@ -69,6 +69,12 @@ fn handle(mut stream: TcpStream, source: Arc<dyn Source>) -> std::io::Result<()>
             let body = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
             respond(&mut stream, 200, "application/json", body.as_bytes())
         }
+        ("GET", p) if p.starts_with("/api/debian") => {
+            // a drafted package's debian/ file contents: /api/debian?slug=ofl/foo
+            let slug = query_param(p, "slug").unwrap_or_default();
+            let body = read_debian_files(&source.build_dir(), &slug);
+            respond(&mut stream, 200, "text/plain; charset=utf-8", body.as_bytes())
+        }
         ("POST", "/api/control") => {
             // body may be partially read already; gather the rest up to content_len
             let body = read_body(&req, &mut stream, content_len);
@@ -92,6 +98,26 @@ fn read_body(req: &str, stream: &mut TcpStream, content_len: usize) -> String {
         body.extend_from_slice(&extra[..m]);
     }
     String::from_utf8_lossy(&body).to_string()
+}
+
+/// Concatenate a drafted package's debian/ files for the metadata panel.
+fn read_debian_files(build_dir: &std::path::Path, slug: &str) -> String {
+    let dpath = build_dir.join("packaging").join(slug.replace('/', "__")).join("debian");
+    let mut out = String::new();
+    for f in ["control", "changelog", "copyright", "watch", "rules", "gflib-provenance"] {
+        out.push_str(&format!("── debian/{} ──\n", f));
+        match std::fs::read_to_string(dpath.join(f)) {
+            Ok(t) => {
+                out.push_str(&t);
+                if !t.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            Err(_) => out.push_str("(not drafted yet — run --export-deb)\n"),
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn apply_control(source: &Arc<dyn Source>, body: &str) -> bool {
@@ -333,8 +359,9 @@ function cohortRow(c){const segs=[[c.cached?'● ':'○ ',c.cached?'g':'muted'],
  return {segs,det:['cohort',c.key]}}
 function builtRow(b){const comp=b.compiler_version||b.backend||'';
  return {segs:[[L(b.slug,32)+' ','g'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9)+'  '+(b.compare||''),'gr']],rt:b.slug,det:['built',b.slug]}}
-function packagingRow(b){const comp=b.compiler_version||b.backend||'';const drafted=!!b.packaged;
- return {segs:[[L(drafted?'drafted':'draftable',10)+' ',drafted?'g':'y'],[L(b.slug,32)+' ','gr'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9),'gr']],rt:b.slug,det:['built',b.slug]}}
+function packagingRow(b){const comp=b.compiler_version||b.backend||'';const ds=b.deb_status||'';
+ let st,sc; if(ds=='validated'){st='validated';sc='g'}else if(ds=='built'){st='built';sc='c'}else if(ds=='failed'){st='deb-failed';sc='r'}else if(b.packaged){st='drafted';sc='y'}else{st='draftable';sc='gr'}
+ return {segs:[[L(st,10)+' ',sc],[L(b.slug,32)+' ','gr'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9),'gr']],rt:b.slug,det:['package',b.slug]}}
 function toolRow(t){const rust=t.lang=='rust';
  return {segs:[[L(t.lang,7)+' ',rust?'g':'y'],[L(t.name,24)+' ','w'],[L(t.kind,12)+' ','c'],[Rp(t.families,4)+' families  ','gr'],[(t.packaged?'packaged':'unpackaged'),'gr']],det:['tool',t.name]}}
 function debToolRow(t){const ok=!!t.present;
@@ -619,6 +646,7 @@ function openDetail(kind,id){
   lines=['cause: '+h.cause,'provenance: '+prov(h),'rebuild: gflib-build --only '+h.slug+' --rebuild --yes','','error:','  '+(h.error||'')];
  } else if(kind=='task'){const t=findBy(snap.tasks,'key',id);if(!t)return;title='Pipeline task: '+t.name;
   lines=['status: '+t.status];if(t.total)lines.push('progress: '+t.done+'/'+t.total);if(t.elapsed)lines.push('elapsed: '+hms(t.elapsed));if(t.detail)lines.push('detail: '+t.detail);
+ } else if(kind=='package'){openPackage(id);return;
  } else if(kind=='tool'){const t=findBy(snap.tool_packages,'name',id);if(!t)return;title='Build-tool: '+t.name;
   const more=(t.family_list||[]).length<(t.families||0)?' (first '+(t.family_list||[]).length+')':'';
   lines=['language: '+(t.lang||'?')+'   kind: '+(t.kind||'?')+'   packaged: '+(t.packaged?'yes':'no'),'required by '+(t.families||0)+' families'+more,'','families:'];
@@ -640,6 +668,15 @@ function openFsFamily(slug){
   b.innerHTML='<div class="muted" style="margin:4px 0 8px">'+E(d.fontspector_version||'')+' · '+fsCount(d.counts||{})+'</div>'+
    checks.map(c=>'<div class="ln"><span class="'+fsCls(c.status)+'">'+(''+c.status).padEnd(6)+'</span> <span class="gr">'+E(c.id)+'</span>  <span class="muted">'+E(c.title)+'</span></div>').join('');
  }).catch(()=>{const b=document.getElementById('fsfd');if(b)b.textContent='(failed to load)'});
+}
+// package metadata panel: deb-build status + the actual debian/ file contents (via /api/debian)
+function openPackage(slug){
+ const b=findBy(snap.built_recent,'slug',slug)||{};
+ const ds=b.deb_status||''; const st=ds||(b.packaged?'drafted':'draftable (built, not yet drafted)');
+ const el=document.getElementById('detail');
+ el.innerHTML='<div class="dhead">Package: '+E(slug)+' &nbsp;<span class="muted">deb status: '+E(st)+'</span><span class="dclose" onclick="closeDetail()">✕ close</span></div><pre class="dbody" id="pkgmeta">loading…</pre>';
+ el.style.display='block';
+ fetch('/api/debian?slug='+encodeURIComponent(slug)).then(r=>r.text()).then(t=>{const m=document.getElementById('pkgmeta');if(m)m.textContent=t}).catch(()=>{const m=document.getElementById('pkgmeta');if(m)m.textContent='(failed to load)'});
 }
 function showDetail(title,lines,slug){
  let h='<div class="dhead">'+E(title)+'<span class="dclose" onclick="closeDetail()">✕ close</span></div><pre class="dbody">'+lines.map(E).join('\n')+'</pre>';

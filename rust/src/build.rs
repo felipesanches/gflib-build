@@ -1325,6 +1325,24 @@ impl Orchestrator {
         // deb-build external toolchain (cached 5s; recovers as tools are installed). Computed before
         // the lock — it has its own cache mutex, no central-lock dependency.
         let deb_tools = crate::deb::deb_tools_cached();
+        // per-package deb-build status from packaging/build-results.json (read once, before the lock)
+        let deb_results: std::collections::HashMap<String, String> = std::fs::read_to_string(
+            self.cfg.build_dir.join("packaging").join("build-results.json"),
+        )
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("results").and_then(|r| r.as_object()).cloned())
+        .map(|obj| {
+            obj.iter()
+                .map(|(slug, res)| {
+                    let built = res.get("built").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let validated = res.get("validated").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let st = if validated { "validated" } else if built { "built" } else { "failed" };
+                    (slug.clone(), st.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
         let sh = self.shared.lock().unwrap();
         let mut counts = Counts::default();
         let mut backends = Backends::default();
@@ -1367,6 +1385,7 @@ impl Orchestrator {
                     builder: r.builder.clone(),
                     builder_version: r.builder_version.clone(),
                     packaged: drafted.contains(&r.slug.replace('/', "__")),
+                    deb_status: deb_results.get(&r.slug).cloned().unwrap_or_default(),
                 });
             }
             if r.status == "building" {

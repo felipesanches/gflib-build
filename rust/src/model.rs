@@ -121,6 +121,7 @@ pub struct BuiltItem {
     #[serde(default)] pub builder: String,
     #[serde(default)] pub builder_version: String,
     #[serde(default)] pub packaged: bool, // a debian/ packaging tree has been drafted on disk
+    #[serde(default)] pub deb_status: String, // "" | built | validated | failed (from build-results.json)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
