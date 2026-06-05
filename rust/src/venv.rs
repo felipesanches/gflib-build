@@ -8,6 +8,18 @@
 //! Hashes use `sha1sum`/`sha256sum` (coreutils) so the cohort key and readiness marker are
 //! BYTE-IDENTICAL to the Python tool's — meaning the Rust port REUSES the existing venvs/ directory
 //! created by the Python daemon (a real drop-in, not a parallel set).
+//!
+//! Cohort-signature normalization (applied when reading a family's requirements, so it flows to the
+//! signature, the install, AND the UI uniformly):
+//!   * `-r FILE` / `--requirement FILE` includes are INLINED (read from the mirror at the same commit,
+//!     recursively) — a bare `-r requirements.in` is a pointer, not a definition, so the referenced
+//!     file's contents are the real requirements.
+//!   * QA-only tools are FILTERED OUT (`fontbakery`/`fontspector` dropped; the `[qa]` extra stripped
+//!     from any package such as `gftools[qa]`). They don't affect the build, only QA — so two cohorts
+//!     differing only in QA tooling collapse into one, and the install avoids fontbakery's heavy and
+//!     conflict-prone dependency closure.
+//! In the install, a family's own pin OVERRIDES the matching base-toolchain pin (the base only fills
+//! in tools the family didn't specify) — this removes the #1 cause of ResolutionImpossible.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -102,6 +114,125 @@ pub fn apply_pin_overrides(lines: &[String]) -> (Vec<String>, Vec<String>) {
     (out, applied)
 }
 
+// ---------- cohort-signature normalization: QA filtering + `-r` include expansion ----------
+
+/// QA-only tools dropped from cohort requirements entirely (they don't affect the build).
+const QA_PKGS: [&str; 2] = ["fontbakery", "fontspector"];
+
+/// True for a package that is QA-only (build-irrelevant) and should be dropped from a cohort.
+pub fn is_qa_pkg(pkg: &str) -> bool {
+    QA_PKGS.contains(&pkg)
+}
+
+/// Normalize ONE requirement line for cohort purposes: drop QA-only packages, strip the `[qa]` extra
+/// from any package (e.g. `gftools[qa]==X` → `gftools==X`). Returns None if the whole line is dropped.
+fn strip_qa_line(line: &str) -> Option<String> {
+    let pkg = req_pkg_name(line);
+    if pkg.is_empty() {
+        return Some(line.to_string()); // blank/comment/option/URL — leave untouched
+    }
+    if is_qa_pkg(&pkg) {
+        return None; // fontbakery / fontspector → dropped entirely
+    }
+    // strip a `[extra,...]` group, removing any `qa`; drop the brackets if nothing remains
+    if let (Some(lb), Some(rb)) = (line.find('['), line.find(']')) {
+        if lb < rb {
+            let kept: Vec<&str> = line[lb + 1..rb]
+                .split(',')
+                .map(|e| e.trim())
+                .filter(|e| !e.is_empty() && !e.eq_ignore_ascii_case("qa"))
+                .collect();
+            let rebuilt = if kept.is_empty() {
+                format!("{}{}", &line[..lb], &line[rb + 1..])
+            } else {
+                format!("{}[{}]{}", &line[..lb], kept.join(","), &line[rb + 1..])
+            };
+            return Some(rebuilt);
+        }
+    }
+    Some(line.to_string())
+}
+
+/// Drop QA-only tools and strip `[qa]` extras across a set of requirement lines.
+pub fn filter_qa_requirements(lines: &[String]) -> Vec<String> {
+    lines.iter().filter_map(|l| strip_qa_line(l)).collect()
+}
+
+fn filter_qa_text(text: &str) -> String {
+    let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    filter_qa_requirements(&lines).join("\n")
+}
+
+/// The file referenced by a `-r FILE` / `--requirement FILE` include directive, if this line is one.
+fn include_target(line: &str) -> Option<String> {
+    let s = line.trim();
+    for pre in ["--requirement=", "-r=", "--requirement ", "-r "] {
+        if let Some(rest) = s.strip_prefix(pre) {
+            let f = rest.split('#').next().unwrap_or("").trim();
+            if !f.is_empty() {
+                return Some(f.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve an include path relative to the including file's directory, collapsing `.`/`..`.
+fn normalize_join(base_dir: &str, target: &str) -> String {
+    let combined = if target.starts_with('/') {
+        target.trim_start_matches('/').to_string()
+    } else {
+        format!("{}{}", base_dir, target)
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in combined.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
+}
+
+/// Inline every `-r FILE` include by calling `read(path)` (recursively, cycle-guarded). A `-r` line is
+/// a pointer to the real requirements, so we splice the referenced file's contents in its place.
+fn expand_includes<R: Fn(&str) -> Option<String>>(
+    read: &R,
+    from: &str,
+    text: &str,
+    seen: &mut HashSet<String>,
+    depth: usize,
+) -> String {
+    if depth > 8 {
+        return text.to_string();
+    }
+    let base_dir = from.rfind('/').map(|i| &from[..i + 1]).unwrap_or("");
+    let mut out: Vec<String> = Vec::new();
+    for ln in text.lines() {
+        match include_target(ln) {
+            Some(target) => {
+                let path = normalize_join(base_dir, &target);
+                if !seen.insert(path.clone()) {
+                    continue; // already inlined — skip the cycle
+                }
+                match read(&path) {
+                    Some(inc) => {
+                        out.push(format!("# gflib-build: inlined -r {}", path));
+                        out.push(expand_includes(read, &path, &inc, seen, depth + 1));
+                    }
+                    // unreadable include → keep the literal line so the signature still reflects it
+                    None => out.push(ln.to_string()),
+                }
+            }
+            None => out.push(ln.to_string()),
+        }
+    }
+    out.join("\n")
+}
+
 /// Packages pip reported it could not satisfy (a pinned version absent from the index).
 pub fn parse_unsatisfiable(text: &str) -> HashSet<String> {
     let mut bad = HashSet::new();
@@ -190,16 +321,28 @@ fn between(text: &str, start: &str, end: &str) -> Option<String> {
     Some(text[i..j].to_string())
 }
 
+/// `git show <commit>:<path>` on a bare mirror, or None if the path is absent at that commit.
+fn git_show(mirror: &Path, commit: &str, path: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["--git-dir", &mirror.to_string_lossy(), "show", &format!("{}:{}", commit, path)])
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    } else {
+        None
+    }
+}
+
 /// Read a repo's requirements at a commit WITHOUT extracting — read-only `git show` on the mirror.
+/// `-r` includes are inlined (read from the mirror) and QA-only tools filtered, so the returned text
+/// is the canonical cohort requirements (drives signature, install, and the UI alike).
 pub fn read_requirements_from_mirror(mirror: &Path, commit: &str) -> String {
+    let read = |p: &str| git_show(mirror, commit, p);
     for r in REQ_FILES {
-        let out = Command::new("git")
-            .args(["--git-dir", &mirror.to_string_lossy(), "show", &format!("{}:{}", commit, r)])
-            .output();
-        if let Ok(o) = out {
-            if o.status.success() {
-                return String::from_utf8_lossy(&o.stdout).to_string();
-            }
+        if let Some(raw) = read(r) {
+            let expanded = expand_includes(&read, r, &raw, &mut HashSet::new(), 0);
+            return filter_qa_text(&expanded);
         }
     }
     String::new()
@@ -207,13 +350,15 @@ pub fn read_requirements_from_mirror(mirror: &Path, commit: &str) -> String {
 
 /// Read the family's requirements from its extracted work tree (post-checkout). Parity API; the build
 /// path reads from the mirror (read-only) instead, but `--cohorts-report` / pre-build will use this.
+/// Applies the SAME include expansion + QA filtering so cohort keys agree with the mirror reader.
 #[allow(dead_code)]
 pub fn read_requirements(work: &Path) -> String {
+    let read = |p: &str| std::fs::read_to_string(work.join(p)).ok();
     for r in REQ_FILES {
-        let p = work.join(r);
-        if p.is_file() {
-            if let Ok(t) = std::fs::read_to_string(&p) {
-                return t;
+        if work.join(r).is_file() {
+            if let Some(raw) = read(r) {
+                let expanded = expand_includes(&read, r, &raw, &mut HashSet::new(), 0);
+                return filter_qa_text(&expanded);
             }
         }
     }
@@ -342,15 +487,31 @@ impl VenvManager {
                 ));
             }
         }
-        let base_lines: Vec<String> = self
-            .base_req
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|t| t.lines().map(|s| s.to_string()).collect())
-            .unwrap_or_default();
+        let base_lines: Vec<String> = filter_qa_requirements(
+            &self
+                .base_req
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|t| t.lines().map(|s| s.to_string()).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+        // req_text arriving from the mirror reader is already include-expanded + QA-filtered.
         let cohort_lines: Vec<String> =
             if key == "base" { Vec::new() } else { req_text.lines().map(|s| s.to_string()).collect() };
-        let requested: Vec<String> = base_lines.iter().chain(cohort_lines.iter()).cloned().collect();
+        // family pins WIN: drop a base toolchain pin when the cohort pins the SAME package, so the
+        // upstream repo's declared version is honored instead of colliding with the base pin (the #1
+        // cause of ResolutionImpossible). Base only supplies tools the family didn't specify.
+        let cohort_pkgs: HashSet<String> =
+            cohort_lines.iter().map(|l| req_pkg_name(l)).filter(|p| !p.is_empty()).collect();
+        let base_kept: Vec<String> = base_lines
+            .iter()
+            .filter(|l| {
+                let p = req_pkg_name(l);
+                p.is_empty() || !cohort_pkgs.contains(&p)
+            })
+            .cloned()
+            .collect();
+        let requested: Vec<String> = base_kept.iter().chain(cohort_lines.iter()).cloned().collect();
         if !requested.iter().any(|l| !req_pkg_name(l).is_empty()) {
             return (String::new(),
                 "no build requirements — the toolchain (gftools/fontmake/…) would be missing; manage-venvs needs a base requirements file".into());
@@ -560,6 +721,65 @@ mod tests {
             "the existing venv must be left intact (a rebuild would rmtree + recreate it)"
         );
         let _ = std::fs::remove_dir_all(&bd);
+    }
+
+    #[test]
+    fn qa_filtering_drops_qa_tools_and_strips_qa_extra() {
+        let lines: Vec<String> = [
+            "gftools[qa]==0.9.99",
+            "fontbakery[googlefonts]==0.12",
+            "fontspector",
+            "fontmake==3.11.1",
+            "gftools[ci,qa]>=0.9",
+            "# a comment",
+            "-e .",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = filter_qa_requirements(&lines);
+        assert_eq!(
+            out,
+            vec!["gftools==0.9.99", "fontmake==3.11.1", "gftools[ci]>=0.9", "# a comment", "-e ."]
+        );
+    }
+
+    #[test]
+    fn cohort_merges_when_only_qa_differs() {
+        // two families whose ONLY difference is QA tooling must land in the SAME cohort
+        let a = filter_qa_text("gftools==0.9.99\nfontmake==3.11.1\nfontbakery[googlefonts]==0.12\n");
+        let b = filter_qa_text("gftools[qa]==0.9.99\nfontmake==3.11.1\n");
+        assert_eq!(cohort_key_for(&a), cohort_key_for(&b));
+        // and a family whose only requirement was a QA tool collapses into the base cohort
+        assert_eq!(cohort_key_for(&filter_qa_text("fontbakery\n")), "base");
+    }
+
+    #[test]
+    fn include_directive_parsing_and_join() {
+        assert_eq!(include_target("-r requirements.in").as_deref(), Some("requirements.in"));
+        assert_eq!(include_target("--requirement=base.txt # note").as_deref(), Some("base.txt"));
+        assert_eq!(include_target("  -r  ../shared/req.txt").as_deref(), Some("../shared/req.txt"));
+        assert_eq!(include_target("gftools==0.9.99"), None);
+        assert_eq!(include_target("-e ."), None);
+        assert_eq!(normalize_join("sources/", "../requirements.in"), "requirements.in");
+        assert_eq!(normalize_join("", "a/./b.txt"), "a/b.txt");
+    }
+
+    #[test]
+    fn expand_includes_inlines_referenced_files() {
+        // a fake mini "repo": requirements.txt is just `-r requirements.in`, which holds the real deps
+        let files: HashMap<&str, &str> = [
+            ("requirements.txt", "-r requirements.in\nfontbakery\n"),
+            ("requirements.in", "gftools==0.9.99\nfontmake==3.11.1\n"),
+        ]
+        .into_iter()
+        .collect();
+        let read = |p: &str| files.get(p).map(|s| s.to_string());
+        let raw = read("requirements.txt").unwrap();
+        let expanded = expand_includes(&read, "requirements.txt", &raw, &mut HashSet::new(), 0);
+        let filtered = filter_qa_text(&expanded);
+        // the include is inlined and the QA tool dropped → cohort of just the real toolchain pins
+        assert_eq!(cohort_key_for(&filtered), cohort_key_for("gftools==0.9.99\nfontmake==3.11.1"));
     }
 
     #[test]
