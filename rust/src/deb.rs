@@ -476,6 +476,62 @@ fn provenance(
     s
 }
 
+// ---- deb-build external toolchain detection (auto-recovers as tools appear) ----
+
+/// Required external programs for deb building/validation: (program, apt-package, purpose).
+const DEB_TOOLS: [(&str, &str, &str); 5] = [
+    ("dpkg-deb", "dpkg", "assemble binary .deb packages"),
+    ("dpkg-buildpackage", "dpkg-dev", "build source packages"),
+    ("fakeroot", "fakeroot", "fake root for correct file ownership"),
+    ("dh", "debhelper", "the dh sequencer (dh $@) for source builds"),
+    ("lintian", "lintian", "package validation / policy checks"),
+];
+
+/// Is `prog` an executable on PATH? Scans PATH directly — no subprocess.
+fn on_path(prog: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = match std::env::var("PATH") {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
+        let p = Path::new(dir).join(prog);
+        if let Ok(md) = std::fs::metadata(&p) {
+            if md.is_file() && md.permissions().mode() & 0o111 != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Detect the deb toolchain now (a PATH scan).
+pub fn detect_deb_tools() -> Vec<model::DebTool> {
+    DEB_TOOLS
+        .iter()
+        .map(|(name, provides, purpose)| model::DebTool {
+            name: name.to_string(),
+            present: on_path(name),
+            provides: provides.to_string(),
+            purpose: purpose.to_string(),
+        })
+        .collect()
+}
+
+/// Detect with a 5-second cache, so the snapshot can show the toolchain cheaply AND recover within
+/// ~5s of a missing tool being installed — no restart required.
+pub fn deb_tools_cached() -> Vec<model::DebTool> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<(f64, Vec<model::DebTool>)>> = OnceLock::new();
+    let m = CACHE.get_or_init(|| Mutex::new((0.0, Vec::new())));
+    let mut g = m.lock().unwrap();
+    if g.1.is_empty() || util::now() - g.0 > 5.0 {
+        g.1 = detect_deb_tools();
+        g.0 = util::now();
+    }
+    g.1.clone()
+}
+
 // ---- dependency-free civil-date formatting (Howard Hinnant's algorithm) ----
 
 /// (year, month, day, hour, minute, second, day-of-week with 0=Sunday) for a UTC epoch.
@@ -566,6 +622,15 @@ mod tests {
         assert_eq!(ymd(1700000000.0), "20231114");
         assert_eq!(rfc2822(1700000000.0), "Tue, 14 Nov 2023 22:13:20 +0000");
         assert_eq!(ymd(0.0), "19700101"); // deterministic when ended==0
+    }
+
+    #[test]
+    fn deb_tools_listed() {
+        let t = detect_deb_tools();
+        assert_eq!(t.len(), 5);
+        assert!(t.iter().any(|x| x.name == "lintian" && x.provides == "lintian"));
+        assert!(t.iter().any(|x| x.name == "dpkg-buildpackage" && x.provides == "dpkg-dev"));
+        assert!(t.iter().any(|x| x.name == "dh" && x.provides == "debhelper"));
     }
 
     #[test]

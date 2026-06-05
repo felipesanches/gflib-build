@@ -24,6 +24,19 @@ const TABS: [&str; 11] = [
     "config", "overview", "queue", "cohorts", "archive", "built", "packaging", "tools", "failures", "stats", "fontspector",
 ];
 
+/// Succinct glossary of the Python->Rust migration milestones, shown in the tools tab so a UI label
+/// like "M5 blocker" is self-documenting. Keep in sync with web.rs MILESTONES + docs/migration-milestones.md.
+const MILESTONES: [(&str, &str); 8] = [
+    ("M0", "Measurement foundation — record compiler + exact version for every build attempt"),
+    ("M1", "Full buildability — 100% of buildable families produce the expected fonts (any backend)"),
+    ("M2", "fontc-gap map — every buildable family attempted with fontc, the result recorded"),
+    ("M3", "fontc equivalence — fontc output equivalent to fontmake/shipped, at scale"),
+    ("M4", "fontc majority — families that build correctly with fontc alone (no fontmake fallback)"),
+    ("M5", "Python-free pipeline — Rust-native gftools-builder3, no Python pre-build or deps"),
+    ("M6", "latest-fontc currency — the M4/M5 set re-validated on the latest fontc"),
+    ("M7", "100% Rust — the whole library: latest fontc, equivalent output, zero Python"),
+];
+
 /// Colour for a fontspector status: FAIL/FATAL/ERROR red · WARN yellow · PASS green · else grey.
 fn fs_color(status: &str) -> Color {
     match status {
@@ -751,8 +764,24 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
             }]
         }
         "packaging" => {
-            // reuses built_recent + the BuiltItem.packaged flag (set by the snapshot writer);
-            // dview "built" so ENTER opens the existing built detail overlay unchanged.
+            // section 1: the deb-build external toolchain (auto-detected; recovers within ~5s).
+            let dt_rows = snap.deb_tools.iter().map(|t| {
+                if t.present {
+                    vec![
+                        ("✓ ".to_string(), Color::Green),
+                        (format!("{:<20} ", t.name), Color::White),
+                        (t.purpose.clone(), Color::Grey),
+                    ]
+                } else {
+                    vec![
+                        ("✗ ".to_string(), Color::Red),
+                        (format!("{:<20} ", t.name), Color::White),
+                        (format!("MISSING — sudo apt install {}", t.provides), Color::Yellow),
+                    ]
+                }
+            }).collect();
+            // section 2: per-family packaging status (reuses built_recent + the packaged flag;
+            // dview "built" so ENTER opens the existing built detail overlay unchanged).
             let rows = snap.built_recent.iter().map(|b| {
                 let (status, scol) = if b.packaged { ("drafted  ", Color::Green) } else { ("draftable", Color::Yellow) };
                 let comp = if !b.compiler_version.is_empty() { b.compiler_version.clone() } else { b.backend.clone() };
@@ -763,10 +792,16 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                     (format!("{:>9}", human(b.bytes)), Color::Grey),
                 ]
             }).collect();
-            vec![SectionR {
-                title: "Packaging — per-family status  (drafted = debian/ on disk · draftable = built, ready to draft)".into(),
-                dview: "built", rows, keys: snap.built_recent.iter().map(|b| b.slug.clone()).collect(),
-            }]
+            vec![
+                SectionR {
+                    title: "Deb toolchain  (install any ✗ to enable deb building/validation — auto-detected, recovers in ~5s)".into(),
+                    dview: "", rows: dt_rows, keys: snap.deb_tools.iter().map(|t| t.name.clone()).collect(),
+                },
+                SectionR {
+                    title: "Packaging — per-family status  (drafted = debian/ on disk · draftable = built, ready to draft)".into(),
+                    dview: "built", rows, keys: snap.built_recent.iter().map(|b| b.slug.clone()).collect(),
+                },
+            ]
         }
         "tools" => {
             // build-tool packages, classified python/rust: the M5 (Python->Rust) burn-down view.
@@ -782,10 +817,20 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                     (status.to_string(), Color::DarkGrey),
                 ]
             }).collect();
-            vec![SectionR {
-                title: "Build-tool packages  (python = M5 blocker · rust = native · ENTER = which families need it)".into(),
-                dview: "tool", rows, keys: snap.tool_packages.iter().map(|t| t.name.clone()).collect(),
-            }]
+            let ms_rows = MILESTONES.iter().map(|(m, d)| vec![
+                (format!("{:<4}", m), Color::Cyan),
+                (d.to_string(), Color::Grey),
+            ]).collect();
+            vec![
+                SectionR {
+                    title: "Build-tool packages  (python = M5 blocker · rust = native · ENTER = which families need it)".into(),
+                    dview: "tool", rows, keys: snap.tool_packages.iter().map(|t| t.name.clone()).collect(),
+                },
+                SectionR {
+                    title: "Migration milestones (M0–M7) — what the rungs mean".into(),
+                    dview: "", rows: ms_rows, keys: Vec::new(),
+                },
+            ]
         }
         "failures" => {
             let mut secs = Vec::new();

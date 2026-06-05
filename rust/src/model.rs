@@ -254,6 +254,16 @@ pub struct ToolPkg {
     #[serde(default)] pub packaged: bool,           // a .deb has been built for this tool (none yet)
 }
 
+/// A required external program for deb building/validation, and whether it is currently on PATH.
+/// Re-detected periodically so the UI recovers as soon as a missing tool is installed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DebTool {
+    #[serde(default)] pub name: String,     // program (e.g. "lintian")
+    #[serde(default)] pub present: bool,
+    #[serde(default)] pub provides: String, // apt package that provides it
+    #[serde(default)] pub purpose: String,
+}
+
 /// Defaulted everywhere so a partial/foreign status.json still deserializes.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -276,6 +286,7 @@ pub struct Snapshot {
     #[serde(default)] pub cohorts: Vec<CohortView>,
     #[serde(default)] pub cohorts_ready: usize,
     #[serde(default)] pub tool_packages: Vec<ToolPkg>, // build-tool packages + their dependent families
+    #[serde(default)] pub deb_tools: Vec<DebTool>,     // required deb-build external programs + availability
     #[serde(default)] pub phase: String,
     #[serde(default)] pub phase_total: usize,
     #[serde(default)] pub phase_done: usize,

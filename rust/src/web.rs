@@ -270,6 +270,8 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
 let snap={}, tab='overview';
 // tab order MUST match the TUI's VIEWS
 const TABS=['config','overview','queue','cohorts','archive','built','packaging','tools','failures','stats','fontspector'];
+// Migration-milestone glossary (keep in sync with tui.rs MILESTONES + docs/migration-milestones.md)
+const MILESTONES=[['M0','Measurement foundation — record compiler + exact version for every build attempt'],['M1','Full buildability — 100% of buildable families produce the expected fonts (any backend)'],['M2','fontc-gap map — every buildable family attempted with fontc, the result recorded'],['M3','fontc equivalence — fontc output equivalent to fontmake/shipped, at scale'],['M4','fontc majority — families that build correctly with fontc alone (no fontmake fallback)'],['M5','Python-free pipeline — Rust-native gftools-builder3, no Python pre-build or deps'],['M6','latest-fontc currency — the M4/M5 set re-validated on the latest fontc'],['M7','100% Rust — the whole library: latest fontc, equivalent output, zero Python']];
 // fontspector status → colour class (FAIL/FATAL/ERROR red · WARN yellow · PASS green · SKIP/INFO grey)
 function fsCls(s){return {PASS:'g',WARN:'y',FAIL:'r',FATAL:'r',ERROR:'r'}[s]||'muted'}
 function fsColor(s){return {PASS:'#22c55e',WARN:'#eab308',FAIL:'#ef4444',FATAL:'#b91c1c',ERROR:'#ef4444',SKIP:'#475569',INFO:'#64748b'}[s]||'#475569'}
@@ -335,6 +337,8 @@ function packagingRow(b){const comp=b.compiler_version||b.backend||'';const draf
  return {segs:[[L(drafted?'drafted':'draftable',10)+' ',drafted?'g':'y'],[L(b.slug,32)+' ','gr'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9),'gr']],rt:b.slug,det:['built',b.slug]}}
 function toolRow(t){const rust=t.lang=='rust';
  return {segs:[[L(t.lang,7)+' ',rust?'g':'y'],[L(t.name,24)+' ','w'],[L(t.kind,12)+' ','c'],[Rp(t.families,4)+' families  ','gr'],[(t.packaged?'packaged':'unpackaged'),'gr']],det:['tool',t.name]}}
+function debToolRow(t){const ok=!!t.present;
+ return {segs:[[ok?'✓ ':'✗ ',ok?'g':'r'],[L(t.name,20)+' ','w'],[ok?(t.purpose||''):('MISSING — sudo apt install '+(t.provides||'')),ok?'gr':'y']]}}
 // clicking a cause FILTERS the families list below (and highlights the selected cause)
 function failcatRow(c){const sel=fsCause==c.cat;
  return {segs:[[(sel?'▸':' ')+Rp(c.count,3)+'  ','w'],[L(c.cat,24),sel?'y':'c'],[' '+(c.hint||''),'muted']],fc:c.cat}}
@@ -348,8 +352,8 @@ function sections(t){
  if(t=='queue')return [{title:'Queued — priority order (variable + larger families first)',rows:filterList(snap.queued_list,['slug','kind']).map(qRow)}];
  if(t=='cohorts')return [{title:'Dependency cohorts  (● = venv cached on disk, reused next run)',rows:filterList(snap.cohorts,['key']).map(cohortRow)}];
  if(t=='built')return [{title:'Built — successes  (slug · compiler+version · size · vs-shipped)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(builtRow)}];
- if(t=='packaging')return [{title:'Packaging — per-family status  (drafted = debian/ on disk · draftable = built, ready to draft)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(packagingRow)}];
- if(t=='tools')return [{title:'Build-tool packages  (python = M5 blocker · rust = native · click = which families need it)',rows:filterList(snap.tool_packages,['name','lang','kind']).map(toolRow)}];
+ if(t=='packaging')return [{title:'Deb toolchain  (install any ✗ to enable deb building/validation — auto-detected, recovers in ~5s)',rows:(snap.deb_tools||[]).map(debToolRow)},{title:'Packaging — per-family status  (drafted = debian/ on disk · draftable = built, ready to draft)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(packagingRow)}];
+ if(t=='tools')return [{title:'Build-tool packages  (python = M5 blocker · rust = native · click = which families need it)',rows:filterList(snap.tool_packages,['name','lang','kind']).map(toolRow)},{title:'Migration milestones (M0–M7) — what the rungs mean',rows:MILESTONES.map(m=>({segs:[[L(m[0],4),'c'],[m[1],'gr']]}))}];
  if(t=='failures'){const s=[];const cats=snap.fail_categories||[];
   if(cats.length)s.push({title:'Failures by cause (click to filter)',rows:filterList(cats,['cat','hint']).map(failcatRow)});
   // families list, scoped to the selected cause. When a cause is selected we list its

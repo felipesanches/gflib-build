@@ -1320,6 +1320,9 @@ impl Orchestrator {
                         .collect()
                 })
                 .unwrap_or_default();
+        // deb-build external toolchain (cached 5s; recovers as tools are installed). Computed before
+        // the lock — it has its own cache mutex, no central-lock dependency.
+        let deb_tools = crate::deb::deb_tools_cached();
         let sh = self.shared.lock().unwrap();
         let mut counts = Counts::default();
         let mut backends = Backends::default();
@@ -1577,6 +1580,7 @@ impl Orchestrator {
                 .unwrap_or_else(|| cohorts_out.iter().filter(|c| c.cached).count()),
             cohorts: cohorts_out,
             tool_packages,
+            deb_tools,
             phase: sh.phase.clone(),
             phase_total: sh.library_total,
             phase_done: 0,
