@@ -107,7 +107,8 @@ impl Orchestrator {
             )
         };
         let (mut fams, library_total, skipped) = match cfg.source.as_str() {
-            "archive" => discover::discover_archive(&cfg.archive, &cfg.archive_rev, cfg.jobs, want.as_ref()),
+            // discovery keeps its own parallelism even when build jobs==0 (inspect-only)
+            "archive" => discover::discover_archive(&cfg.archive, &cfg.archive_rev, cfg.jobs.max(1), want.as_ref()),
             _ => match &cfg.google_fonts {
                 Some(gf) => discover::discover_metadata(gf),
                 None => (Vec::new(), 0, 0),
@@ -178,7 +179,8 @@ impl Orchestrator {
         let queue: VecDeque<String> = queued_with_dur.into_iter().map(|(s, _)| s).collect();
 
         let failure_history = persist::read_failure_history(&cfg.build_dir);
-        let jobs = cfg.jobs.clamp(1, MAX_JOBS);
+        // jobs 0 = inspect-only: keep the loaded data + UI live but spawn NO build workers.
+        let jobs = cfg.jobs.min(MAX_JOBS);
         let shared = Shared {
             results,
             queue,

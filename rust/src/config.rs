@@ -42,6 +42,7 @@ pub struct Config {
     pub fontspector_bin: Option<PathBuf>,   // explicit binary (else cargo-install the pinned version)
     pub fontspector_rerun: bool,            // re-QA families that already have a result (default: skip them)
     pub fontspector_qa: bool,               // SETTING: run QA asynchronously during the build (green families, niced)
+    pub build_debs: bool,                   // SETTING: build+validate .deb packages during --export-deb (default off)
     pub yes: bool,
     pub dry_run: bool,         // MOCKUP: replay a previous session's outcomes (no real clone/venv/compile/QA)
     pub wizard: bool,          // force the first-run setup wizard (the editable config tab pre-build)
@@ -88,6 +89,7 @@ impl Default for Config {
             fontspector_bin: None,
             fontspector_rerun: false,
             fontspector_qa: false,
+            build_debs: false,
             yes: false,
             dry_run: false,
             wizard: false,
@@ -180,7 +182,8 @@ pub fn parse(args: &[String]) -> Parsed {
             "--build-rules" => cfg.build_rules = Some(PathBuf::from(next(&mut i, a))),
             "--manage-venvs" => cfg.manage_venvs = true,
             "--no-manage-venvs" => cfg.manage_venvs = false,
-            "--jobs" => cfg.jobs = next(&mut i, a).parse().unwrap_or(cfg.jobs).max(1),
+            // jobs 0 = load + inspect the latest data with NO build workers (no font building)
+            "--jobs" => cfg.jobs = next(&mut i, a).parse().unwrap_or(cfg.jobs),
             "--timeout" => cfg.timeout = next(&mut i, a).parse().ok(),
             "--percent" => cfg.percent = next(&mut i, a).parse::<f64>().unwrap_or(100.0).clamp(0.0, 100.0),
             "--only" => cfg.only = next(&mut i, a),
@@ -208,6 +211,8 @@ pub fn parse(args: &[String]) -> Parsed {
             "--fontspector" => cfg.fontspector_qa = true,
             "--fontspector-pass" => mode = Mode::Fontspector,
             "--no-fontspector" => cfg.fontspector_qa = false,
+            "--build-debs" => cfg.build_debs = true,
+            "--no-build-debs" => cfg.build_debs = false,
             "--fontspector-version" => cfg.fontspector_version = next(&mut i, a),
             "--fontspector-profile" => cfg.fontspector_profile = next(&mut i, a),
             "--fontspector-bin" => cfg.fontspector_bin = Some(PathBuf::from(next(&mut i, a))),
@@ -252,6 +257,7 @@ fn merge_persisted(cfg: &mut Config, loaded: &BTreeMap<String, serde_json::Value
             "compare" => if let Some(x) = v.as_bool() { cfg.compare = x },
             "manage_venvs" => if let Some(x) = v.as_bool() { cfg.manage_venvs = x },
             "fontspector_qa" => if let Some(x) = v.as_bool() { cfg.fontspector_qa = x },
+            "build_debs" => if let Some(x) = v.as_bool() { cfg.build_debs = x },
             // NOTE: 'ui' is deliberately NOT loaded — it's a per-invocation choice, not a saved
             // preference. (A prior `--ui none` must never silence a later interactive run.)
             "web_port" => if let Some(x) = v.as_u64() { cfg.web_port = x as u16 },
@@ -280,6 +286,7 @@ pub fn save_config(cfg: &Config) {
     m.insert("compare".into(), json!(cfg.compare));
     m.insert("manage_venvs".into(), json!(cfg.manage_venvs));
     m.insert("fontspector_qa".into(), json!(cfg.fontspector_qa));
+    m.insert("build_debs".into(), json!(cfg.build_debs));
     // 'ui' is intentionally NOT persisted (per-invocation choice — see merge_persisted).
     m.insert("web_port".into(), json!(cfg.web_port));
     if let Some(parent) = path.parent() {
@@ -327,6 +334,7 @@ pub fn config_map(cfg: &Config) -> BTreeMap<String, serde_json::Value> {
     m.insert("retry_failed".into(), json!(cfg.retry_failed));
     m.insert("compare".into(), json!(cfg.compare));
     m.insert("fontspector_qa".into(), json!(cfg.fontspector_qa));
+    m.insert("build_debs".into(), json!(cfg.build_debs));
     m
 }
 
@@ -341,7 +349,7 @@ pub fn apply_setup_map(cfg: &mut Config, m: &BTreeMap<String, serde_json::Value>
     if let Some(v) = s("build_dir").filter(|v| !v.is_empty()) { cfg.build_dir = PathBuf::from(v); }
     if let Some(v) = s("backend") { cfg.backend = v; }
     cfg.fontc_bin = s("fontc_bin").filter(|v| !v.is_empty());
-    if let Some(j) = m.get("jobs").and_then(|v| v.as_i64()) { cfg.jobs = j.max(1) as usize; }
+    if let Some(j) = m.get("jobs").and_then(|v| v.as_i64()) { cfg.jobs = j.max(0) as usize; } // 0 = inspect-only
     if let Some(p) = m.get("percent").and_then(|v| v.as_f64()) { cfg.percent = p; }
     cfg.timeout = match m.get("timeout") {
         Some(Value::Null) | None => None,
@@ -351,6 +359,7 @@ pub fn apply_setup_map(cfg: &mut Config, m: &BTreeMap<String, serde_json::Value>
     if let Some(b) = m.get("manage_venvs").and_then(|v| v.as_bool()) { cfg.manage_venvs = b; }
     if let Some(b) = m.get("retry_failed").and_then(|v| v.as_bool()) { cfg.retry_failed = b; }
     if let Some(b) = m.get("fontspector_qa").and_then(|v| v.as_bool()) { cfg.fontspector_qa = b; }
+    if let Some(b) = m.get("build_debs").and_then(|v| v.as_bool()) { cfg.build_debs = b; }
     cfg.compare = m.get("compare").and_then(|v| v.as_bool()).unwrap_or(false) && cfg.source == "metadata";
 }
 

@@ -96,6 +96,7 @@ fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
         ("retry_failed", "retry ALL failed (incl. genuine errors)", CfgKind::Bool, false),
         ("compare", "compare to shipped", CfgKind::Bool, true),
         ("fontspector_qa", "fontspector QA on green builds", CfgKind::Bool, false),
+        ("build_debs", "build .deb packages (during --export-deb)", CfgKind::Bool, false),
     ]
 }
 
