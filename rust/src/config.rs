@@ -47,6 +47,8 @@ pub struct Config {
     pub wizard: bool,          // force the first-run setup wizard (the editable config tab pre-build)
     pub detach: bool,          // run the build in a detached background daemon
     pub no_detach: bool,       // force foreground even for curses (which detaches by default)
+    pub effreq_mirror: String, // --effreq: bare mirror to report effective requirements for
+    pub effreq_commit: String, // --effreq: commit at which to read the requirements
 }
 
 impl Default for Config {
@@ -91,6 +93,8 @@ impl Default for Config {
             wizard: false,
             detach: false,
             no_detach: false,
+            effreq_mirror: String::new(),
+            effreq_commit: String::new(),
         }
     }
 }
@@ -104,6 +108,7 @@ pub enum Mode {
     List,
     Reset,
     CohortsReport,
+    EffReq,      // print the effective (post-filter/override) requirements for one mirror+commit
     Fontspector, // a separate QA pass: run fontspector over all already-built fonts
     Help,
 }
@@ -207,6 +212,11 @@ pub fn parse(args: &[String]) -> Parsed {
             "--fontspector-bin" => cfg.fontspector_bin = Some(PathBuf::from(next(&mut i, a))),
             "--fontspector-rerun" => cfg.fontspector_rerun = true,
             "--cohorts-report" => mode = Mode::CohortsReport,
+            "--effreq" => {
+                mode = Mode::EffReq;
+                cfg.effreq_mirror = next(&mut i, a);
+                cfg.effreq_commit = next(&mut i, a);
+            }
             "--attach" => mode = Mode::Attach,
             "--stop" => mode = Mode::Stop,
             "--reset" => mode = Mode::Reset,

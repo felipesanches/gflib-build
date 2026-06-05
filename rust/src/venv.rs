@@ -163,6 +163,26 @@ fn filter_qa_text(text: &str) -> String {
     filter_qa_requirements(&lines).join("\n")
 }
 
+/// Assemble the REQUESTED requirement lines for a cohort (before pin-overrides / self-heal relaxation):
+/// the QA-filtered base toolchain MINUS any base pin the family itself pins (family wins), followed by
+/// the family's own already-(include-expanded + QA-filtered) lines. This is exactly the set `create()`
+/// hands the installer — exposed so tooling/tests can reproduce a cohort's effective requirements.
+pub fn assemble_requested(base_lines: &[String], req_text: &str, key: &str) -> Vec<String> {
+    let cohort_lines: Vec<String> =
+        if key == "base" { Vec::new() } else { req_text.lines().map(|s| s.to_string()).collect() };
+    let cohort_pkgs: HashSet<String> =
+        cohort_lines.iter().map(|l| req_pkg_name(l)).filter(|p| !p.is_empty()).collect();
+    let base_kept: Vec<String> = base_lines
+        .iter()
+        .filter(|l| {
+            let p = req_pkg_name(l);
+            p.is_empty() || !cohort_pkgs.contains(&p)
+        })
+        .cloned()
+        .collect();
+    base_kept.iter().chain(cohort_lines.iter()).cloned().collect()
+}
+
 /// The file referenced by a `-r FILE` / `--requirement FILE` include directive, if this line is one.
 fn include_target(line: &str) -> Option<String> {
     let s = line.trim();
@@ -496,22 +516,10 @@ impl VenvManager {
                 .unwrap_or_default(),
         );
         // req_text arriving from the mirror reader is already include-expanded + QA-filtered.
-        let cohort_lines: Vec<String> =
-            if key == "base" { Vec::new() } else { req_text.lines().map(|s| s.to_string()).collect() };
-        // family pins WIN: drop a base toolchain pin when the cohort pins the SAME package, so the
+        // family pins WIN: assemble_requested drops any base toolchain pin the cohort also pins, so the
         // upstream repo's declared version is honored instead of colliding with the base pin (the #1
         // cause of ResolutionImpossible). Base only supplies tools the family didn't specify.
-        let cohort_pkgs: HashSet<String> =
-            cohort_lines.iter().map(|l| req_pkg_name(l)).filter(|p| !p.is_empty()).collect();
-        let base_kept: Vec<String> = base_lines
-            .iter()
-            .filter(|l| {
-                let p = req_pkg_name(l);
-                p.is_empty() || !cohort_pkgs.contains(&p)
-            })
-            .cloned()
-            .collect();
-        let requested: Vec<String> = base_kept.iter().chain(cohort_lines.iter()).cloned().collect();
+        let requested: Vec<String> = assemble_requested(&base_lines, req_text, key);
         if !requested.iter().any(|l| !req_pkg_name(l).is_empty()) {
             return (String::new(),
                 "no build requirements — the toolchain (gftools/fontmake/…) would be missing; manage-venvs needs a base requirements file".into());
@@ -742,6 +750,20 @@ mod tests {
             out,
             vec!["gftools==0.9.99", "fontmake==3.11.1", "gftools[ci]>=0.9", "# a comment", "-e ."]
         );
+    }
+
+    #[test]
+    fn family_pins_override_base_toolchain() {
+        let base: Vec<String> = ["fontmake==3.11.1", "fonttools==4.61.1", "gftools==0.9.99"]
+            .iter().map(|s| s.to_string()).collect();
+        // family pins fontmake + gftools (looser); base fontmake/gftools are DROPPED, fonttools kept
+        let got = assemble_requested(&base, "fontmake>=2.4\ngftools>=0.7\ndrawbot-skia>=0.4.8", "c-x");
+        assert_eq!(
+            got,
+            vec!["fonttools==4.61.1", "fontmake>=2.4", "gftools>=0.7", "drawbot-skia>=0.4.8"]
+        );
+        // the 'base' cohort itself takes no family lines
+        assert_eq!(assemble_requested(&base, "whatever", "base"), base);
     }
 
     #[test]

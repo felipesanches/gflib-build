@@ -38,6 +38,7 @@ fn main() {
         Mode::Stop => run_stop(&cfg),
         Mode::Reset => run_reset(&cfg),
         Mode::CohortsReport => run_cohorts_report(&cfg),
+        Mode::EffReq => run_effreq(&cfg),
         Mode::Fontspector => std::process::exit(fontspector::run_pass(&cfg)),
         Mode::Attach => run_attach(&cfg),
         Mode::Build => run_build(cfg),
@@ -279,6 +280,52 @@ fn run_list(cfg: &config::Config) {
     );
 }
 
+/// `--effreq <mirror.git> <commit>`: print the cohort key + the EXACT effective requirements the
+/// installer would feed pip for that repo at that commit — include-expanded, QA-filtered, with family
+/// pins overriding the base toolchain and pin-overrides applied. A read-only diagnostic (one
+/// `git show` per requirements file; no extraction, no install). Useful for debugging venv failures.
+fn run_effreq(cfg: &config::Config) {
+    let mirror = std::path::PathBuf::from(&cfg.effreq_mirror);
+    if !mirror.is_dir() {
+        eprintln!("--effreq: mirror not found: {}", mirror.display());
+        std::process::exit(2);
+    }
+    // base toolchain: explicit --base-requirements, else the bundled requirements-build.txt
+    let base_path = cfg.base_requirements.clone().or_else(|| {
+        ["requirements-build.txt", "../requirements-build.txt"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.is_file())
+    });
+    let base_text = base_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+
+    let req = venv::read_requirements_from_mirror(&mirror, &cfg.effreq_commit);
+    let key = venv::cohort_key_for(&req);
+    let base_lines = venv::filter_qa_requirements(
+        &base_text.lines().map(|s| s.to_string()).collect::<Vec<_>>(),
+    );
+    let requested = venv::assemble_requested(&base_lines, &req, &key);
+    let (effective, overridden) = venv::apply_pin_overrides(&requested);
+
+    println!("# mirror: {}", mirror.display());
+    println!("# commit: {}", cfg.effreq_commit);
+    println!(
+        "# base:   {}",
+        base_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none)".into())
+    );
+    println!("# cohort-key: {}", key);
+    if !overridden.is_empty() {
+        println!("# pin-overrides applied: {}", overridden.join(", "));
+    }
+    println!("# --- effective requirements (what pip resolves) ---");
+    for l in &effective {
+        println!("{}", l);
+    }
+}
+
 fn run_cohorts_report(cfg: &config::Config) {
     // Read-only preview of the dependency-cohort grouping: scan each family's requirements via
     // `git show` on the mirror (no extraction, no builds, archives untouched). Ported from Python.
@@ -473,6 +520,7 @@ LIFECYCLE:
                                 shared opts: --fontspector-version <v> / -profile <p> / -bin <path> / -rerun
   --list                        print the buildable worklist and exit
   --cohorts-report              preview the dependency-cohort grouping (read-only) and exit
+  --effreq <mirror.git> <commit>  print the effective requirements a repo would feed pip (read-only)
   --attach                      attach a read-only monitor to a build at --build-dir
   --detach / --no-detach        run the build in a background daemon (default for curses) / force fg
   --stop                        signal a build daemon at --build-dir to stop (graceful)
