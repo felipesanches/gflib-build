@@ -65,8 +65,9 @@ hand-authoring**:
   per family, `Architecture: all`, `Depends: ${misc:Depends}`, `Homepage`, description from
   METADATA.
 - **`debian/rules`** — `dh $@` with `override_dh_auto_build` running our recipe: stage the
-  pinned source, run `pre_build` steps (C), invoke `gftools-builder`/`fontc` (E) with the
-  family `config.yaml` (D); `override_dh_auto_install` placing the built fonts.
+  pinned source (from the local archive mirror — §7.1), run `pre_build` steps (C), invoke
+  `gftools-builder`/`fontc` (E) with the family `config.yaml` (D); `override_dh_auto_install`
+  placing the built fonts.
 - **`debian/copyright`** — **DEP-5**, generated from the family license (OFL-1.1 / Apache-2.0 /
   UFL-1.0) + `Source:` upstream URL + holders parsed from `OFL.txt`. *(Realizes the DEP-5
   adoption from the provenance doc's §9.)*
@@ -138,6 +139,27 @@ Debian build-dependency packages** — and use that graph as a migration instrum
   build-fix-provenance loop (missing `system_package`, missing `pre_build`, …). Green across
   the library ⇒ the manifests are collectively proven. This ledger is the headline artifact —
   dashboard-surfaced alongside the M-ladder.
+
+### 7.1 Sourcing: real upstream in the metadata, local archive mirror for the build
+
+The packages **reference the canonical upstream** in their metadata (`debian/watch`,
+`debian/copyright` `Source:`, `Vcs-*`), but the **actual build input is fetched from our local
+repo archive** (`upstream_repos/repo_archive/{owner}/{repo}.git`, bare `--mirror`s) at the
+pinned commit — never re-cloned from the network. This is the *same* archive gflib-build already
+builds from (read-only `git archive` / `git show`), so:
+
+- **Fast iteration.** Drafting and testing `debian/` across thousands of families re-uses on-disk
+  mirrors instead of re-downloading; `git -C <mirror> archive <commit>` (or a throwaway clone of
+  the bare mirror) materialises the pinned source tree in milliseconds.
+- **Fully offline & reproducible.** Source from the archive + Python deps from the wheelhouse
+  (§5) + system deps inside the chroot ⇒ the entire `sbuild` is **network-free** — exactly the
+  property that makes a green build trustworthy proof.
+- **Provenance stays honest.** Metadata points users and maintainers at the real upstream; only
+  the *build input* comes from the mirror, and the pinned commit ties the two together. The
+  archive is refreshed with `git remote update` on the maintenance cadence (§8); it is
+  append-only and never modified (repo-archive policy).
+- **One escape hatch.** `--source-from archive|upstream` (default `archive`) lets a maintainer
+  force a fresh upstream fetch to verify a mirror is current, without touching the metadata.
 
 ## 8. Maintenance model (self-maintained, automated)
 
