@@ -44,6 +44,14 @@ pub fn run_export_deb(cfg: &config::Config) {
     let mut index: Vec<serde_json::Value> = Vec::new();
     let (mut exported, mut no_fam, mut no_fonts, mut lic_fallback) = (0usize, 0usize, 0usize, 0usize);
 
+    // --build-debs: assemble + validate a binary .deb per drafted family (a repack of the
+    // already-built fonts via dpkg-deb; the from-source clean-room build is a later stage).
+    let build_debs = cfg.build_debs;
+    let lint_present = on_path("lintian");
+    let pool = pkg_root.join("pool");
+    let mut build_results = serde_json::Map::new();
+    let (mut debs_built, mut debs_failed) = (0usize, 0usize);
+
     for (slug, res) in &st.results {
         if res.status != "built" {
             continue;
@@ -120,10 +128,23 @@ pub fn run_export_deb(cfg: &config::Config) {
         }
         set_exec(&rules_path);
 
+        // optionally build + validate the binary .deb (before index.push, so pkg/version stay owned)
+        let mut deb_built = false;
+        if build_debs {
+            let pkg_dir = pkg_root.join(util::slug_to_logname(slug));
+            let r = build_one_deb(&pkg_dir, &pool, &pkg, &version, fam, &fonts, lint_present);
+            deb_built = r.built;
+            if r.built { debs_built += 1 } else { debs_failed += 1 }
+            build_results.insert(slug.clone(), serde_json::json!({
+                "built": r.built, "validated": r.validated, "deb_bytes": r.deb_bytes,
+                "lint": r.lint, "error": r.error, "package": pkg, "version": version,
+            }));
+        }
+
         index.push(serde_json::json!({
             "slug": slug, "package": pkg, "version": version, "license": spdx,
             "license_assumed": fallback, "fonts": font_names.len(), "backend": res.backend,
-            "compiler_version": res.compiler_version,
+            "compiler_version": res.compiler_version, "deb_built": deb_built,
         }));
         exported += 1;
     }
@@ -132,6 +153,14 @@ pub fn run_export_deb(cfg: &config::Config) {
     let doc = serde_json::json!({ "schema_version": 1, "count": index.len(), "packages": index });
     if let Ok(txt) = serde_json::to_string_pretty(&doc) {
         let _ = std::fs::write(pkg_root.join("index.json"), txt);
+    }
+    if build_debs {
+        let bdoc = serde_json::json!({
+            "schema_version": 1, "built": debs_built, "failed": debs_failed, "results": build_results,
+        });
+        if let Ok(txt) = serde_json::to_string_pretty(&bdoc) {
+            let _ = std::fs::write(pkg_root.join("build-results.json"), txt);
+        }
     }
     eprintln!("export-deb: drafted {} package(s) under {}", exported, pkg_root.display());
     eprintln!(
@@ -144,6 +173,15 @@ pub fn run_export_deb(cfg: &config::Config) {
             String::new()
         }
     );
+    if build_debs {
+        eprintln!(
+            "  debs: {} built, {} failed -> {}{}",
+            debs_built,
+            debs_failed,
+            pool.display(),
+            if lint_present { "" } else { "  (lintian absent — validated via dpkg-deb only)" }
+        );
+    }
 }
 
 // ---- helpers ----
@@ -476,6 +514,158 @@ fn provenance(
     s
 }
 
+// ---- binary .deb assembly (repack of the built fonts via dpkg-deb; from-source build is later) ----
+
+#[derive(Default)]
+struct DebResult {
+    built: bool,
+    validated: bool,
+    deb_bytes: u64,
+    lint: String,
+    error: String,
+}
+
+/// Assemble + validate a binary .deb for one family from its built fonts. Stages a tree under
+/// `pkg_dir/_build/`, runs `dpkg-deb --root-owner-group --build` into `pool/`, then validates with
+/// `dpkg-deb --info`/`--contents` (+ `lintian` when present).
+fn build_one_deb(
+    pkg_dir: &Path,
+    pool: &Path,
+    pkg: &str,
+    version: &str,
+    fam: &model::Family,
+    fonts: &[PathBuf],
+    lint: bool,
+) -> DebResult {
+    let mut res = DebResult::default();
+    let famn = pkg.strip_prefix("fonts-gf-").unwrap_or(pkg);
+    let stage = pkg_dir.join("_build");
+    let _ = std::fs::remove_dir_all(&stage);
+
+    // copy the fonts (de-duplicated by basename) into /usr/share/fonts/{truetype,opentype}/gf-<fam>/
+    let mut seen = BTreeSet::new();
+    let mut size = 0u64;
+    for f in fonts {
+        let name = match f.file_name().map(|n| n.to_string_lossy().to_string()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let sub = if name.to_ascii_lowercase().ends_with(".otf") { "opentype" } else { "truetype" };
+        let dst_dir = stage.join("usr/share/fonts").join(sub).join(format!("gf-{}", famn));
+        if std::fs::create_dir_all(&dst_dir).is_err() {
+            res.error = "stage mkdir failed".into();
+            return res;
+        }
+        let dst = dst_dir.join(&name);
+        if std::fs::copy(f, &dst).is_err() {
+            res.error = format!("copy {} failed", name);
+            return res;
+        }
+        size += std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+    }
+    if seen.is_empty() {
+        res.error = "no fonts to package".into();
+        return res;
+    }
+
+    // DEBIAN/control (binary control)
+    let ctrl_dir = stage.join("DEBIAN");
+    if std::fs::create_dir_all(&ctrl_dir).is_err() {
+        res.error = "DEBIAN mkdir failed".into();
+        return res;
+    }
+    let installed_kb = size.div_ceil(1024).max(1);
+    if std::fs::write(ctrl_dir.join("control"), binary_control(pkg, version, fam, installed_kb)).is_err() {
+        res.error = "write DEBIAN/control failed".into();
+        return res;
+    }
+
+    // build the .deb
+    let _ = std::fs::create_dir_all(pool);
+    let deb_path = pool.join(format!("{}_{}_all.deb", pkg, version));
+    match std::process::Command::new("dpkg-deb")
+        .args(["--root-owner-group", "--build"])
+        .arg(&stage)
+        .arg(&deb_path)
+        .output()
+    {
+        Ok(o) if o.status.success() => res.built = true,
+        Ok(o) => {
+            res.error = format!("dpkg-deb: {}", String::from_utf8_lossy(&o.stderr).trim());
+            let _ = std::fs::remove_dir_all(&stage);
+            return res;
+        }
+        Err(e) => {
+            res.error = format!("dpkg-deb spawn: {}", e);
+            return res;
+        }
+    }
+    res.deb_bytes = std::fs::metadata(&deb_path).map(|m| m.len()).unwrap_or(0);
+
+    // validate: control parses, and the archive actually contains the fonts
+    let info_ok = std::process::Command::new("dpkg-deb")
+        .arg("--info")
+        .arg(&deb_path)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let has_font = std::process::Command::new("dpkg-deb")
+        .arg("--contents")
+        .arg(&deb_path)
+        .output()
+        .map(|o| {
+            let t = String::from_utf8_lossy(&o.stdout);
+            t.contains(".ttf") || t.contains(".otf")
+        })
+        .unwrap_or(false);
+    res.validated = info_ok && has_font;
+
+    res.lint = if lint {
+        match std::process::Command::new("lintian").arg(&deb_path).output() {
+            Ok(o) => {
+                let txt = String::from_utf8_lossy(&o.stdout);
+                let e = txt.lines().filter(|l| l.starts_with("E:")).count();
+                let w = txt.lines().filter(|l| l.starts_with("W:")).count();
+                if e > 0 {
+                    format!("{} errors, {} warnings", e, w)
+                } else if w > 0 {
+                    format!("{} warnings", w)
+                } else {
+                    "clean".into()
+                }
+            }
+            Err(_) => "lintian failed to run".into(),
+        }
+    } else {
+        "not run (lintian absent)".into()
+    };
+
+    let _ = std::fs::remove_dir_all(&stage); // keep the .deb in pool/, drop the staging tree
+    res
+}
+
+/// The binary-package DEBIAN/control (distinct from the source debian/control).
+fn binary_control(pkg: &str, version: &str, fam: &model::Family, installed_kb: u64) -> String {
+    let name = oneline(if fam.name.is_empty() { pkg } else { fam.name.as_str() });
+    let v: Vec<String> = vec![
+        format!("Package: {}", pkg),
+        format!("Version: {}", version),
+        "Architecture: all".into(),
+        format!("Maintainer: {}", MAINTAINER),
+        format!("Installed-Size: {}", installed_kb),
+        "Section: fonts".into(),
+        "Priority: optional".into(),
+        "Multi-Arch: foreign".into(),
+        format!("Description: {} -- Google Fonts, reproducible build", name),
+        " A repack of the gflib-build reproducible build (the from-source clean-room build is a".into(),
+        " later stage). The source package's debian/gflib-provenance records the exact recipe.".into(),
+    ];
+    v.join("\n") + "\n"
+}
+
 // ---- deb-build external toolchain detection (auto-recovers as tools appear) ----
 
 /// Required external programs for deb building/validation: (program, apt-package, purpose).
@@ -622,6 +812,17 @@ mod tests {
         assert_eq!(ymd(1700000000.0), "20231114");
         assert_eq!(rfc2822(1700000000.0), "Tue, 14 Nov 2023 22:13:20 +0000");
         assert_eq!(ymd(0.0), "19700101"); // deterministic when ended==0
+    }
+
+    #[test]
+    fn binary_control_fields() {
+        let fam = model::Family { name: "Test Family".into(), ..Default::default() };
+        let c = binary_control("fonts-gf-test", "0~gf20231114.gabc1234-1", &fam, 12);
+        assert!(c.contains("Package: fonts-gf-test"));
+        assert!(c.contains("Version: 0~gf20231114.gabc1234-1"));
+        assert!(c.contains("Architecture: all"));
+        assert!(c.contains("Installed-Size: 12"));
+        assert!(c.contains("Section: fonts"));
     }
 
     #[test]
