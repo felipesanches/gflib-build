@@ -9,6 +9,7 @@ mod build;
 mod classify;
 mod config;
 mod daemon;
+mod deb;
 mod discover;
 mod fontspector;
 mod mirror;
@@ -39,6 +40,7 @@ fn main() {
         Mode::Reset => run_reset(&cfg),
         Mode::CohortsReport => run_cohorts_report(&cfg),
         Mode::EffReq => run_effreq(&cfg),
+        Mode::ExportDeb => deb::run_export_deb(&cfg),
         Mode::Fontspector => std::process::exit(fontspector::run_pass(&cfg)),
         Mode::Attach => run_attach(&cfg),
         Mode::Build => run_build(cfg),

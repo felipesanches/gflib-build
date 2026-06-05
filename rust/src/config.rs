@@ -110,6 +110,7 @@ pub enum Mode {
     CohortsReport,
     EffReq,      // print the effective (post-filter/override) requirements for one mirror+commit
     Fontspector, // a separate QA pass: run fontspector over all already-built fonts
+    ExportDeb,   // draft a debian/ packaging tree for every successfully-built family
     Help,
 }
 
@@ -212,6 +213,7 @@ pub fn parse(args: &[String]) -> Parsed {
             "--fontspector-bin" => cfg.fontspector_bin = Some(PathBuf::from(next(&mut i, a))),
             "--fontspector-rerun" => cfg.fontspector_rerun = true,
             "--cohorts-report" => mode = Mode::CohortsReport,
+            "--export-deb" => mode = Mode::ExportDeb,
             "--effreq" => {
                 mode = Mode::EffReq;
                 cfg.effreq_mirror = next(&mut i, a);
