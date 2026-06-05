@@ -1352,12 +1352,20 @@ impl Orchestrator {
         let mut index = read_pkg_index(&pkg_root);
         let mut results = read_deb_results(&pkg_root);
         {
+            // Seed `packaged` from prior TERMINAL results only — a real .deb (built==true) or a recorded
+            // no-fonts skip. NOT from index.json: a draft-only `--export-deb` (without --build-debs) fills
+            // index.json with no .debs built, and seeding those would wrongly suppress building them.
             let mut sh = self.shared.lock().unwrap();
-            for k in index.keys() {
-                sh.packaged.insert(k.clone());
-            }
-            for k in results.keys() {
-                sh.packaged.insert(k.clone());
+            for (k, v) in results.iter() {
+                let built = v.get("built").and_then(|b| b.as_bool()).unwrap_or(false);
+                let no_fonts = v
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.contains("no fonts"))
+                    .unwrap_or(false);
+                if built || no_fonts {
+                    sh.packaged.insert(k.clone());
+                }
             }
         }
         loop {
@@ -1402,6 +1410,7 @@ impl Orchestrator {
                     continue;
                 }
             };
+            let gen = res.ended; // build generation: detect a rebuild that lands while we package
             let lint = crate::deb::on_path("lintian");
             let o = crate::deb::package_one_family(
                 &self.cfg.build_dir,
@@ -1413,15 +1422,45 @@ impl Orchestrator {
                 true,
                 lint,
             );
-            if let Some(e) = o.index_entry {
-                index.insert(slug.clone(), e);
+            // built but its out/ fonts were pruned (--discard-fonts before build_debs was on): record a
+            // terminal failure so it's visible in deb_status and not re-attempted every restart.
+            if o.skipped == Some("no_fonts") {
+                results.insert(slug.clone(), serde_json::json!({
+                    "built": false,
+                    "error": "no fonts on disk (rebuild with .deb packaging enabled to keep them)",
+                }));
+                self.shared.lock().unwrap().packaged.insert(slug.clone());
+                write_deb_results(&pkg_root, &results);
+                continue;
             }
-            if let Some(d) = o.deb_result {
-                results.insert(slug.clone(), d);
+            if o.skipped.is_some() {
+                self.shared.lock().unwrap().packaged.insert(slug.clone()); // mkdir/write fail: don't spin
+                continue;
             }
-            self.shared.lock().unwrap().packaged.insert(slug.clone());
-            write_pkg_index(&pkg_root, &index);
-            write_deb_results(&pkg_root, &results);
+            // Commit ONLY if the family wasn't rebuilt while we packaged it — else the .deb we just built
+            // is stale; leave it unpackaged so the next iteration repackages the fresh build.
+            let still_current = {
+                let mut sh = self.shared.lock().unwrap();
+                let ok = sh
+                    .results
+                    .get(&slug)
+                    .map(|r| r.status == "built" && r.ended == gen)
+                    .unwrap_or(false);
+                if ok {
+                    sh.packaged.insert(slug.clone());
+                }
+                ok
+            };
+            if still_current {
+                if let Some(e) = o.index_entry {
+                    index.insert(slug.clone(), e);
+                }
+                if let Some(d) = o.deb_result {
+                    results.insert(slug.clone(), d);
+                }
+                write_pkg_index(&pkg_root, &index);
+                write_deb_results(&pkg_root, &results);
+            }
         }
     }
 
@@ -1649,8 +1688,12 @@ impl Orchestrator {
         // daemon doesn't exit mid-QA.
         let qa_pending = self.cfg.fontspector_qa
             && (!sh.qa_init || !sh.qa_queue.is_empty() || !sh.qa_active.is_empty());
+        // when auto-packaging is on, also wait for the package backlog so a headless/foreground run
+        // doesn't request_stop (killing the package worker) with built-but-unpackaged families left.
+        let pkg_pending = sh.build_debs
+            && sh.results.values().any(|r| r.status == "built" && !sh.packaged.contains(&r.slug));
         let done = counts.queued == 0 && counts.building == 0
-            && self.active.load(Ordering::Relaxed) == 0 && !qa_pending;
+            && self.active.load(Ordering::Relaxed) == 0 && !qa_pending && !pkg_pending;
 
         let op_stats: BTreeMap<String, OpStat> = sh
             .op_stats

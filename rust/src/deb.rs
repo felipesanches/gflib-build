@@ -14,6 +14,17 @@ use std::path::{Path, PathBuf};
 const MAINTAINER: &str = "Google Fonts Deb-Packaging (gflib-build) <juca@members.fsf.org>";
 
 pub fn run_export_deb(cfg: &config::Config) {
+    // A live daemon now auto-packages (the package worker writes packaging/ incrementally). This
+    // one-shot wipes packaging/ and would clobber/race it, so refuse when a daemon owns the build dir.
+    if let Some(pid) = persist::read_daemon_pid(&cfg.build_dir) {
+        eprintln!(
+            "a build daemon (pid {}) owns {} and already auto-packages built families.\n\
+             Stop it (gflib-build --stop) or use a separate --build-dir before running --export-deb.",
+            pid,
+            cfg.build_dir.display()
+        );
+        return;
+    }
     let mut cfg = cfg.clone();
     if !cfg.archive.is_dir() {
         if let Some(a) = discover::detect_archive(&cfg.data_dir) {
@@ -641,6 +652,17 @@ fn build_one_deb(
 
     // build the .deb
     let _ = std::fs::create_dir_all(pool);
+    // drop any prior .deb(s) for this package (a different version, e.g. a rebuild on a later date) so
+    // pool/ keeps at most the current one — the live worker never wipes packaging/.
+    let prefix = format!("{}_", pkg);
+    if let Ok(rd) = std::fs::read_dir(pool) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) && name.ends_with("_all.deb") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
     let deb_path = pool.join(format!("{}_{}_all.deb", pkg, version));
     match std::process::Command::new("dpkg-deb")
         .args(["--root-owner-group", "--build"])
