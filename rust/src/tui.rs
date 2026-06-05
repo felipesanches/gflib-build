@@ -20,8 +20,8 @@ use std::time::Duration;
 
 // Tab order MUST match the web UI's TABS (a user switching between the terminal and the browser
 // sees the same tabs in the same order).
-const TABS: [&str; 10] = [
-    "config", "overview", "queue", "cohorts", "archive", "built", "packaging", "failures", "stats", "fontspector",
+const TABS: [&str; 11] = [
+    "config", "overview", "queue", "cohorts", "archive", "built", "packaging", "tools", "failures", "stats", "fontspector",
 ];
 
 /// Colour for a fontspector status: FAIL/FATAL/ERROR red · WARN yellow · PASS green · else grey.
@@ -766,6 +766,25 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
             vec![SectionR {
                 title: "Packaging — per-family status  (drafted = debian/ on disk · draftable = built, ready to draft)".into(),
                 dview: "built", rows, keys: snap.built_recent.iter().map(|b| b.slug.clone()).collect(),
+            }]
+        }
+        "tools" => {
+            // build-tool packages, classified python/rust: the M5 (Python->Rust) burn-down view.
+            // python = a remaining migration blocker; rust = already a native tool.
+            let rows = snap.tool_packages.iter().map(|t| {
+                let lcol = if t.lang == "rust" { Color::Green } else { Color::Yellow };
+                let status = if t.packaged { "packaged" } else { "unpackaged" };
+                vec![
+                    (format!("{:<7} ", t.lang), lcol),
+                    (format!("{:<24} ", head(&t.name, 24)), Color::White),
+                    (format!("{:<12} ", t.kind), Color::Cyan),
+                    (format!("{:>4} families  ", t.families), Color::Grey),
+                    (status.to_string(), Color::DarkGrey),
+                ]
+            }).collect();
+            vec![SectionR {
+                title: "Build-tool packages  (python = M5 blocker · rust = native · ENTER = which families need it)".into(),
+                dview: "tool", rows, keys: snap.tool_packages.iter().map(|t| t.name.clone()).collect(),
             }]
         }
         "failures" => {
@@ -1587,6 +1606,29 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
                     o.push("log tail:".into());
                     for ln in read_log_tail(&b.log, 60) {
                         o.push(format!("  {}", ln));
+                    }
+                }
+            }
+        }
+        "tool" => {
+            let name = sections_for(snap, tab, fc_sel).get(section).and_then(|s| s.keys.get(sel).cloned());
+            if let Some(name) = name {
+                if let Some(t) = snap.tool_packages.iter().find(|t| t.name == name) {
+                    o.push(format!("Build-tool package: {}", t.name));
+                    o.push(format!(
+                        "language: {}   kind: {}   packaged: {}",
+                        t.lang, t.kind, if t.packaged { "yes" } else { "no" }
+                    ));
+                    let more = if t.family_list.len() < t.families {
+                        format!(" (showing first {})", t.family_list.len())
+                    } else {
+                        String::new()
+                    };
+                    o.push(format!("required by {} families{}", t.families, more));
+                    o.push(String::new());
+                    o.push("families:".into());
+                    for fam in &t.family_list {
+                        o.push(format!("  {}", fam));
                     }
                 }
             }

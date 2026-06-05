@@ -269,7 +269,7 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
 <script>
 let snap={}, tab='overview';
 // tab order MUST match the TUI's VIEWS
-const TABS=['config','overview','queue','cohorts','archive','built','packaging','failures','stats','fontspector'];
+const TABS=['config','overview','queue','cohorts','archive','built','packaging','tools','failures','stats','fontspector'];
 // fontspector status → colour class (FAIL/FATAL/ERROR red · WARN yellow · PASS green · SKIP/INFO grey)
 function fsCls(s){return {PASS:'g',WARN:'y',FAIL:'r',FATAL:'r',ERROR:'r'}[s]||'muted'}
 function fsColor(s){return {PASS:'#22c55e',WARN:'#eab308',FAIL:'#ef4444',FATAL:'#b91c1c',ERROR:'#ef4444',SKIP:'#475569',INFO:'#64748b'}[s]||'#475569'}
@@ -333,6 +333,8 @@ function builtRow(b){const comp=b.compiler_version||b.backend||'';
  return {segs:[[L(b.slug,32)+' ','g'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9)+'  '+(b.compare||''),'gr']],rt:b.slug,det:['built',b.slug]}}
 function packagingRow(b){const comp=b.compiler_version||b.backend||'';const drafted=!!b.packaged;
  return {segs:[[L(drafted?'drafted':'draftable',10)+' ',drafted?'g':'y'],[L(b.slug,32)+' ','gr'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9),'gr']],rt:b.slug,det:['built',b.slug]}}
+function toolRow(t){const rust=t.lang=='rust';
+ return {segs:[[L(t.lang,7)+' ',rust?'g':'y'],[L(t.name,24)+' ','w'],[L(t.kind,12)+' ','c'],[Rp(t.families,4)+' families  ','gr'],[(t.packaged?'packaged':'unpackaged'),'gr']],det:['tool',t.name]}}
 // clicking a cause FILTERS the families list below (and highlights the selected cause)
 function failcatRow(c){const sel=fsCause==c.cat;
  return {segs:[[(sel?'▸':' ')+Rp(c.count,3)+'  ','w'],[L(c.cat,24),sel?'y':'c'],[' '+(c.hint||''),'muted']],fc:c.cat}}
@@ -347,6 +349,7 @@ function sections(t){
  if(t=='cohorts')return [{title:'Dependency cohorts  (● = venv cached on disk, reused next run)',rows:filterList(snap.cohorts,['key']).map(cohortRow)}];
  if(t=='built')return [{title:'Built — successes  (slug · compiler+version · size · vs-shipped)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(builtRow)}];
  if(t=='packaging')return [{title:'Packaging — per-family status  (drafted = debian/ on disk · draftable = built, ready to draft)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(packagingRow)}];
+ if(t=='tools')return [{title:'Build-tool packages  (python = M5 blocker · rust = native · click = which families need it)',rows:filterList(snap.tool_packages,['name','lang','kind']).map(toolRow)}];
  if(t=='failures'){const s=[];const cats=snap.fail_categories||[];
   if(cats.length)s.push({title:'Failures by cause (click to filter)',rows:filterList(cats,['cat','hint']).map(failcatRow)});
   // families list, scoped to the selected cause. When a cause is selected we list its
@@ -612,6 +615,10 @@ function openDetail(kind,id){
   lines=['cause: '+h.cause,'provenance: '+prov(h),'rebuild: gflib-build --only '+h.slug+' --rebuild --yes','','error:','  '+(h.error||'')];
  } else if(kind=='task'){const t=findBy(snap.tasks,'key',id);if(!t)return;title='Pipeline task: '+t.name;
   lines=['status: '+t.status];if(t.total)lines.push('progress: '+t.done+'/'+t.total);if(t.elapsed)lines.push('elapsed: '+hms(t.elapsed));if(t.detail)lines.push('detail: '+t.detail);
+ } else if(kind=='tool'){const t=findBy(snap.tool_packages,'name',id);if(!t)return;title='Build-tool: '+t.name;
+  const more=(t.family_list||[]).length<(t.families||0)?' (first '+(t.family_list||[]).length+')':'';
+  lines=['language: '+(t.lang||'?')+'   kind: '+(t.kind||'?')+'   packaged: '+(t.packaged?'yes':'no'),'required by '+(t.families||0)+' families'+more,'','families:'];
+  (t.family_list||[]).forEach(f=>lines.push('  '+f));
  } else if(kind=='fsfamily'){openFsFamily(id);return;
  } else return;
  showDetail(title,lines,slug);

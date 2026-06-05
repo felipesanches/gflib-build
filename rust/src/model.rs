@@ -242,6 +242,18 @@ pub struct OpStat {
 }
 
 /// The live full snapshot — what both UIs render and the daemon writes to status.json each ~1 s.
+/// One build-tool package (a dependency, compiler, or orchestrator) + the families that need it,
+/// classified python/rust — the per-tool Python->Rust (M5) burn-down view.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ToolPkg {
+    #[serde(default)] pub name: String,
+    #[serde(default)] pub lang: String,             // "python" | "rust"
+    #[serde(default)] pub kind: String,             // "requirement" | "compiler" | "orchestrator"
+    #[serde(default)] pub families: usize,          // how many families build-depend on it
+    #[serde(default)] pub family_list: Vec<String>, // capped slug list (for the detail overlay)
+    #[serde(default)] pub packaged: bool,           // a .deb has been built for this tool (none yet)
+}
+
 /// Defaulted everywhere so a partial/foreign status.json still deserializes.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -263,6 +275,7 @@ pub struct Snapshot {
     #[serde(default)] pub fail_categories: Vec<FailCategory>,
     #[serde(default)] pub cohorts: Vec<CohortView>,
     #[serde(default)] pub cohorts_ready: usize,
+    #[serde(default)] pub tool_packages: Vec<ToolPkg>, // build-tool packages + their dependent families
     #[serde(default)] pub phase: String,
     #[serde(default)] pub phase_total: usize,
     #[serde(default)] pub phase_done: usize,

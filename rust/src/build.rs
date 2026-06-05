@@ -1489,6 +1489,70 @@ impl Orchestrator {
             recent: sh.archive_recent.iter().rev().take(40).cloned().collect(),
         };
 
+        // build-tool packages (the Python->Rust / M5 burn-down): aggregate each family's dependency
+        // requirements + its compiler/orchestrator into a tool -> dependent-families map. CPU-only
+        // (no I/O) so it does not extend the lock with a stall.
+        let tool_packages = {
+            let cohort_pkgs: BTreeMap<&String, Vec<String>> = sh
+                .cohort_reqs
+                .iter()
+                .map(|(k, v)| (k, v.lines().map(crate::venv::req_pkg_name).filter(|p| !p.is_empty()).collect()))
+                .collect();
+            let mut tf: BTreeMap<String, (std::collections::BTreeSet<String>, &'static str)> = BTreeMap::new();
+            for r in sh.results.values() {
+                if let Some(pkgs) = cohort_pkgs.get(&r.cohort) {
+                    for pkg in pkgs {
+                        tf.entry(pkg.clone())
+                            .or_insert_with(|| (std::collections::BTreeSet::new(), "requirement"))
+                            .0
+                            .insert(r.slug.clone());
+                    }
+                }
+                let comps: Vec<&str> = match r.backend.as_str() {
+                    "both" => vec!["fontc", "fontmake"],
+                    "" => vec![],
+                    b => vec![b],
+                };
+                for c in comps {
+                    tf.entry(c.to_string())
+                        .or_insert_with(|| (std::collections::BTreeSet::new(), "compiler"))
+                        .0
+                        .insert(r.slug.clone());
+                }
+                if !r.builder.is_empty() {
+                    tf.entry(r.builder.clone())
+                        .or_insert_with(|| (std::collections::BTreeSet::new(), "orchestrator"))
+                        .0
+                        .insert(r.slug.clone());
+                }
+            }
+            let rust_tools: std::collections::HashSet<&str> =
+                ["fontc", "builder3", "gftools-builder3"].into_iter().collect();
+            let mut v: Vec<crate::model::ToolPkg> = tf
+                .into_iter()
+                .map(|(name, (fams, kind))| {
+                    let lang = if name == "builder2" || name == "fontmake" {
+                        "python"
+                    } else if rust_tools.contains(name.as_str()) {
+                        "rust"
+                    } else {
+                        "python"
+                    };
+                    let family_list: Vec<String> = fams.iter().take(300).cloned().collect();
+                    crate::model::ToolPkg {
+                        name,
+                        lang: lang.to_string(),
+                        kind: kind.to_string(),
+                        families: fams.len(),
+                        family_list,
+                        packaged: false,
+                    }
+                })
+                .collect();
+            v.sort_by(|a, b| b.families.cmp(&a.families).then(a.name.cmp(&b.name)));
+            v
+        };
+
         Snapshot {
             elapsed: self.elapsed(),
             disk_used_delta: 0,
@@ -1512,6 +1576,7 @@ impl Orchestrator {
                 .map(|v| v.ready_count())
                 .unwrap_or_else(|| cohorts_out.iter().filter(|c| c.cached).count()),
             cohorts: cohorts_out,
+            tool_packages,
             phase: sh.phase.clone(),
             phase_total: sh.library_total,
             phase_done: 0,
