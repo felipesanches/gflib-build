@@ -120,6 +120,7 @@ pub struct BuiltItem {
     #[serde(default)] pub compiler_version: String,
     #[serde(default)] pub builder: String,
     #[serde(default)] pub builder_version: String,
+    #[serde(default)] pub packaged: bool, // a debian/ packaging tree has been drafted on disk
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

@@ -1317,6 +1317,13 @@ impl Orchestrator {
         let mut fails = Vec::new();
         let mut built = Vec::new();
         let mut fail_cat: BTreeMap<String, (usize, Vec<String>, &'static str)> = BTreeMap::new();
+        // packaging status: a family is "drafted" when its debian/ tree exists under
+        // <build_dir>/packaging/<slug__>/. Read that dir ONCE per snapshot (cheap) into a set
+        // rather than stat-ing per built family in the render hot path.
+        let drafted: std::collections::HashSet<String> =
+            std::fs::read_dir(self.cfg.build_dir.join("packaging"))
+                .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+                .unwrap_or_default();
 
         for r in sh.results.values() {
             match r.status.as_str() {
@@ -1349,6 +1356,7 @@ impl Orchestrator {
                     compiler_version: r.compiler_version.clone(),
                     builder: r.builder.clone(),
                     builder_version: r.builder_version.clone(),
+                    packaged: drafted.contains(&r.slug.replace('/', "__")),
                 });
             }
             if r.status == "building" {

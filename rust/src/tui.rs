@@ -20,8 +20,8 @@ use std::time::Duration;
 
 // Tab order MUST match the web UI's TABS (a user switching between the terminal and the browser
 // sees the same tabs in the same order).
-const TABS: [&str; 9] = [
-    "config", "overview", "queue", "cohorts", "archive", "built", "failures", "stats", "fontspector",
+const TABS: [&str; 10] = [
+    "config", "overview", "queue", "cohorts", "archive", "built", "packaging", "failures", "stats", "fontspector",
 ];
 
 /// Colour for a fontspector status: FAIL/FATAL/ERROR red · WARN yellow · PASS green · else grey.
@@ -747,6 +747,24 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
             }).collect();
             vec![SectionR {
                 title: "Built — successes  (slug · compiler+version · size · vs-shipped)".into(),
+                dview: "built", rows, keys: snap.built_recent.iter().map(|b| b.slug.clone()).collect(),
+            }]
+        }
+        "packaging" => {
+            // reuses built_recent + the BuiltItem.packaged flag (set by the snapshot writer);
+            // dview "built" so ENTER opens the existing built detail overlay unchanged.
+            let rows = snap.built_recent.iter().map(|b| {
+                let (status, scol) = if b.packaged { ("drafted  ", Color::Green) } else { ("draftable", Color::Yellow) };
+                let comp = if !b.compiler_version.is_empty() { b.compiler_version.clone() } else { b.backend.clone() };
+                vec![
+                    (format!("{:<10} ", status), scol),
+                    (format!("{:<32} ", head(&b.slug, 32)), Color::Grey),
+                    (format!("{:<26} ", head(&comp, 26)), Color::Cyan),
+                    (format!("{:>9}", human(b.bytes)), Color::Grey),
+                ]
+            }).collect();
+            vec![SectionR {
+                title: "Packaging — per-family status  (drafted = debian/ on disk · draftable = built, ready to draft)".into(),
                 dview: "built", rows, keys: snap.built_recent.iter().map(|b| b.slug.clone()).collect(),
             }]
         }

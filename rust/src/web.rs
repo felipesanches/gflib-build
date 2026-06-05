@@ -269,7 +269,7 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
 <script>
 let snap={}, tab='overview';
 // tab order MUST match the TUI's VIEWS
-const TABS=['config','overview','queue','cohorts','archive','built','failures','stats','fontspector'];
+const TABS=['config','overview','queue','cohorts','archive','built','packaging','failures','stats','fontspector'];
 // fontspector status → colour class (FAIL/FATAL/ERROR red · WARN yellow · PASS green · SKIP/INFO grey)
 function fsCls(s){return {PASS:'g',WARN:'y',FAIL:'r',FATAL:'r',ERROR:'r'}[s]||'muted'}
 function fsColor(s){return {PASS:'#22c55e',WARN:'#eab308',FAIL:'#ef4444',FATAL:'#b91c1c',ERROR:'#ef4444',SKIP:'#475569',INFO:'#64748b'}[s]||'#475569'}
@@ -331,6 +331,8 @@ function cohortRow(c){const segs=[[c.cached?'● ':'○ ',c.cached?'g':'muted'],
  return {segs,det:['cohort',c.key]}}
 function builtRow(b){const comp=b.compiler_version||b.backend||'';
  return {segs:[[L(b.slug,32)+' ','g'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9)+'  '+(b.compare||''),'gr']],rt:b.slug,det:['built',b.slug]}}
+function packagingRow(b){const comp=b.compiler_version||b.backend||'';const drafted=!!b.packaged;
+ return {segs:[[L(drafted?'drafted':'draftable',10)+' ',drafted?'g':'y'],[L(b.slug,32)+' ','gr'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9),'gr']],rt:b.slug,det:['built',b.slug]}}
 // clicking a cause FILTERS the families list below (and highlights the selected cause)
 function failcatRow(c){const sel=fsCause==c.cat;
  return {segs:[[(sel?'▸':' ')+Rp(c.count,3)+'  ','w'],[L(c.cat,24),sel?'y':'c'],[' '+(c.hint||''),'muted']],fc:c.cat}}
@@ -344,6 +346,7 @@ function sections(t){
  if(t=='queue')return [{title:'Queued — priority order (variable + larger families first)',rows:filterList(snap.queued_list,['slug','kind']).map(qRow)}];
  if(t=='cohorts')return [{title:'Dependency cohorts  (● = venv cached on disk, reused next run)',rows:filterList(snap.cohorts,['key']).map(cohortRow)}];
  if(t=='built')return [{title:'Built — successes  (slug · compiler+version · size · vs-shipped)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(builtRow)}];
+ if(t=='packaging')return [{title:'Packaging — per-family status  (drafted = debian/ on disk · draftable = built, ready to draft)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(packagingRow)}];
  if(t=='failures'){const s=[];const cats=snap.fail_categories||[];
   if(cats.length)s.push({title:'Failures by cause (click to filter)',rows:filterList(cats,['cat','hint']).map(failcatRow)});
   // families list, scoped to the selected cause. When a cause is selected we list its
