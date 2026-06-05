@@ -3,6 +3,7 @@ name = "gflib-build"
 version = "0.1.0"
 edition = "2021"
 description = "Rust port of gflib-build — build the entire Google Fonts library locally (TUI + web + orchestrator)"
+license = "Apache-2.0"
 
 [[bin]]
 name = "gflib-build"
