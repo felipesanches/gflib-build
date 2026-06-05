@@ -903,6 +903,13 @@ impl Orchestrator {
                 return;
             }
             self.note_cohort(slug, &cohort, &req);
+            // The cohort venv is now installed+marked on disk. Reflect it in the cohorts view
+            // immediately instead of waiting for the 10s size-thread rescan of cached_cohorts — else a
+            // fast first build can turn its family green while the cohort dot is still grey (the
+            // transient the screenshot caught). The next rescan re-confirms it; insert is idempotent.
+            if !cohort.is_empty() {
+                self.shared.lock().unwrap().cached_cohorts.insert(cohort.clone());
+            }
             self.set_result(slug, |r| {
                 r.cohort = cohort.clone();
                 r.note = String::new();
