@@ -87,6 +87,8 @@ pub struct Orchestrator {
     pub clone_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>, // per-repo clone lock (--mirror-missing)
     pub qa_bin: Mutex<Option<(PathBuf, String)>>, // resolved fontspector (path, version), lazily set
     pub dry_playbook: HashMap<String, Res>, // --dry-run: each family's previous outcome to replay
+    pub running: Mutex<HashSet<i32>>,       // pgids of in-flight builder children (freeze/thaw/kill)
+    pub frozen: AtomicBool,                 // pause SIGSTOPs running builds; lock-free mirror of sh.paused
 }
 
 impl Orchestrator {
@@ -241,6 +243,8 @@ impl Orchestrator {
             clone_locks: Mutex::new(HashMap::new()),
             qa_bin: Mutex::new(None),
             dry_playbook,
+            running: Mutex::new(HashSet::new()),
+            frozen: AtomicBool::new(false),
         })
     }
 
@@ -683,7 +687,8 @@ impl Orchestrator {
         };
         let t0 = now();
         if let Err(e) = run_builder(python, &cfg_path, work, log_path, self.cfg.timeout, backend,
-                                    self.cfg.fontc_bin.as_deref(), self.cfg.builder3_bin.as_deref()) {
+                                    self.cfg.fontc_bin.as_deref(), self.cfg.builder3_bin.as_deref(),
+                                    &self.running, &self.frozen) {
             return (false, format!("{}: {}", backend, e), BTreeMap::new(), 0);
         }
         let (bytes, found, extras) = collect_outputs(work, dest, &fam.shipped_fonts, t0);
@@ -964,6 +969,8 @@ impl Orchestrator {
                 backend,
                 self.cfg.fontc_bin.as_deref(),
                 self.cfg.builder3_bin.as_deref(),
+                &self.running,
+                &self.frozen,
             ));
             if let Err(e) = run {
                 last_err = format!("{}: {}", backend, e);
@@ -1119,6 +1126,7 @@ impl Orchestrator {
     pub fn apply_live(self: &Arc<Self>, set: &ControlSet) {
         let mut log = Vec::new();
         let mut new_jobs = None;
+        let mut freeze_sig = None;
         {
             let mut sh = self.shared.lock().unwrap();
             if let Some(j) = set.jobs {
@@ -1163,7 +1171,13 @@ impl Orchestrator {
             }
             if let Some(pause) = set.paused {
                 sh.paused = pause;
-                log.push(if pause { "paused".into() } else { "resumed".into() });
+                self.frozen.store(pause, Ordering::Relaxed);
+                freeze_sig = Some(if pause { SIGSTOP } else { SIGCONT });
+                log.push(if pause {
+                    "paused — froze running builds".into()
+                } else {
+                    "resumed — thawed builds".into()
+                });
             }
             if let Some(b) = &set.backend {
                 sh.backend = b.clone();
@@ -1208,6 +1222,10 @@ impl Orchestrator {
             if n > 200 {
                 sh.control_log.drain(0..n - 200);
             }
+        }
+        // freeze/thaw the in-flight builds AFTER releasing the shared lock (signalling never holds it)
+        if let Some(sig) = freeze_sig {
+            self.signal_running(sig);
         }
         if let Some(j) = new_jobs {
             self.ensure_workers(j);
@@ -1282,7 +1300,20 @@ impl Orchestrator {
 
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        // thaw then kill any in-flight builder groups so frozen/running children don't orphan when the
+        // daemon exits (the children are process-group leaders, so they survive the daemon otherwise).
+        self.signal_running(SIGCONT);
+        self.signal_running(SIGKILL);
         self.cond.notify_all();
+    }
+
+    /// Send `sig` to every in-flight builder process group — used to freeze (SIGSTOP) / thaw (SIGCONT)
+    /// on pause/resume, and to reap children (SIGKILL) on stop.
+    fn signal_running(&self, sig: i32) {
+        let set = self.running.lock().unwrap();
+        for &pgid in set.iter() {
+            signal_group(pgid, sig);
+        }
     }
 
     /// Flush the final status + derived reports SYNCHRONOUSLY (so a short foreground run doesn't exit
@@ -1781,6 +1812,25 @@ fn resolve_config(google_fonts: Option<&Path>, fam: &Family, work: &Path) -> Res
     Err("no config.yaml found (no override, no in-repo config)".into())
 }
 
+// POSIX signal numbers (Linux). Builders run as their own process-group leaders so these reach the
+// whole tree (python -> fontmake -> ninja/ttx). Freeze=SIGSTOP, thaw=SIGCONT, reap-on-stop=SIGKILL.
+const SIGKILL: i32 = 9;
+const SIGCONT: i32 = 18;
+const SIGSTOP: i32 = 19;
+
+/// Send `sig` to a whole process group (negative pid) — catches the builder's descendants, not just
+/// the direct child. A pgid <= 1 is never signalled (would hit pid 1 / every process).
+fn signal_group(pgid: i32, sig: i32) {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    if pgid > 1 {
+        unsafe {
+            kill(-pgid, sig);
+        }
+    }
+}
+
 /// Run the build orchestrator. builder3_bin set -> invoke the Rust-native builder3 binary directly
 /// (no Python); else `python -m gftools.builder <config>` (with --experimental-fontc for fontc).
 fn run_builder(
@@ -1792,6 +1842,8 @@ fn run_builder(
     backend: &str,
     fontc_bin: Option<&str>,
     builder3_bin: Option<&str>,
+    running: &Mutex<HashSet<i32>>,
+    frozen: &AtomicBool,
 ) -> Result<(), String> {
     use std::process::{Command, Stdio};
     let logf = std::fs::OpenOptions::new()
@@ -1837,19 +1889,49 @@ fn run_builder(
         .env("SOURCE_DATE_EPOCH", "0")
         .stdout(Stdio::from(logf))
         .stderr(Stdio::from(logf2));
+    // own process group so a freeze/kill reaches fontmake/ninja/ttx descendants, not just python
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = cmd.spawn().map_err(|e| format!("could not launch builder: {}", e))?;
-    // simple timeout: poll
+    let pgid = child.id() as i32; // == pid, since the child leads its own process group
+    // register for freeze/thaw/kill; the guard deregisters on EVERY exit path (incl. unwind)
+    running.lock().unwrap().insert(pgid);
+    struct Dereg<'a>(&'a Mutex<HashSet<i32>>, i32);
+    impl Drop for Dereg<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut s) = self.0.lock() {
+                s.remove(&self.1);
+            }
+        }
+    }
+    let _dereg = Dereg(running, pgid);
+    // if a pause landed between the worker's !paused check and here, freeze ourselves now (race-safe:
+    // registered above, so apply_live's SIGSTOP sweep either already hit us or this catches it)
+    if frozen.load(Ordering::Relaxed) {
+        signal_group(pgid, SIGSTOP);
+    }
+
+    // timeout poll. Frozen (paused) time must NOT count toward the deadline, else a long read-the-data
+    // pause would spuriously time the build out.
     if let Some(t) = timeout {
-        let deadline = std::time::Instant::now() + Duration::from_secs(t);
+        let mut deadline = std::time::Instant::now() + Duration::from_secs(t);
         loop {
+            if frozen.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(300));
+                deadline += Duration::from_millis(300); // don't count frozen time
+                continue;
+            }
             match child.try_wait() {
                 Ok(Some(st)) => {
                     return if st.success() { Ok(()) } else { Err(last_error_line(log_path)) };
                 }
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
+                        signal_group(pgid, SIGKILL); // kill the whole group, then reap
+                        let _ = child.wait();
                         return Err(format!("timed out after {}s", t));
                     }
                     thread::sleep(Duration::from_millis(300));
@@ -1858,6 +1940,7 @@ fn run_builder(
             }
         }
     } else {
+        // no timeout: wait() blocks until exit; a frozen child simply keeps the worker parked here
         let st = child.wait().map_err(|e| format!("wait: {}", e))?;
         if st.success() {
             Ok(())

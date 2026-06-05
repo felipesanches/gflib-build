@@ -486,7 +486,7 @@ function render(){
  const pre=snap.pre_build;
  DET=[]; // reset the click-to-detail index map for this frame
  // ---- header (rows 0/1) ----
- let hdr='<div class="t"> Google Fonts library build'+(snap.paused?' [PAUSED]':'')+
+ let hdr='<div class="t"> Google Fonts library build'+(snap.paused?' [PAUSED · builds frozen]':'')+
    (pre?'<span class="right muted">first-time setup</span>':'<span class="right w">elapsed '+hms(snap.elapsed)+'</span>')+'</div>';
  if(pre){hdr+='<div class="sub"> configure your build below, then navigate to ▶ Start build</div>';}
  else{
@@ -510,8 +510,8 @@ function render(){
   const opt=(ms,lbl)=>'<option value="'+ms+'"'+(POLL_MS==ms?' selected':'')+'>'+lbl+'</option>';
   const notifyBtn=(window.Notification&&Notification.permission!='granted')?' <button class="tbtn" onclick="askNotify()" title="notify when the build completes">🔔 notify</button>':'';
   document.getElementById('ctl').innerHTML=
-    '<button onclick="ctl({paused:true})"'+(snap.paused?' disabled':'')+'>pause</button> '+
-    '<button onclick="ctl({paused:false})"'+(snap.paused?'':' disabled')+'>resume</button>'+
+    '<button title="pause scheduling AND freeze (SIGSTOP) running builds to free CPU/RAM" onclick="ctl({paused:true})"'+(snap.paused?' disabled':'')+'>pause (freeze)</button> '+
+    '<button title="thaw (SIGCONT) frozen builds and resume scheduling" onclick="ctl({paused:false})"'+(snap.paused?'':' disabled')+'>resume (thaw)</button>'+
     (listTab?' <input id="filter" placeholder="filter… (slug / cause)" oninput="setFilter(this.value)" value="'+E(FILTER)+'">':'')+
     ' <button class="tbtn" onclick="exportJSON()">⬇ JSON</button> <button class="tbtn" onclick="exportCSV()">⬇ CSV (built+failed)</button>'+
     ' <button class="tbtn" onclick="poll()" title="refresh now">↻</button>'+

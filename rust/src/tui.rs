@@ -1047,7 +1047,7 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
     // ---- header (row 0/1) — matches Python exactly: title + [PAUSED], elapsed at w-24 ----
     let title = format!(
         " Google Fonts library build{}",
-        if snap.paused { " [PAUSED]" } else { "" }
+        if snap.paused { " [PAUSED · builds frozen]" } else { "" }
     );
     put(scr, 0, 0, &title, Color::White, w);
 
@@ -1214,7 +1214,7 @@ fn render_tabbar_body(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16
     } else if TABS[ui.tab] == "config" {
         " [↑↓]field  [←→/space]edit  [↵ or C]apply+save  [Tab/⇧Tab]tabs  [q]uit"
     } else {
-        " [Tab/⇧Tab]tabs  [↑↓]item  [←→]section  [↵]details  [p]ause  [R]etry  [C]onfig  [q]uit"
+        " [Tab/⇧Tab]tabs  [↑↓]item  [←→]section  [↵]details  [p]ause(freeze)  [R]etry  [C]onfig  [q]uit"
     };
     put(scr, footer_row, 0, footer, Color::DarkGrey, w);
     if TABS[ui.tab] == "config" && !ui.cfg_flash.is_empty() {
