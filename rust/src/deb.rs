@@ -63,90 +63,39 @@ pub fn run_export_deb(cfg: &config::Config) {
                 continue;
             }
         };
-
-        // gate on on-disk font presence (out dir may have been pruned post-build)
-        let out_dir = cfg.build_dir.join("out").join(util::slug_to_logname(slug));
-        let fonts = collect_fonts(&out_dir);
-        if fonts.is_empty() {
-            no_fonts += 1;
-            continue;
+        let o = package_one_family(
+            &cfg.build_dir,
+            slug,
+            res,
+            fam,
+            gf.as_deref(),
+            st.cohort_reqs.get(&res.cohort),
+            build_debs,
+            lint_present,
+        );
+        match o.skipped {
+            Some("no_fonts") => {
+                no_fonts += 1;
+                continue;
+            }
+            Some(_) => continue, // mkdir/write failure: skip silently (a half-written tree is not a package)
+            None => {}
         }
-        // De-duplicate by basename: `--backend both` writes the SAME basename under out/.../fontc/
-        // and out/.../fontmake/, so a naive walk would list every font twice.
-        let mut font_names: Vec<String> = fonts
-            .iter()
-            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-            .collect();
-        let mut seen = BTreeSet::new();
-        font_names.retain(|n| seen.insert(n.clone()));
-        let has_ttf = font_names.iter().any(|n| n.to_ascii_lowercase().ends_with(".ttf"));
-        let has_otf = font_names.iter().any(|n| n.to_ascii_lowercase().ends_with(".otf"));
-
-        let (spdx, dep5, fallback) = license_for(slug);
-        if fallback {
+        if o.license_fallback {
             lic_fallback += 1;
         }
-        let pkg = pkg_name(slug);
-        let short = short_commit(&fam.commit);
-        // Deterministic: a missing build timestamp (ended==0) yields 1970-01-01 rather than churning
-        // the version on every run via wall-clock now().
-        let epoch = res.ended.max(0.0);
-        let version = format!("0~gf{}.g{}-1", ymd(epoch), short);
-
-        let debian = pkg_root.join(util::slug_to_logname(slug)).join("debian");
-        if std::fs::create_dir_all(debian.join("source")).is_err() {
-            eprintln!("skip {}: cannot create {}", slug, debian.display());
-            continue;
-        }
-        let rules_path = debian.join("rules");
-        let holder = copyright_holder(gf.as_deref(), slug);
-
-        // Write every file, checking each result; on ANY failure skip the family entirely (do not
-        // count it as exported or index it — a half-written tree is not a real package).
-        let writes: Vec<(PathBuf, String)> = vec![
-            (debian.join("control"), control(&pkg, fam, spdx)),
-            (rules_path.clone(), rules(&pkg, has_ttf, has_otf)),
-            (debian.join("copyright"), copyright(fam, dep5, &holder)),
-            (debian.join("changelog"), changelog(&pkg, &version, slug, &fam.commit, epoch)),
-            (debian.join("watch"), watch(&fam.url)),
-            (debian.join("source/format"), "3.0 (quilt)\n".to_string()),
-            (
-                debian.join("gflib-provenance"),
-                provenance(slug, &pkg, spdx, fallback, fam, res, st.cohort_reqs.get(&res.cohort), &font_names),
-            ),
-        ];
-        let mut ok = true;
-        for (p, content) in &writes {
-            if std::fs::write(p, content).is_err() {
-                eprintln!("skip {}: cannot write {}", slug, p.display());
-                ok = false;
-                break;
+        if let Some(d) = o.deb_result {
+            if o.deb_built {
+                debs_built += 1
+            } else {
+                debs_failed += 1
             }
+            build_results.insert(slug.clone(), d);
         }
-        if !ok {
-            continue;
+        if let Some(e) = o.index_entry {
+            index.push(e);
+            exported += 1;
         }
-        set_exec(&rules_path);
-
-        // optionally build + validate the binary .deb (before index.push, so pkg/version stay owned)
-        let mut deb_built = false;
-        if build_debs {
-            let pkg_dir = pkg_root.join(util::slug_to_logname(slug));
-            let r = build_one_deb(&pkg_dir, &pool, &pkg, &version, fam, &fonts, lint_present);
-            deb_built = r.built;
-            if r.built { debs_built += 1 } else { debs_failed += 1 }
-            build_results.insert(slug.clone(), serde_json::json!({
-                "built": r.built, "validated": r.validated, "deb_bytes": r.deb_bytes,
-                "lint": r.lint, "error": r.error, "package": pkg, "version": version,
-            }));
-        }
-
-        index.push(serde_json::json!({
-            "slug": slug, "package": pkg, "version": version, "license": spdx,
-            "license_assumed": fallback, "fonts": font_names.len(), "backend": res.backend,
-            "compiler_version": res.compiler_version, "deb_built": deb_built,
-        }));
-        exported += 1;
     }
 
     let _ = std::fs::create_dir_all(&pkg_root);
@@ -182,6 +131,113 @@ pub fn run_export_deb(cfg: &config::Config) {
             if lint_present { "" } else { "  (lintian absent — validated via dpkg-deb only)" }
         );
     }
+}
+
+/// What packaging one family produced — shared by the `--export-deb` one-shot and the live packaging
+/// worker so both draft identical trees and build identical `.deb`s.
+pub struct PackageOutcome {
+    pub index_entry: Option<serde_json::Value>,
+    pub deb_result: Option<serde_json::Value>, // build-results.json entry (only when build_debs)
+    pub deb_built: bool,
+    pub license_fallback: bool,
+    pub skipped: Option<&'static str>, // "no_fonts" | "mkdir_fail" | "write_fail"
+}
+
+/// Draft the `debian/` tree for one built family under `<build_dir>/packaging/<logname>/` and, when
+/// `build_debs`, assemble+validate its binary `.deb` into `packaging/pool/`. Pure generated output;
+/// does NOT wipe anything (the incremental worker calls this per family). Returns what was produced.
+pub fn package_one_family(
+    build_dir: &Path,
+    slug: &str,
+    res: &model::Res,
+    fam: &model::Family,
+    gf: Option<&Path>,
+    cohort_req: Option<&String>,
+    build_debs: bool,
+    lint_present: bool,
+) -> PackageOutcome {
+    let pkg_root = build_dir.join("packaging");
+    let pool = pkg_root.join("pool");
+    let mut out = PackageOutcome {
+        index_entry: None,
+        deb_result: None,
+        deb_built: false,
+        license_fallback: false,
+        skipped: None,
+    };
+
+    // gate on on-disk font presence (out dir may have been pruned post-build)
+    let out_dir = build_dir.join("out").join(util::slug_to_logname(slug));
+    let fonts = collect_fonts(&out_dir);
+    if fonts.is_empty() {
+        out.skipped = Some("no_fonts");
+        return out;
+    }
+    // De-duplicate by basename: `--backend both` writes the SAME basename under out/.../fontc/
+    // and out/.../fontmake/, so a naive walk would list every font twice.
+    let mut font_names: Vec<String> = fonts
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect();
+    let mut seen = BTreeSet::new();
+    font_names.retain(|n| seen.insert(n.clone()));
+    let has_ttf = font_names.iter().any(|n| n.to_ascii_lowercase().ends_with(".ttf"));
+    let has_otf = font_names.iter().any(|n| n.to_ascii_lowercase().ends_with(".otf"));
+
+    let (spdx, dep5, fallback) = license_for(slug);
+    out.license_fallback = fallback;
+    let pkg = pkg_name(slug);
+    let short = short_commit(&fam.commit);
+    // Deterministic: a missing build timestamp (ended==0) yields 1970-01-01 rather than churning
+    // the version on every run via wall-clock now().
+    let epoch = res.ended.max(0.0);
+    let version = format!("0~gf{}.g{}-1", ymd(epoch), short);
+
+    let debian = pkg_root.join(util::slug_to_logname(slug)).join("debian");
+    if std::fs::create_dir_all(debian.join("source")).is_err() {
+        out.skipped = Some("mkdir_fail");
+        return out;
+    }
+    let rules_path = debian.join("rules");
+    let holder = copyright_holder(gf, slug);
+
+    // Write every file, checking each result; on ANY failure skip the family entirely (do not index
+    // it — a half-written tree is not a real package).
+    let writes: Vec<(PathBuf, String)> = vec![
+        (debian.join("control"), control(&pkg, fam, spdx)),
+        (rules_path.clone(), rules(&pkg, has_ttf, has_otf)),
+        (debian.join("copyright"), copyright(fam, dep5, &holder)),
+        (debian.join("changelog"), changelog(&pkg, &version, slug, &fam.commit, epoch)),
+        (debian.join("watch"), watch(&fam.url)),
+        (debian.join("source/format"), "3.0 (quilt)\n".to_string()),
+        (
+            debian.join("gflib-provenance"),
+            provenance(slug, &pkg, spdx, fallback, fam, res, cohort_req, &font_names),
+        ),
+    ];
+    for (p, content) in &writes {
+        if std::fs::write(p, content).is_err() {
+            out.skipped = Some("write_fail");
+            return out;
+        }
+    }
+    set_exec(&rules_path);
+
+    if build_debs {
+        let pkg_dir = pkg_root.join(util::slug_to_logname(slug));
+        let r = build_one_deb(&pkg_dir, &pool, &pkg, &version, fam, &fonts, lint_present);
+        out.deb_built = r.built;
+        out.deb_result = Some(serde_json::json!({
+            "built": r.built, "validated": r.validated, "deb_bytes": r.deb_bytes,
+            "lint": r.lint, "error": r.error, "package": pkg, "version": version,
+        }));
+    }
+    out.index_entry = Some(serde_json::json!({
+        "slug": slug, "package": pkg, "version": version, "license": spdx,
+        "license_assumed": fallback, "fonts": font_names.len(), "backend": res.backend,
+        "compiler_version": res.compiler_version, "deb_built": out.deb_built,
+    }));
+    out
 }
 
 // ---- helpers ----
