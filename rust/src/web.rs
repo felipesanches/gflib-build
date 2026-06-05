@@ -346,10 +346,18 @@ function sections(t){
  if(t=='built')return [{title:'Built — successes  (slug · compiler+version · size · vs-shipped)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(builtRow)}];
  if(t=='failures'){const s=[];const cats=snap.fail_categories||[];
   if(cats.length)s.push({title:'Failures by cause (click to filter)',rows:filterList(cats,['cat','hint']).map(failcatRow)});
-  // the families list is auto-filtered by the selected cause
-  let fr=snap.failures_recent||[];
-  if(fsCause){const cat=cats.find(c=>c.cat==fsCause);const fam=new Set(cat?(cat.families||[]):[]);fr=fr.filter(f=>fam.has(f.slug));}
-  s.push({title:'Failures — newest first'+(fsCause?' · cause: '+fsCause+' (click the cause again to clear)':' (current)'),rows:filterList(fr,['slug','error']).map(failRow)});
+  // families list, scoped to the selected cause. When a cause is selected we list its
+  // OWN families (the authoritative full set behind the count) rather than intersecting
+  // with the capped 'recent' window — otherwise a cause whose families fell out of that
+  // window shows "(none)" despite a non-zero count. Errors: recent first, then history.
+  let fr=snap.failures_recent||[], ftitle='Failures — newest first (current)';
+  if(fsCause){const cat=cats.find(c=>c.cat==fsCause);const fams=cat?(cat.families||[]):[];
+   const recent=snap.failures_recent||[], hist=snap.failure_history||[];
+   const errFor=(slug)=>{const r=recent.find(f=>f.slug==slug);if(r&&r.error)return r.error;
+    for(let i=hist.length-1;i>=0;i--)if(hist[i].slug==slug&&hist[i].error)return hist[i].error;return '';};
+   fr=fams.map(slug=>({slug,error:errFor(slug)}));
+   ftitle='Families failed — cause: '+fsCause+' ('+(cat?cat.count:fr.length)+', click the cause again to clear)';}
+  s.push({title:ftitle,rows:filterList(fr,['slug','error']).map(failRow)});
   if((snap.failure_history||[]).length)s.push({title:'Failure history (persistent — survives restarts & re-attempts)',rows:filterList(snap.failure_history,['slug','cause','error']).map(histRow)});return s}
  if(t=='stats'){const ph=Object.entries(snap.phase_durations||{}).sort((a,b)=>b[1]-a[1]);
   const ops=Object.entries(snap.op_stats||{}).sort((a,b)=>(b[1].total||0)-(a[1].total||0));
@@ -584,8 +592,12 @@ function openDetail(kind,id){
   lines.push('','requirements:');(c.requirements?c.requirements.split('\n'):['(none — the base cohort has no requirements file)']).forEach(r=>lines.push('  '+r));
  } else if(kind=='built'){const b=findBy(snap.built_recent,'slug',id);if(!b)return;slug=id;title='Built: '+b.slug;
   lines=['backend: '+(b.backend||'?'),'output size: '+human(b.bytes),'vs shipped: '+(b.compare||'(not compared)'),'provenance: '+prov(b),'rebuild: gflib-build --only '+b.slug+' --rebuild --yes'];
- } else if(kind=='failed'){const f=findBy(snap.failures_recent,'slug',id);if(!f)return;slug=id;title='Failed: '+f.slug;
-  lines=['provenance: '+prov(f),'rebuild: gflib-build --only '+f.slug+' --rebuild --yes','','error:','  '+(f.error||'')];
+ } else if(kind=='failed'){const f=findBy(snap.failures_recent,'slug',id);slug=id;
+  if(f){title='Failed: '+f.slug;lines=['provenance: '+prov(f),'rebuild: gflib-build --only '+f.slug+' --rebuild --yes','','error:','  '+(f.error||'')];}
+  else{// not in the recent window — fall back to the persistent failure history
+   const hist=snap.failure_history||[];let h=null;for(let i=hist.length-1;i>=0;i--)if(hist[i].slug==id){h=hist[i];break;}
+   if(h){title='Failed: '+h.slug+' (from failure history)';lines=['cause: '+h.cause,'provenance: '+prov(h),'rebuild: gflib-build --only '+h.slug+' --rebuild --yes','','error:','  '+(h.error||'')];}
+   else{title='Failed: '+id;lines=['(no recorded error details for this family in the current snapshot)'];}}
  } else if(kind=='building'){const b=findBy(snap.building,'slug',id);if(!b)return;slug=id;title='Building: '+b.slug;
   lines=['worker: '+b.worker,'elapsed: '+hms(b.dur),'step: '+(b.note||b.backend||'(starting)')];
  } else if(kind=='queue'){const q=findBy(snap.queued_list,'slug',id);if(!q)return;title='Queued family: '+q.slug;

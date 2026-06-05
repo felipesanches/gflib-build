@@ -770,22 +770,37 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                     keys: snap.fail_categories.iter().map(|c| c.cat.clone()).collect(),
                 });
             }
-            // 'newest first', auto-filtered to the selected cause's families
-            let famset: Option<std::collections::HashSet<&str>> = sel_cat.map(|c| c.families.iter().map(|s| s.as_str()).collect());
-            let filtered: Vec<&crate::model::FailItem> = snap.failures_recent.iter()
-                .filter(|f| famset.as_ref().map_or(true, |set| set.contains(f.slug.as_str())))
-                .collect();
-            let frows = filtered.iter().map(|f| vec![
-                (format!("{:<34} ", f.slug), Color::Red),
-                (f.error.clone(), Color::DarkRed),
-            ]).collect();
-            let ftitle = match sel_cat {
-                Some(c) => format!("Failures — newest first · cause: {}", c.cat),
-                None => "Failures — newest first (current)".into(),
+            // families list, scoped to the selected cause. We list the cause's OWN
+            // families (the authoritative full set behind the count) rather than
+            // intersecting with the capped 'recent' window — otherwise a cause whose
+            // families fell out of the recent window shows "(none)" despite a non-zero
+            // count. Errors are looked up from recent first, then failure-history.
+            let (frows, fkeys, ftitle): (Vec<Vec<(String, Color)>>, Vec<String>, String) = match sel_cat {
+                Some(c) => {
+                    let err_for = |slug: &str| -> Option<String> {
+                        snap.failures_recent.iter().find(|f| f.slug == slug).map(|f| f.error.clone())
+                            .or_else(|| snap.failure_history.iter().rev().find(|h| h.slug == slug).map(|h| h.error.clone()))
+                    };
+                    let rows = c.families.iter().map(|slug| {
+                        let (etxt, ecol) = match err_for(slug) {
+                            Some(e) if !e.is_empty() => (e, Color::DarkRed),
+                            _ => ("(no recorded error text)".to_string(), Color::DarkGrey),
+                        };
+                        vec![(format!("{:<34} ", slug), Color::Red), (etxt, ecol)]
+                    }).collect();
+                    (rows, c.families.clone(), format!("Families failed — cause: {}  ({})", c.cat, c.count))
+                }
+                None => {
+                    let rows = snap.failures_recent.iter().map(|f| vec![
+                        (format!("{:<34} ", f.slug), Color::Red),
+                        (f.error.clone(), Color::DarkRed),
+                    ]).collect();
+                    (rows, snap.failures_recent.iter().map(|f| f.slug.clone()).collect(),
+                     "Failures — newest first (current)".into())
+                }
             };
             secs.push(SectionR {
-                title: ftitle, dview: "failures", rows: frows,
-                keys: filtered.iter().map(|f| f.slug.clone()).collect(),
+                title: ftitle, dview: "failures", rows: frows, keys: fkeys,
             });
             if !snap.failure_history.is_empty() {
                 let rows = snap.failure_history.iter().map(|h| vec![
@@ -1508,18 +1523,35 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
     };
     match dview {
         "failures" => {
-            if let Some(f) = snap.failures_recent.get(sel) {
-                o.push(format!("Failed: {}", f.slug));
-                o.push(format!("provenance: {}", prov_str(&f.compiler_version, &f.backend, &f.builder_version)));
-                o.push(format!("rebuild: gflib-build --only {} --rebuild --yes", f.slug));
-                o.push(String::new());
-                o.push("error:".into());
-                o.push(format!("  {}", f.error));
-                o.push(String::new());
-                o.push(format!("log: {}", if f.log.is_empty() { "(none)".into() } else { f.log.clone() }));
-                o.push("log tail:".into());
-                for ln in read_log_tail(&f.log, 120) {
-                    o.push(format!("  {}", ln));
+            // rows may come from a selected cause's family list (not failures_recent), so
+            // resolve the slug via the section's keys, then look it up in recent → history.
+            let slug = sections_for(snap, tab, fc_sel).get(section).and_then(|s| s.keys.get(sel).cloned());
+            if let Some(slug) = slug {
+                if let Some(f) = snap.failures_recent.iter().find(|f| f.slug == slug) {
+                    o.push(format!("Failed: {}", f.slug));
+                    o.push(format!("provenance: {}", prov_str(&f.compiler_version, &f.backend, &f.builder_version)));
+                    o.push(format!("rebuild: gflib-build --only {} --rebuild --yes", f.slug));
+                    o.push(String::new());
+                    o.push("error:".into());
+                    o.push(format!("  {}", f.error));
+                    o.push(String::new());
+                    o.push(format!("log: {}", if f.log.is_empty() { "(none)".into() } else { f.log.clone() }));
+                    o.push("log tail:".into());
+                    for ln in read_log_tail(&f.log, 120) {
+                        o.push(format!("  {}", ln));
+                    }
+                } else if let Some(h) = snap.failure_history.iter().rev().find(|h| h.slug == slug) {
+                    // not in the recent window — render from the persistent failure history
+                    o.push(format!("Failed: {}  (from failure history)", h.slug));
+                    o.push(format!("cause: {}", h.cause));
+                    o.push(format!("provenance: {}", prov_str(&h.compiler_version, &h.backend, &h.builder_version)));
+                    o.push(format!("rebuild: gflib-build --only {} --rebuild --yes", h.slug));
+                    o.push(String::new());
+                    o.push("error:".into());
+                    o.push(format!("  {}", h.error));
+                } else {
+                    o.push(format!("Failed: {}", slug));
+                    o.push("(no recorded error details for this family in the current snapshot)".into());
                 }
             }
         }
