@@ -23,3 +23,6 @@ events.jsonl
 daemon.pid
 daemon.log
 gflib-build.config
+
+# intermediate render artifacts for docs (the .md source + .pdf are committed)
+docs/*.html
