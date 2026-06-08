@@ -2487,31 +2487,36 @@ fn collect_outputs(
     // from sources/ and writes to `../fonts`, so staged at the work root the builder emits to
     // work.parent/fonts — outside the per-family tree. The fresh-mtime + shipped-name filters below
     // keep collecting from the shared dir safe under parallelism. (Parity with the Python fix.)
-    let mut stack = vec![work.to_path_buf()];
+    // Tag each root: the per-family `work` tree is PRIVATE; `work.parent()/fonts` is SHARED across all
+    // families building concurrently (an override config that runs from sources/ writes to ../fonts).
+    // Matching shipped-named, fresh-mtime fonts are safe to collect from the shared dir, but a
+    // NON-matching font there belongs to another family — never report it as THIS family's "extras"
+    // (that produced misleading "output name mismatch — got [<other family>]" errors).
+    let mut stack: Vec<(PathBuf, bool)> = vec![(work.to_path_buf(), false)];
     if let Some(parent) = work.parent() {
         let stray = parent.join("fonts");
         if stray.is_dir() {
-            stack.push(stray);
+            stack.push((stray, true));
         }
     }
-    let mut fonts = Vec::new();
-    while let Some(p) = stack.pop() {
+    let mut fonts: Vec<(PathBuf, bool)> = Vec::new();
+    while let Some((p, shared)) = stack.pop() {
         if let Ok(rd) = std::fs::read_dir(&p) {
             for e in rd.flatten() {
                 let path = e.path();
                 if path.is_dir() {
-                    stack.push(path);
+                    stack.push((path, shared));
                 } else if let Some(ext) = path.extension() {
                     let ext = ext.to_string_lossy().to_lowercase();
                     if ext == "ttf" || ext == "otf" {
-                        fonts.push(path);
+                        fonts.push((path, shared));
                     }
                 }
             }
         }
     }
     fonts.sort();
-    for f in fonts {
+    for (f, shared) in fonts {
         let md = match std::fs::metadata(&f) {
             Ok(m) => m,
             Err(_) => continue,
@@ -2529,7 +2534,9 @@ fn collect_outputs(
         }
         let name = f.file_name().unwrap().to_string_lossy().to_string();
         if !want.is_empty() && !want.contains(name.as_str()) {
-            if seen.insert(name.clone()) {
+            // only a font from the family's OWN work tree is a true "extra" (a real name mismatch);
+            // a non-matching font in the shared ../fonts dir is another family's output — ignore it.
+            if !shared && seen.insert(name.clone()) {
                 extras.push(name);
             }
             continue;
@@ -2833,6 +2840,29 @@ mod compare_tests {
             collect_outputs(&work, &out, &["Demo[wght].ttf".to_string()], since);
         assert!(found.contains_key("Demo[wght].ttf"), "stray ../fonts output must be collected");
         assert!(total > 0 && out.join("Demo[wght].ttf").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_outputs_ignores_other_families_fonts_in_shared_stray_dir() {
+        // the akshar→"got [AbhayaLibre…]" bug: a non-matching font in the SHARED ../fonts dir belongs
+        // to another family building concurrently and must NOT be reported as our "extras".
+        let root = std::env::temp_dir().join(format!("_stray2_{}", std::process::id()));
+        let work = root.join("work").join("ofl__akshar");
+        let stray = root.join("work").join("fonts"); // work.parent()/fonts — shared
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("AbhayaLibreLatin-Bold.otf"), b"OTHERFAM").unwrap();
+        std::fs::write(work.join("Akshar-Wrong.ttf"), b"OURS").unwrap(); // our own real mismatch
+        let out = root.join("out");
+        let since = crate::util::now() - 1.0;
+        let (_t, found, extras) = collect_outputs(&work, &out, &["Akshar[wght].ttf".to_string()], since);
+        assert!(found.is_empty(), "neither font matches the shipped name");
+        assert!(extras.contains(&"Akshar-Wrong.ttf".to_string()), "our own mismatch IS a real extra");
+        assert!(
+            !extras.iter().any(|e| e.contains("AbhayaLibre")),
+            "another family's shared-dir font must NOT be reported as our extra"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
