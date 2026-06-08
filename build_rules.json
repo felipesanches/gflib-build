@@ -38,10 +38,11 @@
       ]
     },
     "ofl/lilex": {
-      "note": "mishamyrt/Lilex: the Makefile 'generate' target injects OpenType features/classes from sources/opentype_features/ into the .glyphs sources; the plain 'build' target skips it, so gftools-builder must run it first.",
       "pre_build": [
+        "python3 -m pip install -q 'arrrgs>=3.1.0'",
         "python3 scripts/generate.py --config sources/lilexgen_config.yaml generate"
-      ]
+      ],
+      "note": "ofl/lilex: Pre-build script scripts/generate.py fails: ModuleNotFoundError: No module named 'arrrgs' (an upstream build dependency "
     },
     "ofl/lxgwwenkaimonotc": {
       "note": "aaronbell/LxgwWenkaiTC (CJK): Makefile 'build: extract merge export' \u2014 extract.py decompresses the .ufoz archives and merge.py generates the UFO+designspace under sources/build/ that sources/project.yaml references. Heavy build.",
@@ -98,6 +99,382 @@
         "mkdir -p sources && cp -a \"sources/BebasNeueV2.0(2018).glyphs\" \"sources/BebasNeueV2.02018.glyphs\""
       ],
       "note": "ofl/bebasneue: source filename has parentheses (shell-special in the unquoted ninja $in); stage to a clean path the override config references."
+    },
+    "ofl/bhutukaexpandedone": {
+      "pre_build": [
+        "python3 -c \"p='sources/BhuTukaExpandedOne-Regular.glyphs'; s=open(p,encoding='utf-8').read(); n=s.count('unicode = \\\"021A,0162\\\";'); assert n==1, n; s=s.replace('unicode = \\\"021A,0162\\\";','unicode = \\\"021A\\\";',1); open(p,'w',encoding='utf-8').write(s)\""
+      ],
+      "note": "ofl/bhutukaexpandedone: Tcommaaccent declares unicode=\"021A,0162\"; the 0162 (U+0162) duplicates Tcedilla, which is the correct owner of U+0162"
+    },
+    "ofl/chivo": {
+      "pre_build": [
+        "python3 -c \"import re; p='sources/Chivo.glyphs'; s=open(p,encoding='utf-8').read(); m=re.search(r'glyphname = idotlessstroke;',s); a=m.end(); nx=re.search(r'glyphname = ',s[a:]); b=a+nx.start(); blk,n=re.subn(r'\\\\n\\\\s*unicode = 7547;','',s[a:b],1); assert n==1,n; open(p,'w',encoding='utf-8').write(s[:a]+blk+s[b:])\""
+      ],
+      "note": "ofl/chivo: idotlessstroke declares unicode=7547 (U+1D7B) duplicating Ismallstroke (the correct LATIN SMALL CAPITAL LETTER I WITH ST"
+    },
+    "ofl/dosis": {
+      "pre_build": [
+        "python3 -c \"import re; p='sources/Dosis.glyphs'; s=open(p,encoding='utf-8').read(); t={'macroncomb':'00AF','ringcomb':'02DA','hungarumlautcomb':'02DD'}; [None for g,u in t.items()]; \nfor g,u in {'macroncomb':'00AF','ringcomb':'02DA','hungarumlautcomb':'02DD'}.items():\n m=re.search('glyphname = %s;'%g,s); a=m.end(); nx=re.search('glyphname = ',s[a:]); b=a+(nx.start() if nx else len(s)-a); blk,n=re.subn('\\\\n\\\\s*unicode = %s;'%u,'',s[a:b],1); assert n==1,(g,n); s=s[:a]+blk+s[b:]\nopen(p,'w',encoding='utf-8').write(s)\""
+      ],
+      "note": "ofl/dosis: Three combining glyphs wrongly carry the SPACING codepoint of their base: macroncomb=U+00AF (dup of macron), ringcomb=U+"
+    },
+    "ofl/gantari": {
+      "pre_build": [
+        "python3 -c \"import re,glob; \nfor p in ['sources/Gantari.glyphs','sources/Gantari-Italic.glyphs']:\n s=open(p,encoding='utf-8').read(); m=re.search('glyphname = idotless;',s); a=m.end(); nx=re.search('glyphname = ',s[a:]); b=a+nx.start(); blk,n=re.subn('\\\\n\\\\s*unicode = 305;','',s[a:b],1); assert n==1,(p,n); open(p,'w',encoding='utf-8').write(s[:a]+blk+s[b:])\""
+      ],
+      "note": "ofl/gantari: idotless declares unicode=305 (decimal U+0131) duplicating dotlessi, the canonical AGL owner of U+0131; present in both "
+    },
+    "ofl/hindvadodara": {
+      "pre_build": [
+        "python3 -c \"import re; p='masters/HindVadodara.glyphs'; s=open(p,encoding='utf-8').read(); m=re.search('glyphname = gjmEcandra_Anusvara;',s); a=m.end(); nx=re.search('glyphname = ',s[a:]); b=a+nx.start(); blk,n=re.subn('\\\\n\\\\s*unicode = 0A81;','',s[a:b],1); assert n==1,n; open(p,'w',encoding='utf-8').write(s[:a]+blk+s[b:])\""
+      ],
+      "note": "ofl/hindvadodara: Ligature glyph gjmEcandra_Anusvara declares unicode=0A81 duplicating gjCandrabindu, the canonical owner of GUJARATI SIGN"
+    },
+    "ofl/pacifico": {
+      "pre_build": [
+        "python3 -c \"p='sources/Pacifico.glyphs'; s=open(p,encoding='utf-8').read(); n=s.count('unicode = (7806,7807);'); assert n==1, n; s=s.replace('unicode = (7806,7807);','unicode = 7806;',1); open(p,'w',encoding='utf-8').write(s)\""
+      ],
+      "note": "ofl/pacifico: Vdotbelow declares unicode=(7806,7807); the 7807 (U+1E7F = LATIN SMALL LETTER V WITH DOT BELOW) wrongly duplicates the l"
+    },
+    "ofl/intertight": {
+      "pre_build": [
+        "ln -sfn sources/features features"
+      ],
+      "note": "ofl/intertight: Glyphs source uses include(../features/ccmp.fea); built in place from sources/, fontc/fontmake resolve it relative to th"
+    },
+    "ofl/notoserifnyiakengpuachuehmong": {
+      "pre_build": [
+        "touch sources/family.fea"
+      ],
+      "note": "ofl/notoserifnyiakengpuachuehmong: Master UFOs' features.fea is exactly 'include(family.fea);' but sources/family.fea is absent from the repo and is NOT ge"
+    },
+    "ofl/changa": {
+      "pre_build": [
+        "python -c \"import glyphsLib; p='sources/Changa.glyphs'; f=glyphsLib.GSFont(p); f.customParameters['Axes']=[{'Name':'Weight','Tag':'wght'}]; f.save(p)\""
+      ],
+      "note": "ofl/changa: Glyphs 2 source sources/Changa.glyphs exposes a phantom degenerate Width(wdth) axis in GSFont.axes (designspace collapse"
+    },
+    "ofl/crimsonpro": {
+      "pre_build": [
+        "python -c \"import glyphsLib; p='sources/CrimsonPro.glyphs'; f=glyphsLib.GSFont(p); f.customParameters['Axes']=[{'Name':'Weight','Tag':'wght'}]; f.save(p)\"",
+        "python -c \"import glyphsLib; p='sources/CrimsonPro-Italic.glyphs'; f=glyphsLib.GSFont(p); f.customParameters['Axes']=[{'Name':'Weight','Tag':'wght'}]; f.save(p)\""
+      ],
+      "note": "ofl/crimsonpro: Both Glyphs 2 sources (CrimsonPro.glyphs and CrimsonPro-Italic.glyphs) expose a phantom degenerate Width(wdth) axis in G"
+    },
+    "ofl/elmessiri": {
+      "pre_build": [
+        "python -c \"import glyphsLib; p='sources/ElMessiri.glyphs'; f=glyphsLib.GSFont(p); f.customParameters['Axes']=[{'Name':'Weight','Tag':'wght'}]; f.save(p)\""
+      ],
+      "note": "ofl/elmessiri: Glyphs 2 source sources/ElMessiri.glyphs exposes a phantom degenerate Width(wdth) axis in GSFont.axes; gftools-builder n"
+    },
+    "ofl/lemonada": {
+      "pre_build": [
+        "python -c \"import glyphsLib; p='sources/Lemonada.glyphs'; f=glyphsLib.GSFont(p); f.customParameters['Axes']=[{'Name':'Weight','Tag':'wght'}]; f.save(p)\""
+      ],
+      "note": "ofl/lemonada: Glyphs 2 source sources/Lemonada.glyphs exposes a phantom degenerate Width(wdth) axis in GSFont.axes; gftools-builder na"
+    },
+    "ofl/cactusclassicalserif": {
+      "pre_build": [
+        "python source/scripts/extract.py",
+        "python source/fcp_ufo_process.py"
+      ],
+      "note": "ofl/cactusclassicalserif: Override config points at source/CactusClassicalSerif-Regular.ufoz; the googlefonts recipe treats the .ufoz as an unname"
+    },
+    "ofl/chocolateclassicalsans": {
+      "pre_build": [
+        "python source/scripts/extract.py",
+        "python source/fcp_ufo_process.py"
+      ],
+      "note": "ofl/chocolateclassicalsans: Override config points at source/ChocolateClassicalSans-Regular.ufoz; the recipe treats the .ufoz as an unnamed instance"
+    },
+    "ofl/notonaskharabicui": {
+      "pre_build": [
+        "fontmake -g sources/NotoNaskhArabicUI.glyphs -o ufo --output-dir . --master-dir . --designspace-path NotoNaskhArabicUI.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notonaskharabicui: gftools NotoBuilder.glyphs_to_ufo() returns the designspace BASENAME ('NotoNaskhArabicUI.designspace'), dropping the 'so"
+    },
+    "ofl/notosansarabicui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansArabicUI.glyphs -o ufo --output-dir . --master-dir . --designspace-path NotoSansArabicUI.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosansarabicui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansArabicUI.designspace' without the sources/ prefix; DS written to "
+    },
+    "ofl/notosansbengaliui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansBengali.glyphspackage -o ufo --output-dir . --master-dir . --designspace-path NotoSansBengali.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosansbengaliui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansBengali.designspace' without sources/ prefix; DS written to sourc"
+    },
+    "ofl/notosansdevanagariui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansDevanagariUI.glyphspackage -o ufo --output-dir . --master-dir . --designspace-path NotoSansDevanagariUI.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosansdevanagariui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansDevanagariUI.designspace' without sources/ prefix; DS written to "
+    },
+    "ofl/notosansdisplay": {
+      "pre_build": [
+        "fontmake -g sources/NotoSans.glyphspackage -o ufo --output-dir . --master-dir . --designspace-path NotoSans.designspace --ufo-structure json",
+        "fontmake -g sources/NotoSans-Italic.glyphspackage -o ufo --output-dir . --master-dir . --designspace-path NotoSans-Italic.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosansdisplay: gftools glyphs_to_ufo() basename bug: returns 'NotoSans.designspace' without sources/ prefix; DS written to sources/ but"
+    },
+    "ofl/notosansgujaratiui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansGujarati.glyphs -o ufo --output-dir . --master-dir . --designspace-path NotoSansGujarati.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosansgujaratiui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansGujarati.designspace' without sources/ prefix; DS written to sour"
+    },
+    "ofl/notosansgurmukhiui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansGurmukhi.glyphs -o ufo --output-dir . --master-dir . --designspace-path NotoSansGurmukhi.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosansgurmukhiui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansGurmukhi.designspace' without sources/ prefix; DS written to sour"
+    },
+    "ofl/notosanskannadaui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansKannada.glyphs -o ufo --output-dir . --master-dir . --designspace-path NotoSansKannada.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosanskannadaui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansKannada.designspace' without sources/ prefix; DS written to sourc"
+    },
+    "ofl/notosanskhmerui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansKhmerUI.glyphs -o ufo --output-dir . --master-dir . --designspace-path NotoSansKhmerUI.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosanskhmerui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansKhmerUI.designspace' without sources/ prefix; DS written to sourc"
+    },
+    "ofl/notosanslaoui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansLaoUI-MM.glyphs -o ufo --output-dir . --master-dir . --designspace-path NotoSansLaoUI-MM.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosanslaoui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansLaoUI-MM.designspace' without sources/ prefix; DS written to sour"
+    },
+    "ofl/notosansmalayalamui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansMalayalam.glyphs -o ufo --output-dir . --master-dir . --designspace-path NotoSansMalayalam.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosansmalayalamui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansMalayalam.designspace' without sources/ prefix; DS written to sou"
+    },
+    "ofl/notosansmyanmarui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansMyanmarUI.glyphs -o ufo --output-dir . --master-dir . --designspace-path NotoSansMyanmarUI.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosansmyanmarui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansMyanmarUI.designspace' without sources/ prefix; DS written to sou"
+    },
+    "ofl/notosansoriyaui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansOriya.glyphs -o ufo --output-dir . --master-dir . --designspace-path NotoSansOriya.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosansoriyaui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansOriya.designspace' without sources/ prefix; DS written to sources"
+    },
+    "ofl/notosanssinhalaui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansSinhala.glyphspackage -o ufo --output-dir . --master-dir . --designspace-path NotoSansSinhala.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosanssinhalaui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansSinhala.designspace' without sources/ prefix; DS written to sourc"
+    },
+    "ofl/notosanstamilui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansTamil.glyphs -o ufo --output-dir . --master-dir . --designspace-path NotoSansTamil.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosanstamilui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansTamil.designspace' without sources/ prefix; DS written to sources"
+    },
+    "ofl/notosansteluguui": {
+      "pre_build": [
+        "fontmake -g sources/NotoSansTelugu.glyphs -o ufo --output-dir . --master-dir . --designspace-path NotoSansTelugu.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notosansteluguui: gftools glyphs_to_ufo() basename bug: returns 'NotoSansTelugu.designspace' without sources/ prefix; DS written to source"
+    },
+    "ofl/notoserifdisplay": {
+      "pre_build": [
+        "fontmake -g sources/NotoSerif.glyphspackage -o ufo --output-dir . --master-dir . --designspace-path NotoSerif.designspace --ufo-structure json",
+        "fontmake -g sources/NotoSerif-Italic.glyphspackage -o ufo --output-dir . --master-dir . --designspace-path NotoSerif-Italic.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notoserifdisplay: gftools glyphs_to_ufo() basename bug: returns 'NotoSerif.designspace' without sources/ prefix; DS written to sources/ bu"
+    },
+    "ofl/notoserifmyanmar": {
+      "pre_build": [
+        "fontmake -g sources/NotoSerifMyanmar.glyphs -o ufo --output-dir . --master-dir . --designspace-path NotoSerifMyanmar.designspace --ufo-structure json"
+      ],
+      "note": "ofl/notoserifmyanmar: gftools glyphs_to_ufo() basename bug: returns 'NotoSerifMyanmar.designspace' without sources/ prefix; DS written to sour"
+    },
+    "ofl/enriqueta": {
+      "pre_build": [
+        "python3 -c \"p='source/enriqueta_masters_GOOGLE.glyphs'; s=open(p,encoding='utf-8').read(); assert s.count('weightValue = 79;')==1, 'expected exactly one weightValue = 79;'; s=s.replace('weightValue = 79;','weightValue = 80;',1); open(p,'w',encoding='utf-8').write(s)\""
+      ],
+      "note": "ofl/enriqueta: Default (Regular) master sits at weightValue=79 but the Regular instance / wght axis mapping is anchored at designSpace "
+    },
+    "ofl/fuzzybubbles": {
+      "pre_build": [
+        "python3 -c \"p='sources/FuzzyBubbles.glyphs'; s=open(p,encoding='utf-8').read(); assert s.count('widthValue = 5;')==2 and s.count('interpolationWidth = 5;')==1, ('counts',s.count('widthValue = 5;'),s.count('interpolationWidth = 5;')); s=s.replace('widthValue = 5;\\n','').replace('interpolationWidth = 5;\\n',''); open(p,'w',encoding='utf-8').write(s)\""
+      ],
+      "note": "ofl/fuzzybubbles: Spurious degenerate wdth axis: both masters carry widthValue=5 (no width variation) and the Bold instance carries interp"
+    },
+    "ofl/kumarone": {
+      "pre_build": [
+        "fontmake -g 'masters/Kumar One.glyphs' -o ufo --master-dir master_ufos",
+        "python3 -c \"import glyphsLib; f=glyphsLib.GSFont('masters/Kumar One.glyphs'); [f.masters.remove(m) for m in list(f.masters) if m.name!='Filled']; f.save('KumarOne-Filled.glyphs')\""
+      ],
+      "note": "ofl/kumarone: masters/Kumar One.glyphs holds 2 NON-interpolating masters named 'Filled' and 'Outlined' (both weight Regular) - two dis"
+    },
+    "ofl/kumaroneoutline": {
+      "pre_build": [
+        "fontmake -g 'masters/Kumar One.glyphs' -o ufo --master-dir master_ufos",
+        "python3 -c \"import glyphsLib; f=glyphsLib.GSFont('masters/Kumar One.glyphs'); [f.masters.remove(m) for m in list(f.masters) if m.name!='Outlined']; f.save('KumarOne-Outlined.glyphs')\""
+      ],
+      "note": "ofl/kumaroneoutline: Same source masters/Kumar One.glyphs as kumarone; this family ships ONLY the 'Outlined' master (KumarOneOutline-Regular."
+    },
+    "ofl/krub": {
+      "pre_build": [
+        "python -c \"import glyphsLib; f=glyphsLib.GSFont('source/Krub.glyphs'); dups=[g for g in f.glyphs if g.name=='Thai_Head_top']; assert len(dups)==2, len(dups); dups[1].name='Thai_Head_top.dup'; dups[1].export=False; f.save('source/Krub.glyphs')\""
+      ],
+      "note": "ofl/krub: Source defect: source/Krub.glyphs contains TWO distinct glyphs both literally named 'Thai_Head_top'; when glyphsLib mate"
+    },
+    "ofl/abhayalibre": {
+      "pre_build": [
+        "python3 -c \"import io,sys; p='sources/glyphs/Abhaya-Masters.glyphs'; t=io.open(p,encoding='utf-8').read(); assert t.count('familyName = \\\"Abhaya Libre Latin\\\";')==1; t=t.replace('familyName = \\\"Abhaya Libre Latin\\\";','familyName = \\\"Abhaya Libre\\\";'); io.open(p,'w',encoding='utf-8').write(t)\""
+      ],
+      "note": "ofl/abhayalibre: Source sources/glyphs/Abhaya-Masters.glyphs has familyName \"Abhaya Libre Latin\" -> instances/outputs become AbhayaLibreL"
+    },
+    "ofl/42dotsans": {
+      "pre_build": [
+        "glyphs2ufo sources/42dotSans.glyphspackage -m sources/masters"
+      ],
+      "note": "ofl/42dotsans: designspace sources/42dotSans.designspace references masters/*.ufo that are generated from sources/42dotSans.glyphspacka"
+    },
+    "ofl/astasans": {
+      "pre_build": [
+        "glyphs2ufo sources/AstaSans.glyphspackage -m sources/masters"
+      ],
+      "note": "ofl/astasans: designspace sources/AstaSans.designspace references masters/*.ufo generated from sources/AstaSans.glyphspackage via glyp"
+    },
+    "ofl/cabin": {
+      "pre_build": [
+        "cd sources",
+        "glyphs2ufo CabinRegular_v3001.glyphs --generate-GDEF",
+        "glyphs2ufo CabinItalic_v3001.glyphs --generate-GDEF"
+      ],
+      "note": "ofl/cabin: override config points at sources/CabinRegular.designspace + CabinItalic.designspace which reference Cabin-*.ufo masters"
+    },
+    "ofl/comfortaa": {
+      "pre_build": [
+        "python3 -c \"p='sources/Comfortaa.glyphs'; s=open(p).read(); s=s.replace('hryvnia.bold=hvyrnia','hryvnia.bold=hryvnia.bold'); open(p,'w').write(s)\""
+      ],
+      "note": "ofl/comfortaa: sources/Comfortaa.glyphs has a malformed glyph-rename entry '\"hryvnia.bold=hvyrnia\"' (line 72284) renaming hryvnia.bold "
+    },
+    "ofl/overpass": {
+      "pre_build": [
+        "mkdir -p sources/master_ufo",
+        "glyphs2ufo sources/Overpass.glyphs -m sources/master_ufo/"
+      ],
+      "note": "ofl/overpass: sources/Overpass.designspace & Overpass-Italic.designspace reference master_ufo/Overpass-*.ufo generated from sources/Ov"
+    },
+    "ofl/leaguescript": {
+      "pre_build": [
+        "python3 -c \"import re; p='source/LeagueScriptNumberOne.ufo/glyphs/bt.glif'; s=open(p,encoding='utf-8').read(); s=s.replace('<advance width=\\\"-1234\\\"', '<advance width=\\\"0\\\"', 1); open(p,'w',encoding='utf-8').write(s)\""
+      ],
+      "note": "ofl/leaguescript: Glyph 'bt' in source/LeagueScriptNumberOne.ufo has advance width=-1234 (bogus negative); fontmake aborts building OpenTy"
+    },
+    "ofl/bellefair": {
+      "pre_build": [
+        "python -c 'p=\"sources/Bellefair.glyphs\"; t=open(p).read(); open(p,\"w\").write(t.replace(\"languagesystem hebr dflt;\\nlanguagesystem hebr dflt;\\n\",\"languagesystem hebr dflt;\\n\",1))'"
+      ],
+      "note": "ofl/bellefair: sources/Bellefair.glyphs featurePrefixes 'Languagesystems' lists 'languagesystem hebr dflt;' twice (consecutive duplicat"
+    },
+    "ofl/bigshotone": {
+      "pre_build": [
+        "python -c 'import plistlib; u=\"src/BigshotOne.ufo\"; g=plistlib.load(open(u+\"/groups.plist\",\"rb\")); defs=\"\\n\".join(\"@%s = [%s];\"%(k,\" \".join(m.rstrip(chr(39)).strip() for m in v if m.rstrip(chr(39)).strip())) for k,v in g.items()); fea=open(u+\"/features.fea\").read(); open(u+\"/features.fea\",\"w\").write(defs+\"\\n\\n\"+fea)'"
+      ],
+      "note": "ofl/bigshotone: src/BigshotOne.ufo/features.fea uses kerning classes @_A_1st, @_O_1st, etc. (25 refs of @_A_1st alone) that are defined "
+    },
+    "ofl/coiny": {
+      "pre_build": [
+        "python -c 'p=\"UFO/Coiny-Regular.ufo/features.fea\"; t=open(p).read(); open(p,\"w\").write(t.replace(chr(92)+\"?\",chr(92)+\"question\"))'"
+      ],
+      "note": "ofl/coiny: UFO/Coiny-Regular.ufo/features.fea:495 has 'pos \\L <0 0 -20 0> \\?  <0 0 -20 0>;' where '\\?' is an invalid escaped glyph "
+    },
+    "ofl/jaini": {
+      "pre_build": [
+        "python -c 'p=\"Source/Jaini.glyphs\"; t=open(p).read(); open(p,\"w\").write(t.replace(\"[La.dv La.MAR.dv] Halant.dv Ra.dv by LaRa.dv;\",\"La.dv Halant.dv Ra.dv by LaRa.dv;\",1))'"
+      ],
+      "note": "ofl/jaini: Source/Jaini.glyphs lookup rkrf1 has two conflicting rules for the same input: 'sub [La.dv La.MAR.dv] Halant.dv Ra.dv by"
+    },
+    "ofl/jainipurva": {
+      "pre_build": [
+        "python -c 'p=\"Source/JainiPurva.glyphs\"; t=open(p).read(); open(p,\"w\").write(t.replace(\"[La.dv La.MAR.dv] Halant.dv Ra.dv by LaRa.dv;\",\"La.dv Halant.dv Ra.dv by LaRa.dv;\",1))'"
+      ],
+      "note": "ofl/jainipurva: Source/JainiPurva.glyphs lookup rkrf1 (same EkType/Jaini repo) has the identical conflict: 'sub [La.dv La.MAR.dv] Halant"
+    },
+    "ofl/jaldi": {
+      "pre_build": [
+        "python -c 'p=\"sources/Jaldi.glyphs\"; t=open(p).read(); open(p,\"w\").write(t.replace(\"\\\\012languagesystem deva dflt;\\\\012languagesystem latn NLD;\",\"\\\\012languagesystem latn NLD;\",1))'"
+      ],
+      "note": "ofl/jaldi: sources/Jaldi.glyphs Languagesystems featurePrefixes lists 'languagesystem deva dflt;' twice (positions 3 and 5, the sec"
+    },
+    "ofl/leckerlione": {
+      "pre_build": [
+        "python -c 'import plistlib; u=\"ofl/leckerlione/src/LeckerliOne-Regular.ufo\"; g=plistlib.load(open(u+\"/groups.plist\",\"rb\")); defs=\"\\n\".join(\"@%s = [%s];\"%(k,\" \".join(m.rstrip(chr(39)).strip() for m in v if m.rstrip(chr(39)).strip())) for k,v in g.items()); fea=open(u+\"/features.fea\").read(); open(u+\"/features.fea\",\"w\").write(defs+\"\\n\\n\"+fea)'"
+      ],
+      "note": "ofl/leckerlione: ofl/leckerlione/src/LeckerliOne-Regular.ufo/features.fea uses kerning classes @_kern_A_left, @_kern_A_right, etc. define"
+    },
+    "ofl/ibmplexsanskr": {
+      "pre_build": [
+        "python3 - <<'PY'\nimport re,io\np='IBM-Plex-Sans-KR/sources/masters/IBM Plex Sans KR.glyphs'\ns=open(p,encoding='utf-8').read()\n# Neutralize designer 'off' backup layers: rename brace coord {NNN, NNNoff} so glyphsLib no longer reads them as intermediate-master locations.\ns=re.sub(r'name = \"([^\"{]*)\\{(\\d+), (\\d+)off\\}\";', r'name = \"\\1[\\2 \\3 off]\";', s)\nopen(p,'w',encoding='utf-8').write(s)\nPY"
+      ],
+      "note": "ofl/ibmplexsanskr: Source defect: glyph layers named 'Rg {400, 100off}' / '{390, 100off}' are parsed by glyphsLib as brace/intermediate-lay"
+    },
+    "ofl/kalam": {
+      "pre_build": [
+        "sed -i 's/^name = 50;$/name = \"50\";/' masters/Kalam.glyphs"
+      ],
+      "note": "ofl/kalam: Source defect: the single instance in masters/Kalam.glyphs has an unquoted numeric styleName ('name = 50;'), read by gly"
+    },
+    "ofl/playwritear": {
+      "pre_build": [
+        "python3 scripts/generate-guideline-source.py"
+      ],
+      "note": "ofl/playwritear: Build references sources/generated/Playwrite-Guides.glyphs which is generated at build time by scripts/generate-guidelin"
+    },
+    "ofl/playwritearguides": {
+      "pre_build": [
+        "python3 scripts/generate-guideline-source.py"
+      ],
+      "note": "ofl/playwritearguides: Same as playwritear: missing build-time-generated sources/generated/Playwrite-Guides.glyphs (produced by scripts/generat"
+    },
+    "ofl/playwriteat": {
+      "pre_build": [
+        "python3 scripts/generate-guideline-source.py"
+      ],
+      "note": "ofl/playwriteat: Same Playwrite missing-generated-source: sources/generated/Playwrite-Guides.glyphs not produced before the build."
+    },
+    "ofl/playwriteatguides": {
+      "pre_build": [
+        "python3 scripts/generate-guideline-source.py"
+      ],
+      "note": "ofl/playwriteatguides: Same Playwrite missing-generated-source: sources/generated/Playwrite-Guides.glyphs not produced before the build."
+    },
+    "ofl/playwriteaunsw": {
+      "pre_build": [
+        "python3 scripts/generate-guideline-source.py"
+      ],
+      "note": "ofl/playwriteaunsw: Same Playwrite missing-generated-source: sources/generated/Playwrite-Guides.glyphs not produced before the build."
+    },
+    "ofl/playwriteaunswguides": {
+      "pre_build": [
+        "python3 scripts/generate-guideline-source.py"
+      ],
+      "note": "ofl/playwriteaunswguides: Same Playwrite missing-generated-source: sources/generated/Playwrite-Guides.glyphs not produced before the build."
+    },
+    "ofl/playwriteauqld": {
+      "pre_build": [
+        "python3 scripts/generate-guideline-source.py"
+      ],
+      "note": "ofl/playwriteauqld: Same Playwrite missing-generated-source: sources/generated/Playwrite-Guides.glyphs not produced before the build."
+    },
+    "ofl/playwriteauqldguides": {
+      "pre_build": [
+        "python3 scripts/generate-guideline-source.py"
+      ],
+      "note": "ofl/playwriteauqldguides: Same Playwrite missing-generated-source: sources/generated/Playwrite-Guides.glyphs not produced before the build."
     }
   }
 }
