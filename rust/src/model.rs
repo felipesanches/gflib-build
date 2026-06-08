@@ -95,6 +95,7 @@ pub struct BuildingItem {
 pub struct QueuedItem {
     #[serde(default)] pub slug: String,
     #[serde(default)] pub kind: String,
+    #[serde(default)] pub crater: String, // fontc_crater's verdict token (see crater::CraterStatus::token)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -107,6 +108,7 @@ pub struct FailItem {
     #[serde(default)] pub compiler_version: String,
     #[serde(default)] pub builder: String,
     #[serde(default)] pub builder_version: String,
+    #[serde(default)] pub crater: String, // fontc_crater's verdict token (see crater::CraterStatus::token)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -122,6 +124,7 @@ pub struct BuiltItem {
     #[serde(default)] pub builder_version: String,
     #[serde(default)] pub packaged: bool, // a debian/ packaging tree has been drafted on disk
     #[serde(default)] pub deb_status: String, // "" | built | validated | failed (from build-results.json)
+    #[serde(default)] pub crater: String, // fontc_crater's verdict token (see crater::CraterStatus::token)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -243,6 +246,32 @@ pub struct OpStat {
 }
 
 /// The live full snapshot — what both UIs render and the daemon writes to status.json each ~1 s.
+/// The fontc_crater comparison summary carried in the snapshot: how our build outcomes line up with
+/// fontc_crater's latest verdict, family by family. The headline is `we_build_fontc_cant` — families
+/// WE compile that fontc_crater's fontc cannot (the build fixes most valuable to the fontc team).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CraterView {
+    #[serde(default)] pub run: String,         // crater latest-run date
+    #[serde(default)] pub fontc_rev: String,   // fontc revision crater ran
+    #[serde(default)] pub fonts_repo_sha: String, // google/fonts SHA crater compared against
+    #[serde(default)] pub complete: bool,       // false = diff-only fallback (no fontc/both-failed split)
+    #[serde(default)] pub matched: usize,       // families joined to a crater verdict
+    // our build status × crater verdict (the actionable buckets):
+    #[serde(default)] pub we_build_fontc_cant: usize, // built here, fontc failed in crater — GOLD
+    #[serde(default)] pub we_fail_fontc_ok: usize,    // failed here, fontc built it — our regressions
+    #[serde(default)] pub both_ok_identical: usize,
+    #[serde(default)] pub both_ok_diff: usize,
+    #[serde(default)] pub gold_families: Vec<String>, // capped slug list for the panel
+    #[serde(default)] pub regression_families: Vec<String>, // capped slug list for the panel
+    // raw crater verdict tally across matched families:
+    #[serde(default)] pub c_identical: usize,
+    #[serde(default)] pub c_diff: usize,
+    #[serde(default)] pub c_fontc_failed: usize,
+    #[serde(default)] pub c_fontmake_failed: usize,
+    #[serde(default)] pub c_both_failed: usize,
+    #[serde(default)] pub c_repo_failed: usize,
+}
+
 /// One build-tool package (a dependency, compiler, or orchestrator) + the families that need it,
 /// classified python/rust — the per-tool Python->Rust (M5) burn-down view.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -310,6 +339,7 @@ pub struct Snapshot {
     #[serde(default)] pub config_path: String,
     #[serde(default)] pub pre_build: bool, // first-run setup wizard (config tab is the only view)
     #[serde(default)] pub fontspector: Option<FontspectorView>, // QA results (the --fontspector pass)
+    #[serde(default)] pub crater: Option<CraterView>, // fontc_crater build-status comparison (when loaded)
     #[serde(default)] pub done: bool,
     #[serde(default)] pub daemon_alive: bool,
 }

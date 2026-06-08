@@ -27,6 +27,10 @@ pub struct Config {
     pub percent: f64,
     pub only: String,
     pub retry_category: String,
+    pub retrigger: String,         // comma-separated slugs to force-rebuild (after applying a fix)
+    pub retrigger_crater: String,  // force-rebuild families by crater verdict: fontc-failed|both-failed|failed|diff
+    pub crater_path: Option<PathBuf>, // explicit fontc_crater status file (else auto-resolved)
+    pub no_crater: bool,           // disable the crater comparison entirely
     pub compare: bool,
     pub mirror_missing: bool,
     pub populate_archive: bool,
@@ -75,6 +79,10 @@ impl Default for Config {
             percent: 100.0,
             only: String::new(),
             retry_category: String::new(),
+            retrigger: String::new(),
+            retrigger_crater: String::new(),
+            crater_path: None,
+            no_crater: false,
             compare: false,
             mirror_missing: false,
             populate_archive: false,
@@ -188,6 +196,12 @@ pub fn parse(args: &[String]) -> Parsed {
             "--percent" => cfg.percent = next(&mut i, a).parse::<f64>().unwrap_or(100.0).clamp(0.0, 100.0),
             "--only" => cfg.only = next(&mut i, a),
             "--retry-category" => cfg.retry_category = next(&mut i, a),
+            // force-rebuild a named set of families (after applying a fix), regardless of prior status
+            "--retrigger" => cfg.retrigger = next(&mut i, a),
+            // force-rebuild families by fontc_crater verdict (fontc-failed|both-failed|failed|diff)
+            "--retrigger-crater" => cfg.retrigger_crater = next(&mut i, a),
+            "--crater" => cfg.crater_path = Some(PathBuf::from(next(&mut i, a))),
+            "--no-crater" => cfg.no_crater = true,
             "--compare" => cfg.compare = true,
             "--no-compare" => cfg.compare = false,
             "--mirror-missing" => cfg.mirror_missing = true,

@@ -8,6 +8,7 @@
 mod build;
 mod classify;
 mod config;
+mod crater;
 mod daemon;
 mod deb;
 mod discover;

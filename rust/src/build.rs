@@ -91,6 +91,8 @@ pub struct Orchestrator {
     pub dry_playbook: HashMap<String, Res>, // --dry-run: each family's previous outcome to replay
     pub running: Mutex<HashSet<i32>>,       // pgids of in-flight builder children (freeze/thaw/kill)
     pub frozen: AtomicBool,                 // pause SIGSTOPs running builds; lock-free mirror of sh.paused
+    pub crater: Option<crate::crater::CraterData>, // fontc_crater latest verdict (None = unavailable/disabled)
+    pub crater_by_slug: BTreeMap<String, crate::crater::CraterStatus>, // family slug -> crater verdict
 }
 
 impl Orchestrator {
@@ -133,6 +135,49 @@ impl Orchestrator {
         // dashboard animates the whole build again — but the worker just replays it (no real work).
         let dry_playbook: HashMap<String, Res> =
             if cfg.dry_run { prior.iter().map(|(k, v)| (k.clone(), v.clone())).collect() } else { HashMap::new() };
+
+        // fontc_crater comparison: load the latest per-target verdict and join each discovered family
+        // to it by upstream repo. Done before the worklist loop so a --retrigger-crater selection can
+        // force-rebuild families by crater verdict.
+        let crater = if cfg.no_crater {
+            None
+        } else {
+            crate::crater::resolve_path(cfg.crater_path.as_deref(), &cfg.data_dir)
+                .and_then(|p| crate::crater::load(&p))
+        };
+        let crater_by_slug: BTreeMap<String, crate::crater::CraterStatus> = match &crater {
+            Some(c) => fams
+                .iter()
+                .filter_map(|f| c.status_for_url(&f.url).map(|st| (f.slug.clone(), st.clone())))
+                .collect(),
+            None => BTreeMap::new(),
+        };
+        // retrigger set: explicit --retrigger slugs ∪ families matching --retrigger-crater. These are
+        // force-rebuilt below regardless of their prior built/failed status (the "I just applied a
+        // fix, rebuild the affected families" path).
+        let mut retrigger_set: HashSet<String> = cfg
+            .retrigger
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !cfg.retrigger_crater.trim().is_empty() {
+            let mode = cfg.retrigger_crater.trim().to_lowercase();
+            use crate::crater::CraterStatus as CS;
+            for (slug, st) in &crater_by_slug {
+                let hit = match mode.as_str() {
+                    "fontc-failed" | "fontc_failed" => matches!(st, CS::FontcFailed),
+                    "both-failed" | "both_failed" => matches!(st, CS::BothFailed),
+                    "failed" => st.fontc_failed(),
+                    "diff" => matches!(st, CS::Diff(_)),
+                    _ => false,
+                };
+                if hit {
+                    retrigger_set.insert(slug.clone());
+                }
+            }
+        }
+
         let mut results = BTreeMap::new();
         let mut families = BTreeMap::new();
         // (slug, prior_duration) for queued families — sorted longest-first below to shrink the tail
@@ -141,11 +186,15 @@ impl Orchestrator {
             let slug = f.slug.clone();
             families.insert(slug.clone(), f);
             let prev = prior.get(&slug);
+            let force = retrigger_set.contains(&slug);
             // resume: keep a prior success unless --rebuild; re-queue a failure if the user forces it
             // OR (self-heal, matching Python) its cause is in the AUTO_RETRY set — a fresh attempt can
             // clear a rebuilt venv / retried clone / updated mirror, so the failure hints stay honest.
+            // A --retrigger / --retrigger-crater hit force-rebuilds regardless of prior status.
             let (status, kind) = if cfg.dry_run {
                 ("queued", "new") // re-queue all for the mockup replay
+            } else if force {
+                ("queued", "rebuild")
             } else { match prev {
                 Some(p) if p.status == "built" && !cfg.rebuild => ("built", ""),
                 Some(p) if p.status == "failed" => {
@@ -173,7 +222,7 @@ impl Orchestrator {
             r.slug = slug.clone();
             r.status = status.into();
             if status == "queued" {
-                r.queued_kind = if cfg.rebuild { "rebuild".into() } else { kind.into() };
+                r.queued_kind = if cfg.rebuild || force { "rebuild".into() } else { kind.into() };
                 queued_with_dur.push((slug.clone(), prior_dur));
             }
             results.insert(slug, r);
@@ -249,6 +298,8 @@ impl Orchestrator {
             dry_playbook,
             running: Mutex::new(HashSet::new()),
             frozen: AtomicBool::new(false),
+            crater,
+            crater_by_slug,
         })
     }
 
@@ -1585,6 +1636,7 @@ impl Orchestrator {
                     builder_version: r.builder_version.clone(),
                     packaged: drafted.contains(&r.slug.replace('/', "__")),
                     deb_status: deb_results.get(&r.slug).cloned().unwrap_or_default(),
+                    crater: self.crater_by_slug.get(&r.slug).map(|s| s.token()).unwrap_or_default(),
                 });
             }
             if r.status == "building" {
@@ -1600,6 +1652,7 @@ impl Orchestrator {
                 queued_list.push(QueuedItem {
                     slug: r.slug.clone(),
                     kind: if r.queued_kind.is_empty() { "new".into() } else { r.queued_kind.clone() },
+                    crater: self.crater_by_slug.get(&r.slug).map(|s| s.token()).unwrap_or_default(),
                 });
             }
             if r.status == "failed" {
@@ -1612,6 +1665,7 @@ impl Orchestrator {
                     compiler_version: r.compiler_version.clone(),
                     builder: r.builder.clone(),
                     builder_version: r.builder_version.clone(),
+                    crater: self.crater_by_slug.get(&r.slug).map(|s| s.token()).unwrap_or_default(),
                 });
                 let (cause, hint) = crate::classify::categorize_failure(&r.error);
                 let ent = fail_cat.entry(cause.to_string()).or_insert((0, Vec::new(), hint));
@@ -1781,6 +1835,58 @@ impl Orchestrator {
             v
         };
 
+        // fontc_crater comparison summary: how our build outcomes line up with crater's latest
+        // verdict, family by family. The actionable buckets are the gold (we build / fontc can't)
+        // and the regressions (we fail / fontc built it).
+        let crater_view = self.crater.as_ref().map(|c| {
+            use crate::crater::CraterStatus as CS;
+            let mut v = crate::model::CraterView {
+                run: c.meta.latest_run.clone(),
+                fontc_rev: c.meta.fontc_rev.clone(),
+                fonts_repo_sha: c.meta.fonts_repo_sha.clone(),
+                complete: c.meta.complete,
+                ..Default::default()
+            };
+            for r in sh.results.values() {
+                let st = match self.crater_by_slug.get(&r.slug) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                v.matched += 1;
+                match st {
+                    CS::Identical => v.c_identical += 1,
+                    CS::Diff(_) => v.c_diff += 1,
+                    CS::FontcFailed => v.c_fontc_failed += 1,
+                    CS::FontmakeFailed => v.c_fontmake_failed += 1,
+                    CS::BothFailed => v.c_both_failed += 1,
+                    CS::RepoFailed => v.c_repo_failed += 1,
+                }
+                let built = r.status == "built";
+                if built && st.fontc_failed() {
+                    v.we_build_fontc_cant += 1;
+                    if v.gold_families.len() < 60 {
+                        v.gold_families.push(r.slug.clone());
+                    }
+                }
+                if r.status == "failed" && st.fontc_built() {
+                    v.we_fail_fontc_ok += 1;
+                    if v.regression_families.len() < 60 {
+                        v.regression_families.push(r.slug.clone());
+                    }
+                }
+                if built {
+                    match st {
+                        CS::Identical => v.both_ok_identical += 1,
+                        CS::Diff(_) => v.both_ok_diff += 1,
+                        _ => {}
+                    }
+                }
+            }
+            v.gold_families.sort();
+            v.regression_families.sort();
+            v
+        });
+
         Snapshot {
             elapsed: self.elapsed(),
             disk_used_delta: 0,
@@ -1838,6 +1944,7 @@ impl Orchestrator {
             config_path: self.cfg.data_dir.join("gflib-build.config").to_string_lossy().to_string(),
             pre_build: false, // a live build is never the setup wizard
             fontspector: sh.fontspector.clone(), // live QA aggregate (async --fontspector orchestration)
+            crater: crater_view,
             done,
             daemon_alive: true,
         }
