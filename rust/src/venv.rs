@@ -285,12 +285,15 @@ pub fn parse_failed_wheel_builds(text: &str) -> HashSet<String> {
         while let Some(pos) = rest.find(marker) {
             let after = &rest[pos + marker.len()..];
             if after.starts_with("installable wheels") {
-                // "Failed to build installable wheels for some pyproject.toml based projects (a, b)"
-                if let Some(lp) = after.find('(') {
-                    if let Some(rp) = after[lp..].find(')') {
-                        for p in after[lp + 1..lp + rp].split(',') {
+                // "Failed to build installable wheels for some pyproject.toml based projects (a, b)".
+                // Only the FIRST line counts — searching `after` (the whole rest of the log) for '(' would
+                // grab an unrelated later "Collecting X (from -r …)" paren and inject the bogus token "from".
+                let line = after.split('\n').next().unwrap_or(after);
+                if let Some(lp) = line.find('(') {
+                    if let Some(rp) = line[lp..].find(')') {
+                        for p in line[lp + 1..lp + rp].split(',') {
                             let tok = take_pkg(p.trim().trim_start_matches(['\'', '"']));
-                            if !tok.is_empty() {
+                            if !tok.is_empty() && tok != "from" {
                                 out.insert(tok.to_lowercase());
                             }
                         }
@@ -299,7 +302,7 @@ pub fn parse_failed_wheel_builds(text: &str) -> HashSet<String> {
             } else {
                 // "Failed building wheel for X" / "Failed to build 'X'" / "Failed to build X"
                 let tok = take_pkg(after.trim_start_matches(['\'', '"']));
-                if !tok.is_empty() {
+                if !tok.is_empty() && tok != "from" {
                     out.insert(tok.to_lowercase());
                 }
             }
@@ -360,8 +363,11 @@ pub fn parse_sdist_packages(text: &str) -> HashSet<String> {
     out
 }
 
-/// Base pins a cohort's own dep conflicts with (ResolutionImpossible) — only ones WE control.
-pub fn parse_conflict_pins(text: &str, base_pkgs: &HashSet<String>) -> HashSet<String> {
+/// Pins involved in a ResolutionImpossible — each "The user requested <pkg>==<ver>". Includes FAMILY
+/// pins, not only base ones: e.g. cormorant's `fontMath==0.9.1` conflicts with `fontmake … fontMath>=0.9.4`,
+/// and relaxing that family pin is the only way the cohort resolves. (Previously this filtered to base
+/// pins via `intersection(base_pkgs)`, so such a family pin was found but discarded → the loop bailed.)
+pub fn parse_conflict_pins(text: &str, _base_pkgs: &HashSet<String>) -> HashSet<String> {
     let low = text.to_lowercase();
     if !low.contains("resolutionimpossible") && !low.contains("conflicting dependencies") {
         return HashSet::new();
@@ -377,7 +383,7 @@ pub fn parse_conflict_pins(text: &str, base_pkgs: &HashSet<String>) -> HashSet<S
         }
         rest = &after[tok.len().max(1).min(after.len())..];
     }
-    out.intersection(base_pkgs).cloned().collect()
+    out
 }
 
 /// A missing SYSTEM library (not a pin we can fix) → a short "<lib> (install <pkg>)" hint, else None.
@@ -621,6 +627,11 @@ impl VenvManager {
         ov.sort();
         ov.dedup();
         let mut key_text = requested.join("\n");
+        // A toolchain-POLICY epoch folded into the marker hash: bump it whenever a venv-build policy
+        // changes (here: the setuptools<81 pin). Without it, a venv created under the OLD policy
+        // (setuptools 82, no pkg_resources) keeps being silently reused because its requirements still
+        // match — so existing venvs never pick up the fix. Bumping the epoch forces a clean rebuild.
+        key_text.push_str("\n|gflib-policy:setuptools<81");
         if !ov.is_empty() {
             key_text.push_str("|ov:");
             key_text.push_str(&ov.iter().map(|p| format!("{}={}", p, pin_override(p).unwrap())).collect::<Vec<_>>().join(","));
@@ -812,6 +823,23 @@ mod tests {
         assert!(m.contains("lxml"), "expected lxml in {:?}", m);
         assert!(!m.contains("jinja2"), "a wheel package must NOT be relaxed: {:?}", m);
         assert!(parse_failed_wheel_builds("Successfully installed everything").is_empty());
+        // the 'installable wheels (…)' summary must read only its OWN line — a later
+        // "Collecting X (from -r …)" must NOT inject the bogus token "from".
+        let pip25 = "ERROR: Failed to build installable wheels for some pyproject.toml based projects (pygit2)\n\
+                     Collecting zopfli==0.2.2 (from -r /tmp/eff.txt (line 9))\n";
+        let f = parse_failed_wheel_builds(pip25);
+        assert!(f.contains("pygit2"), "expected pygit2 in {:?}", f);
+        assert!(!f.contains("from"), "must never relax the bogus token 'from': {:?}", f);
+    }
+    #[test]
+    fn parse_conflict_pins_relaxes_family_pin() {
+        // cormorant: a FAMILY pin conflicts with a base tool — must be relaxed (was discarded by the
+        // old base-only filter).
+        let log = "ERROR: Cannot install -r eff.txt because these package versions have conflicting \
+                   dependencies.\nThe conflict is caused by:\n    The user requested fontMath==0.9.1\n    \
+                   fontmake 3.11.1 depends on fontMath>=0.9.4\nResolutionImpossible\n";
+        let got = parse_conflict_pins(log, &HashSet::new());
+        assert!(got.contains("fontmath"), "family pin fontMath must be relaxable: {:?}", got);
     }
     #[test]
     fn parse_sdist_packages_finds_build_candidates() {
@@ -864,7 +892,8 @@ mod tests {
         std::fs::create_dir_all(vdir.join("bin")).unwrap();
         let dummy_py = vdir.join("bin").join("python");
         std::fs::write(&dummy_py, "#!/bin/sh\n").unwrap();
-        let want = sha_hex("sha256sum", "wheel"); // base cohort, requested = ["wheel"], no override
+        // base cohort, requested = ["wheel"], no override, + the toolchain-policy epoch folded into key_text
+        let want = sha_hex("sha256sum", "wheel\n|gflib-policy:setuptools<81");
         std::fs::write(vdir.join(".gflib-installed"), format!("{}\n", &want[..want.len().min(16)])).unwrap();
 
         let vm = VenvManager::new(&bd, "python3", Some(basereq));
