@@ -501,9 +501,10 @@ BUILD:
   --fontc-bin <PATH>            fontc (Rust) binary (auto-detected)
   --builder3-bin <PATH>         gftools-builder3 (Rust orchestrator)
   --build-python <PATH>         interpreter for builds (default python3)
-  --pythons <a,b,c>             cohort-venv Python ladder, newest→oldest (e.g. python3.13,python3.11).
-                                A cohort whose exact pinned reqs have no wheel on a rung falls back to an
-                                older one (keeping the pins) before relaxing. Single entry = legacy.
+  --pythons <a,b,c|auto>        cohort-venv Python ladder, newest→oldest (e.g. python3.13,python3.11), or
+                                'auto' to discover installed python3.N. A cohort whose exact pinned reqs
+                                have no wheel on a rung falls back to an older one (keeping the pins)
+                                before relaxing; the commit year picks the starting rung. Single = legacy.
   --jobs <N>                    parallel workers (default = CPU count)
   --timeout <SECS>              per-build timeout (default: none)
   --compare                     sha256-compare built fonts to shipped (metadata mode)

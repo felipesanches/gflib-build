@@ -1082,7 +1082,9 @@ impl Orchestrator {
         let python = if let Some(v) = &self.venvs {
             let req = venv::read_requirements_from_mirror(&mirror, &fam.commit);
             self.set_result(slug, |r| r.note = "installing deps".into());
-            let (py, cohort, pyver, verr) = self.timed(slug, "venv", || v.get_python(&req, |_k| {}));
+            // in multi-Python mode, the commit year picks the starting ladder rung (skip too-new interpreters)
+            let cyear = if self.cfg.pythons.len() > 1 { commit_year(&mirror, &fam.commit) } else { None };
+            let (py, cohort, pyver, verr) = self.timed(slug, "venv", || v.get_python(&req, cyear, |_k| {}));
             if !verr.is_empty() {
                 let msg = format!("venv: {}", verr);
                 let (cause, _) = crate::classify::categorize_failure(&msg);
@@ -1857,6 +1859,7 @@ impl Orchestrator {
         let mut counts = Counts::default();
         let mut backends = Backends::default();
         let mut migration: BTreeMap<String, usize> = BTreeMap::new();
+        let mut python_versions: BTreeMap<String, usize> = BTreeMap::new(); // built families by interpreter
         let mut building = Vec::new();
         let mut queued_list = Vec::new();
         let mut fails = Vec::new();
@@ -1873,6 +1876,9 @@ impl Orchestrator {
                 _ => {}
             }
             if r.status == "built" {
+                if !r.python_version.is_empty() {
+                    *python_versions.entry(r.python_version.clone()).or_insert(0) += 1;
+                }
                 match r.backend.as_str() {
                     "fontc" => {
                         backends.fontc += 1;
@@ -2187,6 +2193,7 @@ impl Orchestrator {
             tooling,
             builders,
             migration,
+            python_versions,
             op_stats,
             phase_durations: [("build".to_string(), (self.elapsed() * 10.0).round() / 10.0)]
                 .into_iter()
@@ -2263,6 +2270,18 @@ pub fn mirror_path(archive: &Path, repo_url: &str) -> PathBuf {
     } else {
         archive.join(format!("{}.git", u))
     }
+}
+
+/// The year a commit was authored (from the bare mirror), for the Python-ladder era heuristic.
+fn commit_year(mirror: &Path, commit: &str) -> Option<u32> {
+    let out = std::process::Command::new("git")
+        .args(["-C", &mirror.to_string_lossy(), "show", "-s", "--format=%cd", "--date=format:%Y", commit])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 fn log_line(log_path: &Path, msg: &str) {

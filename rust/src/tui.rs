@@ -994,10 +994,17 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
             let mut ops: Vec<(String, crate::model::OpStat)> = snap.op_stats.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             ops.sort_by(|a, b| b.1.total.partial_cmp(&a.1.total).unwrap_or(std::cmp::Ordering::Equal));
             let orows = ops.iter().map(|(k, s)| vec![(format!("{:<10} total {:>9.1}  n {:>5}  mean {:>7.2}  max {:>7.1}", k, s.total, s.count, s.mean, s.max), Color::Cyan)]).collect();
-            vec![
+            let mut sections = vec![
                 SectionR { title: "Phase timing".into(), dview: "", rows: prows, keys: phases.iter().map(|(k, _)| k.clone()).collect() },
                 SectionR { title: "Operation timing".into(), dview: "stats", rows: orows, keys: ops.iter().map(|(k, _)| k.clone()).collect() },
-            ]
+            ];
+            if !snap.python_versions.is_empty() {
+                let pyrows = snap.python_versions.iter()
+                    .map(|(v, n)| vec![(format!("Python {:<10} {:>6} families", v, n), Color::Green)]).collect();
+                sections.push(SectionR { title: "Python interpreters (multi-Python ladder)".into(), dview: "",
+                    rows: pyrows, keys: snap.python_versions.keys().cloned().collect() });
+            }
+            sections
         }
         "fontspector" => match &snap.fontspector {
             None => vec![SectionR {

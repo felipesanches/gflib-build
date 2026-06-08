@@ -399,6 +399,8 @@ function statsPrefix(){const m=snap.migration||{};
  const tl=snap.tooling||{},bl=snap.builders||{};
  if(Object.keys(tl).length)h+='<div class="ln c">compilers in use:  '+Object.entries(tl).map(e=>E(e[0]+' → '+e[1])).join('   ')+'</div>';
  if(Object.keys(bl).length)h+='<div class="ln c">builders in use:   '+Object.entries(bl).map(e=>E(e[0]+' → '+e[1])).join('   ')+'</div>';
+ const pv=snap.python_versions||{};
+ if(Object.keys(pv).length)h+='<div class="ln g">Python interpreters: '+Object.entries(pv).sort().map(e=>E(e[0]+' → '+e[1]+' families')).join('   ')+'</div>';
  return h;
 }
 

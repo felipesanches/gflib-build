@@ -103,6 +103,47 @@ pub fn normalize_requirements(text: &str) -> String {
     lines.join("\n")
 }
 
+/// Auto-detect an interpreter ladder from installed `python3.N` binaries, newest→oldest (`--pythons auto`).
+/// Falls back to `["python3"]` if no versioned interpreters are found.
+pub fn detect_ladder() -> Vec<String> {
+    let mut out = Vec::new();
+    for minor in (8..=15).rev() {
+        let bin = format!("python3.{}", minor);
+        let ok = Command::new(&bin)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            out.push(bin);
+        }
+    }
+    if out.is_empty() {
+        out.push("python3".to_string());
+    }
+    out
+}
+
+/// The newest Python minor that plausibly has wheels for a package pinned by a repo committed in `year`
+/// — i.e. ~the Python era of the freeze, plus a one-release buffer (wheels often land for the next minor).
+/// Used to pick the STARTING ladder rung so an obviously-old cohort skips probing brand-new interpreters.
+pub fn usable_python_minor_for_year(year: u32) -> u32 {
+    let era = match year {
+        0..=2020 => 9,
+        2021 => 10,
+        2022 => 11,
+        2023 => 12,
+        2024 => 13,
+        _ => 14,
+    };
+    era + 1
+}
+
+/// Parse the minor version from a pyinfo tag ("py311" → 11, "py39" → 9). None if not a `py3*` tag.
+pub fn tag_minor(tag: &str) -> Option<u32> {
+    tag.strip_prefix("py3").and_then(|s| s.parse().ok())
+}
+
 /// Cohort venv key for a Python-ladder rung: the default rung (idx 0) keeps the bare cohort key so every
 /// EXISTING venv is reused unchanged (zero rebuild when the ladder is enabled); each older rung appends
 /// the interpreter tag (`<key>-py311`) to get a distinct, Python-specific venv.
@@ -564,7 +605,13 @@ impl VenvManager {
         let pip_cache = build_dir.join("pip-cache");
         let _ = std::fs::create_dir_all(&root);
         let _ = std::fs::create_dir_all(&pip_cache);
-        let pythons: Vec<String> = if pythons.is_empty() { vec!["python3".into()] } else { pythons.to_vec() };
+        let pythons: Vec<String> = if pythons.len() == 1 && pythons[0] == "auto" {
+            detect_ladder() // --pythons auto → discover installed python3.N, newest→oldest
+        } else if pythons.is_empty() {
+            vec!["python3".into()]
+        } else {
+            pythons.to_vec()
+        };
         let base_python = pythons[0].clone();
         VenvManager {
             root,
@@ -633,17 +680,34 @@ impl VenvManager {
     /// to install the EXACT pinned reqs falls through to the next (older) rung WITHOUT relaxing — only
     /// the last rung relaxes, so we prefer "faithful pins on an older Python" over "relaxed pins on a
     /// newer one". A single-rung ladder is byte-identical to the legacy single-Python path.
-    pub fn get_python<F: FnOnce(&str)>(&self, req_text: &str, on_install: F) -> (String, String, String, String) {
+    pub fn get_python<F: FnOnce(&str)>(&self, req_text: &str, commit_year: Option<u32>, on_install: F) -> (String, String, String, String) {
         let base_key = cohort_key_for(req_text);
-        // Build the runnable rungs: (python, cohort key, python_version). Skip a non-default rung whose
-        // interpreter isn't installed; the default rung is always present.
+        // Build the runnable rungs: (python, cohort key, python_version) + each rung's minor. Skip a
+        // non-default rung whose interpreter isn't installed; the default rung is always present.
         let mut rungs: Vec<(String, String, String)> = Vec::new();
+        let mut minors: Vec<Option<u32>> = Vec::new();
         for (idx, python) in self.pythons.iter().enumerate() {
             if idx == 0 {
-                let full = self.pyinfo(python).map(|(_, f)| f).unwrap_or_default();
+                let (tag, full) = self.pyinfo(python).unwrap_or_default();
                 rungs.push((python.clone(), rung_cohort_key(&base_key, 0, ""), full));
+                minors.push(tag_minor(&tag));
             } else if let Some((tag, full)) = self.pyinfo(python) {
                 rungs.push((python.clone(), rung_cohort_key(&base_key, idx, &tag), full));
+                minors.push(tag_minor(&tag));
+            }
+        }
+        // commit-date heuristic: skip rungs whose Python is too new for the freeze era (they'd fail the
+        // wheel check anyway), so an old cohort starts at an era-appropriate interpreter. Keep ≥1 rung.
+        if let Some(year) = commit_year {
+            let usable = usable_python_minor_for_year(year);
+            let keep: Vec<usize> = (0..rungs.len())
+                .filter(|&i| minors[i].map(|m| m <= usable).unwrap_or(true))
+                .collect();
+            if keep.is_empty() {
+                let last = rungs.len() - 1;
+                rungs = vec![rungs[last].clone()]; // all too new → best-effort oldest rung
+            } else if keep.len() < rungs.len() {
+                rungs = keep.iter().map(|&i| rungs[i].clone()).collect();
             }
         }
         // fast path: any rung's venv already built (no lock churn)?
@@ -1028,6 +1092,19 @@ mod tests {
         assert_ne!(rung_cohort_key(&base, 1, "py311"), rung_cohort_key(&base, 2, "py310"));
     }
     #[test]
+    fn python_era_and_tag_helpers() {
+        assert_eq!(tag_minor("py311"), Some(11));
+        assert_eq!(tag_minor("py39"), Some(9));
+        assert_eq!(tag_minor("py310"), Some(10));
+        assert_eq!(tag_minor("nope"), None);
+        // an old freeze (2021) shouldn't reach for cp313; a 2024 one can
+        assert!(usable_python_minor_for_year(2021) < 13);
+        assert!(usable_python_minor_for_year(2024) >= 13);
+        assert!(usable_python_minor_for_year(2019) <= usable_python_minor_for_year(2024));
+        // --pythons auto finds at least one runnable interpreter (python3 or a versioned one)
+        assert!(!detect_ladder().is_empty());
+    }
+    #[test]
     fn pyinfo_reports_a_tag_and_skips_missing_interpreters() {
         let bd = std::env::temp_dir().join(format!("_vmpy_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&bd);
@@ -1058,7 +1135,7 @@ mod tests {
         let vm = VenvManager::new(&bd, &["python3".to_string()], Some(basereq));
         // on_install is a "starting" notification (called before create() regardless of reuse). The
         // real reuse signal: create() returns early WITHOUT rmtree, so the dummy file is untouched.
-        let (py, key, _pyver, err) = vm.get_python("", |_| {});
+        let (py, key, _pyver, err) = vm.get_python("", None, |_| {});
         assert_eq!(key, "base");
         assert!(err.is_empty(), "reuse should not error: {}", err);
         assert_eq!(py, dummy_py.to_string_lossy(), "must return the existing venv's python");

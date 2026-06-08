@@ -336,6 +336,7 @@ pub struct Snapshot {
     #[serde(default)] pub tooling: BTreeMap<String, String>,   // M0: compiler -> version
     #[serde(default)] pub builders: BTreeMap<String, String>,  // M0: builder2/builder3 -> version
     #[serde(default)] pub migration: BTreeMap<String, usize>,
+    #[serde(default)] pub python_versions: BTreeMap<String, usize>, // M0: built families per Python interpreter
     #[serde(default)] pub op_stats: BTreeMap<String, OpStat>,       // per-op timing (stats tab)
     #[serde(default)] pub phase_durations: BTreeMap<String, f64>,
     #[serde(default)] pub tasks: Vec<TaskItem>,
