@@ -2086,6 +2086,24 @@ fn run_builder(
         .map_err(|e| format!("open log: {}", e))?;
     let logf2 = logf.try_clone().map_err(|e| format!("clone log fd: {}", e))?;
 
+    // run_builder sets current_dir(work) below, so a RELATIVE venv python (from a relative --build-dir,
+    // or the default relative --data-dir) would resolve against work/ — breaking both the spawn AND the
+    // venv-bin-on-PATH logic (gftools.builder shells out to `fontmake` by name, so the venv bin MUST be
+    // on PATH). Resolve it to an absolute path once, up front.
+    let python_owned = {
+        let p = Path::new(python);
+        if p.is_absolute() {
+            None
+        } else {
+            Some(
+                std::env::current_dir()
+                    .map(|c| c.join(p).to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| python.to_string()),
+            )
+        }
+    };
+    let python: &str = python_owned.as_deref().unwrap_or(python);
+
     let mut cmd;
     let orch;
     if let Some(b3) = builder3_bin {
@@ -2106,7 +2124,7 @@ fn run_builder(
     // gftools.builder shells out to fontmake / ninja / gftools / ttfautohint BY NAME, so the chosen
     // interpreter's bin/ MUST be on PATH (running venv/bin/python does not by itself activate the
     // venv). Use the venv bin = the python's parent dir WITHOUT resolving symlinks (canonicalize would
-    // follow venv/bin/python → the system /usr/bin and miss fontmake). The python path is absolute.
+    // follow venv/bin/python → the system /usr/bin and miss fontmake). python is absolute (resolved above).
     let bindir = {
         let p = Path::new(python);
         if p.is_absolute() { p.parent().map(|d| d.to_path_buf()) } else { None }

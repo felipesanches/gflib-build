@@ -20,6 +20,12 @@ pub fn is_transient_clone_error(err: &str) -> bool {
 /// Map a failure message to a short CAUSE + an actionable HINT (verbatim from Python).
 pub fn categorize_failure(error: &str) -> (&'static str, &'static str) {
     let low = error.to_lowercase();
+    if low.contains("could not launch builder") || low.contains("no such file or directory: 'fontmake'") {
+        return (
+            "build launcher error",
+            "the venv python/fontmake wasn't found via a relative build path — fixed by resolving the venv to an absolute path; re-attempted automatically",
+        );
+    }
     if low.contains("no module named 'gftools'")
         || low.contains("no module named gftools")
         || low.contains("could not launch builder")
@@ -108,10 +114,11 @@ pub fn categorize_failure(error: &str) -> (&'static str, &'static str) {
 /// Causes a fresh attempt can plausibly clear — re-attempted automatically on the next build (the
 /// self-heal set). Causes needing human action outside the tool (missing -dev lib, unreachable repo,
 /// genuine build error) are deliberately excluded; `--retry-failed` re-attempts even those.
-const AUTO_RETRY_CATEGORIES: [&str; 9] = [
+const AUTO_RETRY_CATEGORIES: [&str; 10] = [
     "broken dependency venv", "dependency install failed", "transient fetch error",
     "stale archive mirror", "repo not mirrored", "internal/transient I/O",
     "dependency conflict", "build needs setuptools", "misconfigured requirements",
+    "build launcher error",
 ];
 
 pub fn is_auto_retry(cause: &str) -> bool {
