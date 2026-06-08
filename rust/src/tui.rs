@@ -1149,13 +1149,19 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
         } else {
             format!("disk used {} (build {} + archive {})", human(bld + arc), human(bld), human(arc))
         };
+        // when builds are frozen by a lowered job limit (not a global pause), note it next to jobs
+        let job_frozen = if !snap.paused && snap.frozen_builds > 0 {
+            format!(" ({} frozen→draining)", snap.frozen_builds)
+        } else {
+            String::new()
+        };
         put(
             scr,
             1,
             0,
             &format!(
-                " {}  free {}  jobs {}  cohorts {}  fontc {}/fontmake {}",
-                disk, human(snap.disk_free), snap.jobs, snap.cohorts.len(),
+                " {}  free {}  jobs {}{}  cohorts {}  fontc {}/fontmake {}",
+                disk, human(snap.disk_free), snap.jobs, job_frozen, snap.cohorts.len(),
                 snap.backends.fontc, snap.backends.fontmake
             ),
             Color::Cyan,

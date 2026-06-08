@@ -517,7 +517,9 @@ function render(){
   const bld=snap.disk_build_total||0,arc=snap.disk_archive_total||0;
   const disk=snap.disk_archive_nested?('disk used '+human(bld)+' (build + nested archive, all included)')
     :('disk used '+human(bld+arc)+' (build '+human(bld)+' + archive '+human(arc)+')');
-  hdr+='<div class="sub"> '+disk+'  free '+human(snap.disk_free)+'  jobs '+(snap.jobs||0)+'  cohorts '+((snap.cohorts||[]).length)+
+  // when builds are frozen by a lowered job limit (not a global pause), call it out next to jobs
+  const jobFrozen=(!snap.paused&&(snap.frozen_builds||0)>0)?' <span class="m">('+snap.frozen_builds+' frozen → draining to limit)</span>':'';
+  hdr+='<div class="sub"> '+disk+'  free '+human(snap.disk_free)+'  jobs '+(snap.jobs||0)+jobFrozen+'  cohorts '+((snap.cohorts||[]).length)+
     '  fontc '+((snap.backends||{}).fontc||0)+'/fontmake '+((snap.backends||{}).fontmake||0)+'</div>';
  }
  document.getElementById('hdr').innerHTML=hdr;

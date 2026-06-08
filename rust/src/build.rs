@@ -74,6 +74,87 @@ pub struct Shared {
     pub op_stats: HashMap<String, (f64, usize, f64)>, // op -> (total_secs, count, max) for timings.json
 }
 
+/// One in-flight builder process group and whether it is currently SIGSTOP-frozen. Kept in start
+/// order (push appends) so the regulator can freeze the NEWEST excess and thaw the OLDEST first.
+struct RunEntry {
+    pgid: i32,
+    frozen: bool,
+}
+
+/// The registry of in-flight builder children, with per-build freeze state. Replaces the old
+/// `HashSet<i32>`: the same membership/iteration, plus the ordering + per-entry `frozen` flag the
+/// job regulator needs to keep exactly `jobs` builds actively running (the rest frozen, not killed).
+#[derive(Default)]
+pub struct RunReg {
+    entries: Vec<RunEntry>,
+}
+
+impl RunReg {
+    fn insert(&mut self, pgid: i32, frozen: bool) {
+        self.entries.push(RunEntry { pgid, frozen });
+    }
+    fn remove(&mut self, pgid: i32) {
+        self.entries.retain(|e| e.pgid != pgid);
+    }
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+    fn unfrozen(&self) -> usize {
+        self.entries.iter().filter(|e| !e.frozen).count()
+    }
+    fn frozen_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.frozen).count()
+    }
+    fn is_frozen(&self, pgid: i32) -> bool {
+        self.entries.iter().any(|e| e.pgid == pgid && e.frozen)
+    }
+    fn pgids(&self) -> Vec<i32> {
+        self.entries.iter().map(|e| e.pgid).collect()
+    }
+    /// Decide which builds to freeze/thaw to reach the target (paused → all frozen; otherwise exactly
+    /// `jobs` unfrozen). Mutates the per-entry `frozen` flags and RETURNS the pgids to SIGSTOP / SIGCONT
+    /// so the caller can signal them (under the same lock). Freezes the NEWEST excess (tail-first) and
+    /// thaws the OLDEST frozen (head-first), so the builds closest to finishing keep running.
+    fn plan(&mut self, paused: bool, jobs: usize) -> (Vec<i32>, Vec<i32>) {
+        let (mut freeze, mut thaw) = (Vec::new(), Vec::new());
+        if paused {
+            for e in self.entries.iter_mut() {
+                if !e.frozen {
+                    e.frozen = true;
+                    freeze.push(e.pgid);
+                }
+            }
+            return (freeze, thaw);
+        }
+        let mut unfrozen = self.entries.iter().filter(|e| !e.frozen).count();
+        if unfrozen > jobs {
+            for e in self.entries.iter_mut().rev() {
+                if unfrozen <= jobs {
+                    break;
+                }
+                if !e.frozen {
+                    e.frozen = true;
+                    freeze.push(e.pgid);
+                    unfrozen -= 1;
+                }
+            }
+        }
+        if unfrozen < jobs {
+            for e in self.entries.iter_mut() {
+                if unfrozen >= jobs {
+                    break;
+                }
+                if e.frozen {
+                    e.frozen = false;
+                    thaw.push(e.pgid);
+                    unfrozen += 1;
+                }
+            }
+        }
+        (freeze, thaw)
+    }
+}
+
 pub struct Orchestrator {
     pub cfg: Config,
     pub shared: Arc<Mutex<Shared>>,
@@ -89,8 +170,9 @@ pub struct Orchestrator {
     pub clone_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>, // per-repo clone lock (--mirror-missing)
     pub qa_bin: Mutex<Option<(PathBuf, String)>>, // resolved fontspector (path, version), lazily set
     pub dry_playbook: HashMap<String, Res>, // --dry-run: each family's previous outcome to replay
-    pub running: Mutex<HashSet<i32>>,       // pgids of in-flight builder children (freeze/thaw/kill)
-    pub frozen: AtomicBool,                 // pause SIGSTOPs running builds; lock-free mirror of sh.paused
+    pub running: Mutex<RunReg>,             // in-flight builder children + freeze state (freeze/thaw/kill)
+    pub frozen: AtomicBool,                 // global pause SIGSTOPs ALL running builds; mirror of sh.paused
+    pub job_limit: AtomicUsize,             // live jobs target; lock-free mirror of sh.jobs for the regulator
     pub crater: Option<crate::crater::CraterData>, // fontc_crater latest verdict (None = unavailable/disabled)
     pub crater_by_slug: BTreeMap<String, crate::crater::CraterStatus>, // family slug -> crater verdict
 }
@@ -296,8 +378,9 @@ impl Orchestrator {
             clone_locks: Mutex::new(HashMap::new()),
             qa_bin: Mutex::new(None),
             dry_playbook,
-            running: Mutex::new(HashSet::new()),
+            running: Mutex::new(RunReg::default()),
             frozen: AtomicBool::new(false),
+            job_limit: AtomicUsize::new(jobs),
             crater,
             crater_by_slug,
         })
@@ -605,7 +688,17 @@ impl Orchestrator {
                     if self.stop.load(Ordering::Relaxed) {
                         return;
                     }
-                    let ready = id < sh.jobs && !sh.paused && !sh.queue.is_empty();
+                    // Cap concurrency at the live job limit measured at the builder-child level too:
+                    // don't start new work while `jobs` builds are already actively compiling, and never
+                    // start new work while ANY build is frozen by a lowered job limit — let those
+                    // in-progress builds thaw and finish first (drain before new). (running is never
+                    // locked while holding `sh` elsewhere, so this nested lock can't deadlock.)
+                    let (unfrozen, frozen_now) = {
+                        let reg = self.running.lock().unwrap();
+                        (reg.unfrozen(), reg.frozen_count())
+                    };
+                    let ready = id < sh.jobs && !sh.paused && !sh.queue.is_empty()
+                        && unfrozen < sh.jobs && frozen_now == 0;
                     if ready {
                         break;
                     }
@@ -628,6 +721,10 @@ impl Orchestrator {
             self.active.fetch_add(1, Ordering::Relaxed);
             self.build_one(&slug, id);
             self.active.fetch_sub(1, Ordering::Relaxed);
+            // a build just finished → refill the freed slot by thawing the oldest frozen build
+            // (drain-first), and wake parked workers so they re-evaluate the gate.
+            self.regulate();
+            self.cond.notify_all();
             if !self.cfg.dry_run {
                 self.save_state(); // never persist the mockup replay over the real session's state.json
             }
@@ -753,7 +850,7 @@ impl Orchestrator {
         let t0 = now();
         if let Err(e) = run_builder(python, &cfg_path, work, log_path, self.cfg.timeout, backend,
                                     self.cfg.fontc_bin.as_deref(), self.cfg.builder3_bin.as_deref(),
-                                    &self.running, &self.frozen) {
+                                    &self.running, &self.frozen, &self.job_limit) {
             return (false, format!("{}: {}", backend, e), BTreeMap::new(), 0);
         }
         let (bytes, found, extras) = collect_outputs(work, dest, &fam.shipped_fonts, t0);
@@ -1043,6 +1140,7 @@ impl Orchestrator {
                 self.cfg.builder3_bin.as_deref(),
                 &self.running,
                 &self.frozen,
+                &self.job_limit,
             ));
             if let Err(e) = run {
                 last_err = format!("{}: {}", backend, e);
@@ -1200,13 +1298,13 @@ impl Orchestrator {
     pub fn apply_live(self: &Arc<Self>, set: &ControlSet) {
         let mut log = Vec::new();
         let mut new_jobs = None;
-        let mut freeze_sig = None;
         let mut persist_build_debs = None;
         {
             let mut sh = self.shared.lock().unwrap();
             if let Some(j) = set.jobs {
                 let j = j.clamp(1, MAX_JOBS);
                 sh.jobs = j;
+                self.job_limit.store(j, Ordering::Relaxed); // regulator reads this lock-free
                 new_jobs = Some(j);
                 log.push(format!("jobs → {}", j));
             }
@@ -1246,8 +1344,7 @@ impl Orchestrator {
             }
             if let Some(pause) = set.paused {
                 sh.paused = pause;
-                self.frozen.store(pause, Ordering::Relaxed);
-                freeze_sig = Some(if pause { SIGSTOP } else { SIGCONT });
+                self.frozen.store(pause, Ordering::Relaxed); // regulate() freezes ALL while paused
                 log.push(if pause {
                     "paused — froze running builds".into()
                 } else {
@@ -1303,10 +1400,11 @@ impl Orchestrator {
                 sh.control_log.drain(0..n - 200);
             }
         }
-        // freeze/thaw the in-flight builds AFTER releasing the shared lock (signalling never holds it)
-        if let Some(sig) = freeze_sig {
-            self.signal_running(sig);
-        }
+        // Reconcile freeze/thaw AFTER releasing the shared lock: the regulator enforces the live
+        // (paused, jobs) target — a global pause freezes everything; otherwise it keeps exactly `jobs`
+        // builds unfrozen, freezing the newest excess when jobs was lowered and thawing the oldest when
+        // it was raised. (regulate() takes only the `running` lock, never `sh`, so this is deadlock-free.)
+        self.regulate();
         // persist a live build_debs toggle so the next run / a bare `--export-deb` agrees on disk
         if let Some(b) = persist_build_debs {
             let path = self.cfg.data_dir.join("gflib-build.config");
@@ -1524,12 +1622,31 @@ impl Orchestrator {
         self.cond.notify_all();
     }
 
-    /// Send `sig` to every in-flight builder process group — used to freeze (SIGSTOP) / thaw (SIGCONT)
-    /// on pause/resume, and to reap children (SIGKILL) on stop.
+    /// Send `sig` to every in-flight builder process group regardless of freeze state — used to reap
+    /// children (SIGCONT then SIGKILL) on stop, so nothing orphans.
     fn signal_running(&self, sig: i32) {
-        let set = self.running.lock().unwrap();
-        for &pgid in set.iter() {
+        let reg = self.running.lock().unwrap();
+        for pgid in reg.pgids() {
             signal_group(pgid, sig);
+        }
+    }
+
+    /// Job regulator: bring the set of ACTIVELY-running (unfrozen) builder children in line with the
+    /// live target — exactly `job_limit` unfrozen when running, or all frozen when globally paused.
+    /// Lowering jobs below the number of running builds freezes (SIGSTOP) the newest excess; as builds
+    /// finish, the freed slots thaw (SIGCONT) the oldest frozen build first, so in-progress work drains
+    /// before any new family starts. Signals under the `running` lock (matching the register path) so a
+    /// concurrent finish/register can't interleave a freeze against a just-reused pgid.
+    fn regulate(&self) {
+        let paused = self.frozen.load(Ordering::Relaxed);
+        let jobs = self.job_limit.load(Ordering::Relaxed);
+        let mut reg = self.running.lock().unwrap();
+        let (freeze, thaw) = reg.plan(paused, jobs);
+        for pgid in freeze {
+            signal_group(pgid, SIGSTOP);
+        }
+        for pgid in thaw {
+            signal_group(pgid, SIGCONT);
         }
     }
 
@@ -1558,8 +1675,12 @@ impl Orchestrator {
 
     /// Build the live snapshot rendered by every frontend and written to status.json.
     pub fn snapshot(&self) -> Snapshot {
-        // in-flight builder children (exactly the ones a pause SIGSTOP-freezes) — read before the lock
-        let running_builds = self.running.lock().unwrap().len();
+        // in-flight builder children + how many are currently frozen (by a pause or the job limit) —
+        // read before the central lock
+        let (running_builds, frozen_builds) = {
+            let reg = self.running.lock().unwrap();
+            (reg.len(), reg.frozen_count())
+        };
         // packaging status: read packaging/ ONCE, BEFORE taking the central lock, so the readdir
         // never stalls other threads on the mutex. "drafted" = a packaging/<slug__>/ directory
         // exists (keep only real subdirectories, skipping index.json).
@@ -1897,6 +2018,7 @@ impl Orchestrator {
             jobs: sh.jobs,
             paused: sh.paused,
             running_builds,
+            frozen_builds,
             total: sh.results.len(),
             counts,
             backends,
@@ -2182,8 +2304,9 @@ fn run_builder(
     backend: &str,
     fontc_bin: Option<&str>,
     builder3_bin: Option<&str>,
-    running: &Mutex<HashSet<i32>>,
+    running: &Mutex<RunReg>,
     frozen: &AtomicBool,
+    job_limit: &AtomicUsize,
 ) -> Result<(), String> {
     use std::process::{Command, Stdio};
     let logf = std::fs::OpenOptions::new()
@@ -2262,19 +2385,24 @@ fn run_builder(
     // insert, so we read frozen=false, or strictly after our SIGSTOP, so it SIGCONTs the stopped group).
     {
         let mut g = running.lock().unwrap();
-        g.insert(pgid);
-        if frozen.load(Ordering::Relaxed) {
+        // start frozen if globally paused, OR if `jobs` builds are already actively compiling (this one
+        // is the excess — the gate let it through during a light checkout phase, or a live jobs cut just
+        // landed). The regulator thaws it later when a slot frees.
+        let start_frozen = frozen.load(Ordering::Relaxed)
+            || g.unfrozen() >= job_limit.load(Ordering::Relaxed);
+        g.insert(pgid, start_frozen);
+        if start_frozen {
             signal_group(pgid, SIGSTOP);
         }
     }
     // Deregister on every exit path (incl. unwind). The reap sites below also remove pgid the moment the
     // child exits, shrinking the (already sub-ms) pid-reuse window in which a stale pgid could be
     // signalled; this guard is the panic/early-return backstop (remove of an absent key is harmless).
-    struct Dereg<'a>(&'a Mutex<HashSet<i32>>, i32);
+    struct Dereg<'a>(&'a Mutex<RunReg>, i32);
     impl Drop for Dereg<'_> {
         fn drop(&mut self) {
             if let Ok(mut s) = self.0.lock() {
-                s.remove(&self.1);
+                s.remove(self.1);
             }
         }
     }
@@ -2285,21 +2413,23 @@ fn run_builder(
     if let Some(t) = timeout {
         let mut deadline = std::time::Instant::now() + Duration::from_secs(t);
         loop {
-            if frozen.load(Ordering::Relaxed) {
+            // frozen time — by a global pause OR by the job limit (this build's own freeze flag) — must
+            // not count toward the deadline, else a long freeze would spuriously time the build out.
+            if frozen.load(Ordering::Relaxed) || running.lock().unwrap().is_frozen(pgid) {
                 thread::sleep(Duration::from_millis(300));
                 deadline += Duration::from_millis(300); // don't count frozen time
                 continue;
             }
             match child.try_wait() {
                 Ok(Some(st)) => {
-                    running.lock().unwrap().remove(&pgid); // exited+reaped → deregister before returning
+                    running.lock().unwrap().remove(pgid); // exited+reaped → deregister before returning
                     return if st.success() { Ok(()) } else { Err(last_error_line(log_path)) };
                 }
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
                         signal_group(pgid, SIGKILL); // kill the whole group, then reap
                         let _ = child.wait();
-                        running.lock().unwrap().remove(&pgid);
+                        running.lock().unwrap().remove(pgid);
                         return Err(format!("timed out after {}s", t));
                     }
                     thread::sleep(Duration::from_millis(300));
@@ -2310,7 +2440,7 @@ fn run_builder(
     } else {
         // no timeout: wait() blocks until exit; a frozen child simply keeps the worker parked here
         let st = child.wait().map_err(|e| format!("wait: {}", e))?;
-        running.lock().unwrap().remove(&pgid); // exited+reaped → deregister before returning
+        running.lock().unwrap().remove(pgid); // exited+reaped → deregister before returning
         if st.success() {
             Ok(())
         } else {
@@ -2545,6 +2675,75 @@ fn cached_cohort_set(build_dir: &Path) -> HashSet<String> {
         }
     }
     set
+}
+
+#[cfg(test)]
+mod jobs_freeze_tests {
+    use super::*;
+    fn reg(items: &[(i32, bool)]) -> RunReg {
+        let mut r = RunReg::default();
+        for &(p, f) in items {
+            r.insert(p, f);
+        }
+        r
+    }
+    fn sorted(mut v: Vec<i32>) -> Vec<i32> {
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn lowering_jobs_freezes_the_newest_excess() {
+        // 5 running unfrozen, pgids inserted oldest→newest; jobs→2 freezes the 3 NEWEST, keeps 2 oldest
+        let mut r = reg(&[(1, false), (2, false), (3, false), (4, false), (5, false)]);
+        let (freeze, thaw) = r.plan(false, 2);
+        assert!(thaw.is_empty());
+        assert_eq!(sorted(freeze), vec![3, 4, 5]);
+        assert_eq!(r.unfrozen(), 2);
+        assert!(!r.is_frozen(1) && !r.is_frozen(2)); // the builds closest to finishing keep running
+        assert!(r.is_frozen(3) && r.is_frozen(4) && r.is_frozen(5));
+    }
+
+    #[test]
+    fn freeing_a_slot_thaws_the_oldest_frozen_first() {
+        // jobs=2; 2 unfrozen (1,2) + 3 frozen (3,4,5). One unfrozen finishes → a slot opens.
+        let mut r = reg(&[(1, false), (2, false), (3, true), (4, true), (5, true)]);
+        r.remove(1);
+        let (freeze, thaw) = r.plan(false, 2);
+        assert!(freeze.is_empty());
+        assert_eq!(thaw, vec![3]); // oldest frozen resumes (drain in-progress before new)
+        assert_eq!(r.unfrozen(), 2);
+    }
+
+    #[test]
+    fn raising_jobs_thaws_multiple_oldest_first() {
+        let mut r = reg(&[(1, false), (2, false), (3, true), (4, true), (5, true)]); // was jobs=2
+        let (freeze, thaw) = r.plan(false, 4); // raise to 4 → thaw the 2 oldest frozen
+        assert!(freeze.is_empty());
+        assert_eq!(thaw, vec![3, 4]);
+        assert_eq!(r.unfrozen(), 4);
+        assert!(r.is_frozen(5));
+    }
+
+    #[test]
+    fn global_pause_freezes_all_then_resume_thaws_to_jobs() {
+        let mut r = reg(&[(1, false), (2, false), (3, false)]);
+        let (freeze, thaw) = r.plan(true, 2); // paused → freeze ALL, ignoring jobs
+        assert!(thaw.is_empty());
+        assert_eq!(sorted(freeze), vec![1, 2, 3]);
+        assert_eq!(r.unfrozen(), 0);
+        let (freeze2, thaw2) = r.plan(false, 2); // resume at jobs=2 → thaw the 2 oldest
+        assert!(freeze2.is_empty());
+        assert_eq!(thaw2, vec![1, 2]);
+        assert_eq!(r.unfrozen(), 2);
+    }
+
+    #[test]
+    fn already_at_target_is_a_noop() {
+        let mut r = reg(&[(1, false), (2, false), (3, true)]);
+        let (freeze, thaw) = r.plan(false, 2);
+        assert!(freeze.is_empty() && thaw.is_empty());
+    }
 }
 
 #[cfg(test)]
