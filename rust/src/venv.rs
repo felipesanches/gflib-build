@@ -42,6 +42,35 @@ pub fn pin_override(pkg: &str) -> Option<&'static str> {
 
 // ---------- pure requirement helpers (unit-tested) ----------
 
+/// glyphsLib's `LANGUAGE_MAPPING` (builder/constants.py) is missing Korean — the standard MS tag KOR
+/// (langID 0x0412) was never added — so any `.glyphs` with a KOR-localized name aborts the build with
+/// `ValueError: Unknown name language: KOR`. Add the entry to a freshly-installed venv's glyphsLib so
+/// those families compile (the langID-correct fix preserves the Korean name; `REVERSE_LANGUAGE_MAPPING`
+/// is derived from the same dict, so one line fixes both directions). Idempotent + atomic write; a no-op
+/// if glyphsLib isn't present or already has KOR. Upstream fix: a one-line addition to glyphsLib.
+fn patch_glyphslib_kor(py: &Path) {
+    const SCRIPT: &str = concat!(
+        "try:\n",
+        "    import glyphsLib.builder.constants as m\n",
+        "except Exception:\n",
+        "    raise SystemExit(0)\n",
+        "import os\n",
+        "f = m.__file__\n",
+        "t = open(f).read()\n",
+        "if '\"KOR\":' not in t and 'LANGUAGE_MAPPING = {' in t:\n",
+        "    nt = t.replace('LANGUAGE_MAPPING = {', 'LANGUAGE_MAPPING = {\\n    \"KOR\": 0x0412,', 1)\n",
+        "    tmp = f + '.korpatch'\n",
+        "    open(tmp, 'w').write(nt)\n",
+        "    os.replace(tmp, f)\n",
+    );
+    let _ = Command::new(py)
+        .arg("-c")
+        .arg(SCRIPT)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Package name from a requirements line, or "" for blank/comment/option/URL lines.
 pub fn req_pkg_name(line: &str) -> String {
     let s = line.trim();
@@ -744,6 +773,7 @@ impl VenvManager {
             };
             if matches!(&status, Ok(s) if s.success()) {
                 let _ = std::fs::write(&ready, format!("{}\n", want_hash));
+                patch_glyphslib_kor(&py); // add the Korean name-language glyphsLib is missing (see below)
                 // promote globally-bad base pins to the shared relaxed set (record once)
                 let base_fixed: HashSet<String> = relax.difference(&conflict_relax).cloned().collect::<HashSet<_>>()
                     .intersection(&base_pkgs).cloned().collect();
