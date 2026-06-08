@@ -737,15 +737,25 @@ impl VenvManager {
             let eff = relax_requirements(&src_lines, &relax);
             let _ = std::fs::write(&eff_path, eff.join("\n") + "\n");
             let mut header = String::new();
+            if attempt == 0 {
+                // Start of a fresh install session. NEVER truncate — preserve any prior session's log
+                // (a stale failure may still be referenced by a family's error/the UI); just mark the
+                // boundary so old and new sessions are easy to tell apart.
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                header = format!("\n\n===== gflib-build install session @ unix {} (cohort {}) =====\n", ts, key);
+            }
             if !relax.is_empty() {
                 let mut r: Vec<_> = relax.iter().cloned().collect();
                 r.sort();
-                header = format!("# gflib-build attempt {}: auto-relaxed pins {:?}\n", attempt + 1, r);
+                header.push_str(&format!("# attempt {}: auto-relaxed pins {:?}\n", attempt + 1, r));
             }
             // append the attempt header + run pip with stdout/stderr -> the cohort install log
+            // (append-only: a prior log is never deleted, so references to it stay valid)
             {
-                let mut f = std::fs::OpenOptions::new().create(true)
-                    .append(attempt != 0).write(true).truncate(attempt == 0).open(&log);
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&log);
                 if let Ok(ref mut lf) = f {
                     let _ = lf.write_all(header.as_bytes());
                 }
@@ -832,29 +842,29 @@ impl VenvManager {
             if new_relax.is_empty() && new_wheel.is_empty() {
                 // nothing NEW to relax OR wheel-force → a genuine failure; classify it like the Python tool
                 if let Some(syslib) = scan_missing_system_dep(&log_text) {
-                    return (String::new(), format!("missing system library: {} (see {}.install.log)", syslib, key));
+                    return (String::new(), format!("missing system library: {} (see venvs/{}.install.log)", syslib, key));
                 }
                 let low = log_text.to_lowercase();
                 if low.contains("resolutionimpossible") || low.contains("conflicting dependencies") {
-                    return (String::new(), format!("dependency conflict (see {}.install.log)", key));
+                    return (String::new(), format!("dependency conflict (see venvs/{}.install.log)", key));
                 }
                 if low.contains("resolution-too-deep") {
-                    return (String::new(), format!("pip resolution too deep — needs tighter constraints (see {}.install.log)", key));
+                    return (String::new(), format!("pip resolution too deep — needs tighter constraints (see venvs/{}.install.log)", key));
                 }
                 if low.contains("no module named 'pkg_resources'") {
-                    return (String::new(), format!("build needs setuptools/pkg_resources (see {}.install.log)", key));
+                    return (String::new(), format!("build needs setuptools/pkg_resources (see venvs/{}.install.log)", key));
                 }
                 let note = if relax.is_empty() { String::new() } else {
                     let mut r: Vec<_> = relax.iter().cloned().collect(); r.sort();
                     format!(" after auto-relaxing {:?}", r)
                 };
-                return (String::new(), format!("pip install failed{} (see {}.install.log)", note, key));
+                return (String::new(), format!("pip install failed{} (see venvs/{}.install.log)", note, key));
             }
             for c in &conflicts { conflict_relax.insert(c.clone()); }
             for r in new_relax { relax.insert(r); }
         }
         let mut r: Vec<_> = relax.iter().cloned().collect(); r.sort();
-        (String::new(), format!("pip install failed even after auto-relaxing {:?} (see {}.install.log)", r, key))
+        (String::new(), format!("pip install failed even after auto-relaxing {:?} (see venvs/{}.install.log)", r, key))
     }
 }
 
