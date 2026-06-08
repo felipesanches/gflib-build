@@ -1923,6 +1923,8 @@ impl Orchestrator {
                     builder: r.builder.clone(),
                     builder_version: r.builder_version.clone(),
                     crater: self.crater_by_slug.get(&r.slug).map(|s| s.token()).unwrap_or_default(),
+                    rebuild_note: crate::classify::rebuild_pending_note("failed", "", &r.error)
+                        .unwrap_or_default(),
                 });
                 let (cause, hint) = crate::classify::categorize_failure(&r.error);
                 let ent = fail_cat.entry(cause.to_string()).or_insert((0, Vec::new(), hint));

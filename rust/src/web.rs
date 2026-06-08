@@ -338,7 +338,7 @@ function renderSec(s){return secHdr(s.title,s.rows.length)+(s.rows.length?s.rows
 function taskRow(t){const m=TASK_MARK[t.status]||'?',cl=TASK_CLS[t.status]||'gr';
  const prog=t.total?(t.done+'/'+t.total):'',el=t.elapsed?hms(t.elapsed):'';
  return {segs:[[m+' '+L(t.name,26)+' '+L(prog,11)+Rp(el,8)+'  '+(t.detail||''),cl]],det:['task',t.key]}}
-function failRow(f){const segs=[[L(f.slug,34)+' ','r']];if(f.crater)segs.push(['[cr:'+L(f.crater,10)+'] ',craterCol(f.crater)]);segs.push([f.error||'','dr']);return {segs,rt:f.slug,det:['failed',f.slug]}}
+function failRow(f){const segs=[[L(f.slug,34)+' ','r']];if(f.rebuild_note)segs.push(['⟳ ','y']);if(f.crater)segs.push(['[cr:'+L(f.crater,10)+'] ',craterCol(f.crater)]);segs.push([f.error||'','dr']);return {segs,rt:f.slug,det:['failed',f.slug]}}
 function qRow(q){const kc={retry:'y',rebuild:'c'}[q.kind]||'g';const segs=[['  '+L(q.kind,8)+' ',kc],[L(q.slug||'',38)+' ','gr']];if(q.crater)segs.push(['cr:'+q.crater,craterCol(q.crater)]);return {segs,rt:q.slug,det:['queue',q.slug]}}
 // cohort member colour by build status: built=green, failed=red, building=yellow, else grey
 function famCls(st){return {built:'g',failed:'r',building:'y'}[st]||'muted'}
@@ -643,7 +643,7 @@ function openDetail(kind,id){
  } else if(kind=='built'){const b=findBy(snap.built_recent,'slug',id);if(!b)return;slug=id;title='Built: '+b.slug;
   lines=['backend: '+(b.backend||'?'),'output size: '+human(b.bytes),'vs shipped: '+(b.compare||'(not compared)'),'provenance: '+prov(b),'rebuild: gflib-build --only '+b.slug+' --rebuild --yes'];
  } else if(kind=='failed'){const f=findBy(snap.failures_recent,'slug',id);slug=id;
-  if(f){title='Failed: '+f.slug;lines=['provenance: '+prov(f),'rebuild: gflib-build --only '+f.slug+' --rebuild --yes','','error:','  '+(f.error||'')];}
+  if(f){title='Failed: '+f.slug;lines=['provenance: '+prov(f),'rebuild: gflib-build --only '+f.slug+' --rebuild --yes','','error:','  '+(f.error||'')];if(f.rebuild_note)lines.unshift('⟳ REBUILD PENDING — '+f.rebuild_note,'');}
   else{// not in the recent window — fall back to the persistent failure history
    const hist=snap.failure_history||[];let h=null;for(let i=hist.length-1;i>=0;i--)if(hist[i].slug==id){h=hist[i];break;}
    if(h){title='Failed: '+h.slug+' (from failure history)';lines=['cause: '+h.cause,'provenance: '+prov(h),'rebuild: gflib-build --only '+h.slug+' --rebuild --yes','','error:','  '+(h.error||'')];}

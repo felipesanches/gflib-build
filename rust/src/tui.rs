@@ -1759,6 +1759,10 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
             let slug = sections_for(snap, tab, fc_sel).get(section).and_then(|s| s.keys.get(sel).cloned());
             if let Some(slug) = slug {
                 if let Some(f) = snap.failures_recent.iter().find(|f| f.slug == slug) {
+                    if !f.rebuild_note.is_empty() {
+                        o.push(format!("⟳ REBUILD PENDING — {}", f.rebuild_note));
+                        o.push(String::new());
+                    }
                     o.push(format!("Failed: {}", f.slug));
                     o.push(format!("provenance: {}", prov_str(&f.compiler_version, &f.backend, &f.builder_version)));
                     o.push(format!("rebuild: gflib-build --only {} --rebuild --yes", f.slug));
@@ -1773,6 +1777,10 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
                     }
                 } else if let Some(h) = snap.failure_history.iter().rev().find(|h| h.slug == slug) {
                     // not in the recent window — render from the persistent failure history
+                    if let Some(note) = crate::classify::rebuild_pending_note("failed", "", &h.error) {
+                        o.push(format!("⟳ REBUILD PENDING — {}", note));
+                        o.push(String::new());
+                    }
                     o.push(format!("Failed: {}  (from failure history)", h.slug));
                     o.push(format!("cause: {}", h.cause));
                     o.push(format!("provenance: {}", prov_str(&h.compiler_version, &h.backend, &h.builder_version)));

@@ -125,6 +125,31 @@ pub fn is_auto_retry(cause: &str) -> bool {
     AUTO_RETRY_CATEGORIES.contains(&cause)
 }
 
+/// A banner for a family whose displayed result is NOT settled — a fresh attempt is queued, or its
+/// failure cause is auto-retried (so recent toolchain/config changes may already address the shown log).
+/// Returns None when the result is the current, final outcome. Used by both UIs to avoid presenting a
+/// stale failure log as if it were the last word.
+pub fn rebuild_pending_note(status: &str, queued_kind: &str, error: &str) -> Option<String> {
+    match status {
+        "queued" => Some(format!(
+            "A fresh {} of this family is queued — the log/error below is from the PREVIOUS attempt.",
+            if queued_kind == "rebuild" { "rebuild" } else { "attempt" }
+        )),
+        "failed" => {
+            let (cause, _) = categorize_failure(error);
+            if is_auto_retry(cause) {
+                Some(format!(
+                    "This failure ('{}') is auto-retried on the next run — recent toolchain/config changes may already address the log below, so it can be stale.",
+                    cause
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Causes an IMMEDIATE in-build retry can clear (the transient ones). Used by R6 (in-build retry).
 #[allow(dead_code)]
 const IN_BUILD_RETRY_CATEGORIES: [&str; 2] = ["transient fetch error", "internal/transient I/O"];
@@ -148,6 +173,19 @@ mod tests {
         assert_eq!(categorize_failure("missing system library: libcairo").0, "missing system library");
         assert_eq!(categorize_failure("not in mirror: deadbeef").0, "stale archive mirror");
         assert_eq!(categorize_failure("kaboom").0, "other");
+    }
+    #[test]
+    fn rebuild_pending_note_flags_stale_failures() {
+        // a queued family → its shown result is from a prior attempt
+        assert!(rebuild_pending_note("queued", "rebuild", "").unwrap().contains("rebuild"));
+        assert!(rebuild_pending_note("queued", "retry", "").is_some());
+        // a failed family whose cause is auto-retried (e.g. gelasio's dependency conflict) → stale-able
+        assert!(rebuild_pending_note("failed", "", "ResolutionImpossible / dependency conflict").is_some());
+        assert!(rebuild_pending_note("failed", "", "error: setuptools is required").is_some());
+        // a genuine non-auto-retry failure → no banner (the result IS the last word)
+        assert!(rebuild_pending_note("failed", "", "fontmake: cannot map glyph to U+0041").is_none());
+        // a built family → never a pending banner
+        assert!(rebuild_pending_note("built", "", "").is_none());
     }
     #[test]
     fn auto_retry_membership() {

@@ -112,6 +112,7 @@ pub struct FailItem {
     #[serde(default)] pub builder: String,
     #[serde(default)] pub builder_version: String,
     #[serde(default)] pub crater: String, // fontc_crater's verdict token (see crater::CraterStatus::token)
+    #[serde(default)] pub rebuild_note: String, // non-empty when a fresh attempt is pending (auto-retry) — the log may be stale
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
