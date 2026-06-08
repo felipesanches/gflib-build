@@ -2396,6 +2396,13 @@ fn run_builder(
     }
     cmd.current_dir(work)
         .env("SOURCE_DATE_EPOCH", "0")
+        // Use protobuf's pure-Python runtime so an OLD pinned toolchain (e.g. gftools 0.7.x / fontmake
+        // 2.x) whose generated _pb2.py was built against protobuf<=3.20 still loads under the modern
+        // protobuf installed in the venv (protobuf 4+ refuses the old C-descriptor codegen with
+        // "Descriptors cannot be created directly"). Downgrading protobuf isn't an option — 3.20 has no
+        // cp313 wheel. This is protobuf's own documented remedy; same wire format, identical output,
+        // negligibly slower (gftools only parses small METADATA.pb / config files).
+        .env("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
         .stdout(Stdio::from(logf))
         .stderr(Stdio::from(logf2));
     // own process group so a freeze/kill reaches fontmake/ninja/ttx descendants, not just python
