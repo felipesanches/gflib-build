@@ -475,6 +475,61 @@
         "python3 scripts/generate-guideline-source.py"
       ],
       "note": "ofl/playwriteauqldguides: Same Playwrite missing-generated-source: sources/generated/Playwrite-Guides.glyphs not produced before the build."
+    },
+    "ofl/charissil": {
+      "pre_build": [
+        "python3 -c \"import re,glob; fs=sorted(glob.glob('source/CharisSIL-*.ufo/glyphs/L_tnS_mA_E_gA_lef.S_ngS_tory.glif')); assert len(fs)==4, fs; [ ( (lambda s: (s, re.subn(r'\\\\s*<unicode hex=\\\"A7BB\\\"/>\\\\n','\\\\n',s,count=1)[0]))(open(f,encoding='utf-8').read()) ) for f in fs]; [ (lambda f: (lambda s: (lambda ns: (_ for _ in ()).throw(AssertionError('no change '+f)) if ns==s else open(f,'w',encoding='utf-8').write(ns))(re.subn(r'\\\\s*<unicode hex=\\\"A7BB\\\"/>\\\\n','\\\\n',s,count=1)[0]))(open(f,encoding='utf-8').read()))(f) for f in fs]\""
+      ],
+      "note": "ofl/charissil: Override config.yaml already exists in google/fonts (buildVariable:false, sources=source/CharisSIL{Roman,Itali"
+    },
+    "ofl/coda": {
+      "pre_build": [
+        "python3 -c \"import re; targets=[('coda/in-progress/Regular/src/Coda.ufo/glyphs/uni021A_.glif','021A'),('coda/in-progress/Heavy/src/Coda-Heavy-IN.ufo/glyphs/uni021A_.glif','021A'),('coda/in-progress/Regular/src/Coda.ufo/glyphs/uni021B_.glif','021B'),('coda/in-progress/Heavy/src/Coda-Heavy-IN.ufo/glyphs/uni021B_.glif','021B'),('coda/in-progress/Heavy/src/Coda-Heavy-IN.ufo/glyphs/uni0326.glif','0326')]; [ (lambda f,h: (lambda s: (lambda ns: (_ for _ in ()).throw(AssertionError('no change '+f)) if (ns==s or len(ns)==0) else open(f,'w',encoding='utf-8').write(ns))(re.subn(r'\\\\s*<unicode hex=\\\"'+h+r'\\\"/>\\\\n','\\\\n',s,count=1)[0]))(open(f,encoding='utf-8').read()))(f,h) for f,h in targets]\""
+      ],
+      "note": "ofl/coda: CORRECTED PATCH IS BROADER THAN THE ORIGINAL FINDING. The original triage proposed stripping only U+021A from "
+    },
+    "ofl/dongle": {
+      "pre_build": [
+        "python -c \"import zipfile; zipfile.ZipFile('sources/Dongle.zip').extract('Dongle.glyphs', 'sources')\""
+      ],
+      "note": "ofl/dongle: generate source for override"
+    },
+    "ofl/gowunbatang": {
+      "pre_build": [
+        "python -c \"import zipfile; zipfile.ZipFile('sources/GowunBatang.zip').extract('GowunBatang.glyphs', 'sources')\""
+      ],
+      "note": "ofl/gowunbatang: generate source for override"
+    },
+    "ofl/gupter": {
+      "pre_build": [
+        "cat > _patch_gupter.py <<'PYEOF'\n#!/usr/bin/env python3\n\"\"\"Pin the variable-font default master to the real Regular master.\nThe 2 masters sit at Weight design 66 (Regular) and 108 (Bold), but the\ngenerated designspace default lands at design 70 (the Regular *instance*),\nwhere no master exists -> fontmake 'Default source not found!'. Adding an\n'Axis Location' custom parameter to each master makes glyphsLib build the\nuser->design map from the masters (400->66, 700->108), so the user default\n(400) resolves to the real Regular master at design 66. Master outlines are\nuntouched; the Regular instance stays at its interpolated design 70.\"\"\"\nimport sys, glyphsLib\nfrom glyphsLib.classes import GSCustomParameter\npath = sys.argv[1]\nf = glyphsLib.GSFont(path)\nloc = {\"Regular\": 400, \"Bold\": 700}\nfor m in f.masters:\n    if m.name in loc and not any(cp.name == \"Axis Location\" for cp in m.customParameters):\n        m.customParameters.append(\n            GSCustomParameter(\"Axis Location\", [{\"Axis\": \"Weight\", \"Location\": loc[m.name]}])\n        )\nf.save(path)\nPYEOF",
+        "python3 _patch_gupter.py SOURCES/Gupter-Family.glyphs"
+      ],
+      "note": "ofl/gupter: Cohort c-516a7ac32cf5 (fontmake 3.12.1, glyphsLib 6.12.7). The cohort venv was found stripped to bare pip/setu"
+    },
+    "ofl/notosanssyriac": {
+      "pre_build": [
+        "python -c \"import glyphsLib; p='sources/NotoSansSyriac.glyphs'; f=glyphsLib.GSFont(p); f.customParameters['Axes']=[{'Name':'Weight','Tag':'wght'}]; f.save(p)\""
+      ],
+      "note": "ofl/notosanssyriac: Empty prebuild_commands was the failure cause (diagnosis correct, no patch recorded). Adapted the VERIFIED cha"
+    },
+    "ofl/notosanssyriaceastern": {
+      "pre_build": [
+        "python -c \"import glyphsLib; p='sources/NotoSansSyriacEastern.glyphs'; f=glyphsLib.GSFont(p); f.customParameters['Axes']=[{'Name':'Weight','Tag':'wght'}]; f.save(p)\""
+      ],
+      "note": "ofl/notosanssyriaceastern: Empty prebuild_commands was the failure cause. Verified the changa Axes-custom-param patch works on a Glyphs3 "
+    },
+    "ofl/notosansvithkuqi": {
+      "pre_build": [
+        "python -c \"import glyphsLib; p='sources/NotoSansVithkuqi.glyphs'; f=glyphsLib.GSFont(p); f.customParameters['Axes']=[{'Name':'Weight','Tag':'wght'}]; f.save(p)\""
+      ],
+      "note": "ofl/notosansvithkuqi: Empty prebuild_commands was the failure cause. Explicit single-axis Axes custom param suppresses glyphsLib's s"
+    },
+    "ofl/notoserifvithkuqi": {
+      "pre_build": [
+        "python -c \"import glyphsLib; p='sources/NotoSerifVithkuqi.glyphs'; f=glyphsLib.GSFont(p); f.customParameters['Axes']=[{'Name':'Weight','Tag':'wght'}]; f.save(p)\""
+      ],
+      "note": "ofl/notoserifvithkuqi: Empty prebuild_commands was the failure cause. Identical degenerate-wdth class and fix as the Sans companion. "
     }
   }
 }
