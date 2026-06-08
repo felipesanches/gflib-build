@@ -201,14 +201,14 @@ fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> std::
 const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
 <title>gflib-build dashboard</title>
 <style>
- :root{--g:#86efac;--r:#fca5a5;--c:#67e8f9;--y:#fde68a;--muted:#7c8aa0;--dr:#c77d7d;--w:#fff;--gr:#cbd5e1;--bg:#0b0e14;--panel:#11161f;--line:#1e293b;--secbg:#0e1420;--hover:#16202f;--pinbg:#1a1505}
- body[data-theme=light]{--g:#15803d;--r:#b91c1c;--c:#0e7490;--y:#a16207;--muted:#64748b;--dr:#b45454;--w:#0b1220;--gr:#1e293b;--bg:#f6f7f9;--panel:#ffffff;--line:#e2e8f0;--secbg:#eef2f7;--hover:#e8edf3;--pinbg:#fdf6e3}
+ :root{--g:#86efac;--r:#fca5a5;--c:#67e8f9;--y:#fde68a;--muted:#7c8aa0;--dr:#c77d7d;--w:#fff;--gr:#cbd5e1;--m:#f0abfc;--bg:#0b0e14;--panel:#11161f;--line:#1e293b;--secbg:#0e1420;--hover:#16202f;--pinbg:#1a1505}
+ body[data-theme=light]{--g:#15803d;--r:#b91c1c;--c:#0e7490;--y:#a16207;--muted:#64748b;--dr:#b45454;--w:#0b1220;--gr:#1e293b;--m:#a21caf;--bg:#f6f7f9;--panel:#ffffff;--line:#e2e8f0;--secbg:#eef2f7;--hover:#e8edf3;--pinbg:#fdf6e3}
  body{background:var(--bg);color:var(--gr);font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:10px 12px}
  /* W5: responsive multi-pane (overview sections side by side on wide screens) */
  .panes{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
  @media(max-width:900px){.panes{grid-template-columns:1fr}}
  .w5{font-size:11px}
- .g{color:var(--g)}.r{color:var(--r)}.c{color:var(--c)}.y{color:var(--y)}.muted{color:var(--muted)}.dr{color:var(--dr)}.w{color:var(--w)}.gr{color:var(--gr)}.b{font-weight:600}
+ .g{color:var(--g)}.r{color:var(--r)}.c{color:var(--c)}.y{color:var(--y)}.muted{color:var(--muted)}.dr{color:var(--dr)}.w{color:var(--w)}.gr{color:var(--gr)}.m{color:var(--m)}.b{font-weight:600}
  .t{font-size:15px;color:var(--w);font-weight:600}
  .sub{color:var(--c)}
  .right{float:right}
@@ -280,7 +280,9 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
 <script>
 let snap={}, tab='overview';
 // tab order MUST match the TUI's VIEWS
-const TABS=['config','overview','queue','cohorts','archive','built','packaging','tools','failures','stats','fontspector'];
+const TABS=['config','overview','queue','cohorts','archive','built','packaging','tools','failures','stats','fontspector','crater'];
+// colour a fontc_crater verdict token (magenta = fontc can't build it — the gold pairing on our built rows)
+function craterCol(tok){if(!tok)return 'muted';if(tok=='fontc-fail'||tok=='both-fail'||tok=='src-miss')return 'm';if(tok=='fmake-fail')return 'muted';if(tok[0]=='~')return 'y';return 'c'}
 // Migration-milestone glossary (keep in sync with tui.rs MILESTONES + docs/migration-milestones.md)
 const MILESTONES=[['M0','Measurement foundation — record compiler + exact version for every build attempt'],['M1','Full buildability — 100% of buildable families produce the expected fonts (any backend)'],['M2','fontc-gap map — every buildable family attempted with fontc, the result recorded'],['M3','fontc equivalence — fontc output equivalent to fontmake/shipped, at scale'],['M4','fontc majority — families that build correctly with fontc alone (no fontmake fallback)'],['M5','Python-free pipeline — Rust-native gftools-builder3, no Python pre-build or deps'],['M6','latest-fontc currency — the M4/M5 set re-validated on the latest fontc'],['M7','100% Rust — the whole library: latest fontc, equivalent output, zero Python']];
 // fontspector status → colour class (FAIL/FATAL/ERROR red · WARN yellow · PASS green · SKIP/INFO grey)
@@ -336,15 +338,17 @@ function renderSec(s){return secHdr(s.title,s.rows.length)+(s.rows.length?s.rows
 function taskRow(t){const m=TASK_MARK[t.status]||'?',cl=TASK_CLS[t.status]||'gr';
  const prog=t.total?(t.done+'/'+t.total):'',el=t.elapsed?hms(t.elapsed):'';
  return {segs:[[m+' '+L(t.name,26)+' '+L(prog,11)+Rp(el,8)+'  '+(t.detail||''),cl]],det:['task',t.key]}}
-function failRow(f){return {segs:[[L(f.slug,34)+' ','r'],[f.error||'','dr']],rt:f.slug,det:['failed',f.slug]}}
-function qRow(q){const kc={retry:'y',rebuild:'c'}[q.kind]||'g';return {segs:[['  '+L(q.kind,8)+' ',kc],[q.slug||'','gr']],rt:q.slug,det:['queue',q.slug]}}
+function failRow(f){const segs=[[L(f.slug,34)+' ','r']];if(f.crater)segs.push(['[cr:'+L(f.crater,10)+'] ',craterCol(f.crater)]);segs.push([f.error||'','dr']);return {segs,rt:f.slug,det:['failed',f.slug]}}
+function qRow(q){const kc={retry:'y',rebuild:'c'}[q.kind]||'g';const segs=[['  '+L(q.kind,8)+' ',kc],[L(q.slug||'',38)+' ','gr']];if(q.crater)segs.push(['cr:'+q.crater,craterCol(q.crater)]);return {segs,rt:q.slug,det:['queue',q.slug]}}
 // cohort member colour by build status: built=green, failed=red, building=yellow, else grey
 function famCls(st){return {built:'g',failed:'r',building:'y'}[st]||'muted'}
 function cohortRow(c){const segs=[[c.cached?'● ':'○ ',c.cached?'g':'muted'],[Rp(c.count,4)+'  '+L(c.key,14)+' ',!c.cached?'muted':(c.key=='base'?'w':'c')]];
  const f=c.families||[];if(!f.length)segs.push(['(no families yet)','muted']);else f.forEach((m,i)=>{if(i)segs.push([' | ','c']);segs.push([m.name,famCls(m.status)])});
  return {segs,det:['cohort',c.key]}}
 function builtRow(b){const comp=b.compiler_version||b.backend||'';
- return {segs:[[L(b.slug,32)+' ','g'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9)+'  '+(b.compare||''),'gr']],rt:b.slug,det:['built',b.slug]}}
+ const segs=[[L(b.slug,32)+' ','g'],[L(comp,24)+' ','c'],[Rp(human(b.bytes),9)+'  '+L(b.compare||'',8),'gr']];
+ if(b.crater)segs.push([' cr:'+b.crater,craterCol(b.crater)]); // magenta here = we built what fontc can't
+ return {segs,rt:b.slug,det:['built',b.slug]}}
 function packagingRow(b){const comp=b.compiler_version||b.backend||'';const ds=b.deb_status||'';
  let st,sc; if(ds=='validated'){st='validated';sc='g'}else if(ds=='built'){st='built';sc='c'}else if(ds=='failed'){st='deb-failed';sc='r'}else if(b.packaged){st='drafted';sc='y'}else{st='draftable';sc='gr'}
  return {segs:[[L(st,10)+' ',sc],[L(b.slug,32)+' ','gr'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9),'gr']],rt:b.slug,det:['package',b.slug]}}
@@ -447,6 +451,25 @@ function fsView(){const fs=snap.fontspector;
 function fsFamLink(slug){return '<span class="clk c" onclick="event.stopPropagation();openDetail(\'fsfamily\',\''+E(slug)+'\')">'+E(slug)+'</span>'}
 function toggleFsCheck(i){const e=document.getElementById('fsck'+i);if(e)e.style.display=e.style.display=='none'?'block':'none'}
 
+function craterView(){const cv=snap.crater;
+ if(!cv)return '<div class="sec">fontc_crater comparison</div><div class="ln muted">Not loaded. Put fontc_crater_targets.json in gflib-data (or run gfonts_agents’ fetch_crater_analysis.py), then refresh. --no-crater disables.</div>';
+ const partial=cv.complete?'':' <span class="y">[PARTIAL: diff-only fallback — run fetch_crater_analysis.py for the fontc/both-failed split]</span>';
+ let h='<div class="sec">fontc_crater comparison — summary'+partial+'</div>';
+ h+='<div class="ln muted">crater run '+E(cv.run)+' · fontc '+E((cv.fontc_rev||'').slice(0,12))+' · google/fonts '+E((cv.fonts_repo_sha||'').slice(0,12))+' · matched '+(cv.matched||0)+' families</div>';
+ h+='<div class="ln m b">  GOLD  we build · fontc can’t : '+(cv.we_build_fontc_cant||0)+'   (upstream-worthy build fixes)</div>';
+ h+='<div class="ln r">  REGR  we fail  · fontc built : '+(cv.we_fail_fontc_ok||0)+'   (our build bugs)</div>';
+ h+='<div class="ln g">  both build · identical       : '+(cv.both_ok_identical||0)+'</div>';
+ h+='<div class="ln y">  both build · output differs  : '+(cv.both_ok_diff||0)+'</div>';
+ h+='<div class="ln muted">crater verdicts (matched): match '+(cv.c_identical||0)+' · diff '+(cv.c_diff||0)+' · fontc-fail '+(cv.c_fontc_failed||0)+' · fmake-fail '+(cv.c_fontmake_failed||0)+' · both-fail '+(cv.c_both_failed||0)+' · src-miss '+(cv.c_repo_failed||0)+'</div>';
+ const gold=cv.gold_families||[],regr=cv.regression_families||[];
+ h+='<div class="sec">GOLD — we build, fontc_crater’s fontc cannot ('+(cv.we_build_fontc_cant||0)+')</div>';
+ h+='<div class="ln muted">refresh this set with:  gflib-build --retrigger-crater fontc-failed</div>';
+ h+=gold.length?gold.map(s=>'<div class="ln clk" onclick="openDetail(\'built\',\''+E(s)+'\')"><span class="m">'+E(L(s,50))+'</span> <span class="muted">fontc can’t build this — our build fix is upstream-worthy</span></div>').join(''):'<div class="ln muted">(none)</div>';
+ h+='<div class="sec">Regressions — fontc builds it, we fail ('+(cv.we_fail_fontc_ok||0)+')</div>';
+ h+=regr.length?regr.map(s=>'<div class="ln clk" onclick="openDetail(\'failed\',\''+E(s)+'\')"><span class="r">'+E(L(s,50))+'</span> <span class="muted">fontc builds this but we don’t — likely our bug</span></div>').join(''):'<div class="ln muted">(none)</div>';
+ return h;
+}
+
 function showIf(k,cf){const s=x=>(cf[x]==null?'':''+cf[x]);
  if(k=='google_fonts')return s('source')=='metadata';
  if(k=='fontc_bin')return s('backend')!='fontmake';
@@ -531,6 +554,7 @@ function render(){
  if(tab=='config')body+=cfgView();
  else if(tab=='archive')body+=archiveView();
  else if(tab=='fontspector')body+=fsView();
+ else if(tab=='crater')body+=craterView();
  else if(tab=='overview')body+='<div class="panes">'+sections(tab).map(s=>'<div>'+renderSec(s)+'</div>').join('')+'</div>'; // multi-pane
  else{body+=(tab=='stats'?statsPrefix():'')+sections(tab).map(renderSec).join('');}
  document.getElementById('body').innerHTML=body;

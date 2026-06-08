@@ -20,8 +20,8 @@ use std::time::Duration;
 
 // Tab order MUST match the web UI's TABS (a user switching between the terminal and the browser
 // sees the same tabs in the same order).
-const TABS: [&str; 11] = [
-    "config", "overview", "queue", "cohorts", "archive", "built", "packaging", "tools", "failures", "stats", "fontspector",
+const TABS: [&str; 12] = [
+    "config", "overview", "queue", "cohorts", "archive", "built", "packaging", "tools", "failures", "stats", "fontspector", "crater",
 ];
 
 /// Succinct glossary of the Python->Rust migration milestones, shown in the tools tab so a UI label
@@ -751,11 +751,33 @@ fn task_color(status: &str) -> Color {
     }
 }
 
+/// Colour a fontc_crater verdict token. The fontc-can't-build cases (fontc-fail / both-fail /
+/// src-miss) are magenta so they pop on our BUILT rows — that pairing is the gold (we compile what
+/// fontc cannot). A fontmake-only failure is dim (fontc is fine there); a diff is yellow.
+fn crater_color(tok: &str) -> Color {
+    if tok.is_empty() {
+        Color::DarkGrey
+    } else if tok == "fontc-fail" || tok == "both-fail" || tok == "src-miss" {
+        Color::Magenta
+    } else if tok == "fmake-fail" {
+        Color::DarkGrey
+    } else if tok.starts_with('~') {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    }
+}
+
 fn failures_section(snap: &Snapshot) -> SectionR {
-    let rows = snap.failures_recent.iter().map(|f| vec![
-        (format!("{:<34} ", f.slug), Color::Red),
-        (f.error.clone(), Color::DarkRed),
-    ]).collect();
+    let rows = snap.failures_recent.iter().map(|f| {
+        let mut segs = vec![(format!("{:<34} ", f.slug), Color::Red)];
+        if !f.crater.is_empty() {
+            // crater building this while we fail = a regression worth a closer look
+            segs.push((format!("[cr:{:<10}] ", f.crater), crater_color(&f.crater)));
+        }
+        segs.push((f.error.clone(), Color::DarkRed));
+        segs
+    }).collect();
     SectionR {
         title: "Failures — newest first (current)".into(),
         dview: "failures",
@@ -780,10 +802,16 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
         }
         "queue" => {
             let kcol = |kind: &str| match kind { "retry" => Color::Yellow, "rebuild" => Color::Cyan, _ => Color::Green };
-            let rows = snap.queued_list.iter().map(|q| vec![
-                (format!("  {:<8} ", q.kind), kcol(&q.kind)),
-                (q.slug.clone(), Color::Grey),
-            ]).collect();
+            let rows = snap.queued_list.iter().map(|q| {
+                let mut segs = vec![
+                    (format!("  {:<8} ", q.kind), kcol(&q.kind)),
+                    (format!("{:<38} ", head(&q.slug, 38)), Color::Grey),
+                ];
+                if !q.crater.is_empty() {
+                    segs.push((format!("cr:{}", q.crater), crater_color(&q.crater)));
+                }
+                segs
+            }).collect();
             vec![SectionR {
                 title: "Queued — priority order (variable + larger families first)".into(),
                 dview: "queue", rows, keys: snap.queued_list.iter().map(|q| q.slug.clone()).collect(),
@@ -799,14 +827,19 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
         "built" => {
             let rows = snap.built_recent.iter().map(|b| {
                 let comp = if !b.compiler_version.is_empty() { b.compiler_version.clone() } else { b.backend.clone() };
-                vec![
+                let mut segs = vec![
                     (format!("{:<32} ", head(&b.slug, 32)), Color::Green),
-                    (format!("{:<26} ", head(&comp, 26)), Color::Cyan),
-                    (format!("{:>9}  {}", human(b.bytes), b.compare), Color::Grey),
-                ]
+                    (format!("{:<24} ", head(&comp, 24)), Color::Cyan),
+                    (format!("{:>9}  {:<8}", human(b.bytes), b.compare), Color::Grey),
+                ];
+                if !b.crater.is_empty() {
+                    // magenta token here = we built a family fontc_crater's fontc can't (the gold case)
+                    segs.push((format!(" cr:{}", b.crater), crater_color(&b.crater)));
+                }
+                segs
             }).collect();
             vec![SectionR {
-                title: "Built — successes  (slug · compiler+version · size · vs-shipped)".into(),
+                title: "Built — successes  (slug · compiler+version · size · vs-shipped · crater)".into(),
                 dview: "built", rows, keys: snap.built_recent.iter().map(|b| b.slug.clone()).collect(),
             }]
         }
@@ -993,6 +1026,47 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                     SectionR {
                         title: "Families — worst status first".into(),
                         dview: "fsfamily", rows: frows, keys: fs.per_family.iter().map(|f| f.slug.clone()).collect(),
+                    },
+                ]
+            }
+        },
+        "crater" => match &snap.crater {
+            None => vec![SectionR {
+                title: "fontc_crater — not loaded  (put fontc_crater_targets.json in gflib-data, or run gfonts_agents' fetch_crater_analysis.py; --no-crater disables)".into(),
+                dview: "", rows: Vec::new(), keys: Vec::new(),
+            }],
+            Some(cv) => {
+                let partial = if cv.complete { String::new() } else {
+                    "   [PARTIAL: diff-only fallback — run fetch_crater_analysis.py for the fontc/both-failed split]".into()
+                };
+                let sum = vec![
+                    vec![(format!("crater run {} · fontc {} · google/fonts {}{}",
+                        cv.run, head(&cv.fontc_rev, 12), head(&cv.fonts_repo_sha, 12), partial), Color::Grey)],
+                    vec![(format!("matched {} of our families to a crater verdict", cv.matched), Color::White)],
+                    vec![(format!("  GOLD  we build · fontc can't : {:>4}   (upstream-worthy build fixes)", cv.we_build_fontc_cant), Color::Magenta)],
+                    vec![(format!("  REGR  we fail  · fontc built : {:>4}   (our build bugs)", cv.we_fail_fontc_ok), Color::Red)],
+                    vec![(format!("  both build · identical       : {:>4}", cv.both_ok_identical), Color::Green)],
+                    vec![(format!("  both build · output differs  : {:>4}", cv.both_ok_diff), Color::Yellow)],
+                    vec![(format!("crater verdicts (matched): match {} · diff {} · fontc-fail {} · fmake-fail {} · both-fail {} · src-miss {}",
+                        cv.c_identical, cv.c_diff, cv.c_fontc_failed, cv.c_fontmake_failed, cv.c_both_failed, cv.c_repo_failed), Color::DarkGrey)],
+                ];
+                let grows = cv.gold_families.iter().map(|s| vec![
+                    (format!("{:<50} ", head(s, 50)), Color::Magenta),
+                    ("fontc can't build this — our build fix is upstream-worthy".into(), Color::DarkGrey),
+                ]).collect();
+                let rrows = cv.regression_families.iter().map(|s| vec![
+                    (format!("{:<50} ", head(s, 50)), Color::Red),
+                    ("fontc builds this but we don't — likely our bug".into(), Color::DarkGrey),
+                ]).collect();
+                vec![
+                    SectionR { title: "fontc_crater comparison — summary".into(), dview: "", rows: sum, keys: Vec::new() },
+                    SectionR {
+                        title: format!("GOLD — we build, fontc_crater's fontc cannot ({})   ·   refresh with:  --retrigger-crater fontc-failed", cv.we_build_fontc_cant),
+                        dview: "built", rows: grows, keys: cv.gold_families.clone(),
+                    },
+                    SectionR {
+                        title: format!("Regressions — fontc builds it, we fail ({})", cv.we_fail_fontc_ok),
+                        dview: "failures", rows: rrows, keys: cv.regression_families.clone(),
                     },
                 ]
             }
