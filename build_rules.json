@@ -44,16 +44,53 @@
       ]
     },
     "ofl/lxgwwenkaimonotc": {
-      "note": "aaronbell/LxgwWenkaiTC (CJK): Makefile 'build: extract merge export' — extract.py decompresses the .ufoz archives and merge.py generates the UFO+designspace under sources/build/ that sources/project.yaml references. Heavy build.",
+      "note": "aaronbell/LxgwWenkaiTC (CJK): Makefile 'build: extract merge export' \u2014 extract.py decompresses the .ufoz archives and merge.py generates the UFO+designspace under sources/build/ that sources/project.yaml references. Heavy build.",
       "pre_build": [
         "python3 sources/scripts/extract.py",
         "python3 sources/scripts/merge.py"
       ]
     },
     "ofl/moiraione": {
-      "note": "JAMO-TYPEFACE/Moirai: Sources/config.yaml references 'Moirai.glyphs' but the committed file is 'Sources/moirai.glyphs' (lowercase) — works on case-insensitive macOS, fails on Linux. Stage the correctly-cased name.",
+      "note": "JAMO-TYPEFACE/Moirai: Sources/config.yaml references 'Moirai.glyphs' but the committed file is 'Sources/moirai.glyphs' (lowercase) \u2014 works on case-insensitive macOS, fails on Linux. Stage the correctly-cased name.",
       "pre_build": [
         "cp Sources/moirai.glyphs Sources/Moirai.glyphs"
+      ]
+    },
+    "ofl/biryani": {
+      "note": "ofl/biryani: source path contains spaces; gftools-builder's ninja rules interpolate $in UNQUOTED, so fontmake word-splits the path at job runtime. Stage to a space-free path the override config.yaml references (2 masters, instantiateUfo retained).",
+      "pre_build": [
+        "mkdir -p sources && cp -a \"Source Files/Biryani 20150307.glyphs\" \"sources/Biryani20150307.glyphs\""
+      ]
+    },
+    "ofl/chakrapetch": {
+      "note": "ofl/chakrapetch: source path contains spaces; gftools-builder's ninja rules interpolate $in UNQUOTED, so fontmake word-splits the path at job runtime. Stage to a space-free path the override config.yaml references (6 masters, instantiateUfo retained).",
+      "pre_build": [
+        "mkdir -p sources && cp -a \"source/Chakra Petch.glyphs\" \"sources/ChakraPetch.glyphs\""
+      ]
+    },
+    "ofl/cinzeldecorative": {
+      "note": "ofl/cinzeldecorative: source path contains spaces; gftools-builder's ninja rules interpolate $in UNQUOTED, so fontmake word-splits the path at job runtime. Stage to a space-free path the override config.yaml references (2 masters, instantiateUfo retained).",
+      "pre_build": [
+        "mkdir -p sources && cp -a \"Glyphs Files/Cinzel_Regular.glyphs\" \"sources/Cinzel_Regular.glyphs\"",
+        "mkdir -p sources && cp -a \"Glyphs Files/Cinzel_Decorative.glyphs\" \"sources/Cinzel_Decorative.glyphs\""
+      ]
+    },
+    "ofl/cormorantupright": {
+      "note": "ofl/cormorantupright: source path contains spaces; gftools-builder's ninja rules interpolate $in UNQUOTED, so fontmake word-splits the path at job runtime. Stage to a space-free path the override config.yaml references (2 masters, instantiateUfo retained).",
+      "pre_build": [
+        "mkdir -p sources && cp -a \"4. Glyphs Source Files/CormorantUpright.glyphs\" \"sources/CormorantUpright.glyphs\""
+      ]
+    },
+    "ofl/martel": {
+      "note": "ofl/martel: source path contains spaces; gftools-builder's ninja rules interpolate $in UNQUOTED, so fontmake word-splits the path at job runtime. Stage to a space-free path the override config.yaml references (3 masters, instantiateUfo retained).",
+      "pre_build": [
+        "mkdir -p sources && cp -a \"Martel Source Files/Martel 20150306.glyphs\" \"sources/Martel20150306.glyphs\""
+      ]
+    },
+    "ofl/martelsans": {
+      "note": "ofl/martelsans: source path contains spaces; gftools-builder's ninja rules interpolate $in UNQUOTED, so fontmake word-splits the path at job runtime. Stage to a space-free path the override config.yaml references (2 masters, instantiateUfo retained).",
+      "pre_build": [
+        "mkdir -p sources && cp -a \"Martel Sans Source Files/Martel_Sans_20150305.glyphs\" \"sources/Martel_Sans_20150305.glyphs\""
       ]
     }
   }
