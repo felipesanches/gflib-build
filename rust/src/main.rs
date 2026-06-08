@@ -505,6 +505,20 @@ BUILD:
   --timeout <SECS>              per-build timeout (default: none)
   --compare                     sha256-compare built fonts to shipped (metadata mode)
   --retry-failed / --rebuild    re-attempt failures / ignore prior state
+  --retry-category <CAUSE>      re-attempt only failures with this cause (see the failures tab)
+  --retrigger <a,b>             force-rebuild an explicit slug list regardless of prior status
+                                (the "I just applied a fix, rebuild the affected families" path)
+
+FONTC_CRATER COMPARISON (compare our build status to fontc_crater's latest run):
+  --crater <PATH>               fontc_crater status file (default: auto-resolve
+                                fontc_crater_targets.json, then the diff-only analysis file, in
+                                gflib-data and the sibling gfonts_agents/data)
+  --no-crater                   disable the fontc_crater comparison
+  --retrigger-crater <MODE>     force-rebuild families by crater verdict, where MODE is
+                                fontc-failed | both-failed | failed | diff. e.g.
+                                --retrigger-crater fontc-failed rebuilds every family
+                                fontc_crater's fontc cannot compile — to find the ones WE can
+                                (their config.yaml / build rules then unblock crater too).
 
 UI:
   --ui <auto|curses|plain|json|none|web>   frontend (default auto)
