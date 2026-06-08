@@ -63,6 +63,9 @@ pub struct Res {
     pub retries: u32,
     #[serde(default)]
     pub timings: BTreeMap<String, f64>, // per-operation seconds for this family (extract/venv/build/…)
+    #[serde(default)]
+    pub config_sig: String, // content hash of the gflib-build override config (+ build_rules entry) used
+                            // for this attempt; lets the daemon auto-rebuild when we change the fix
 }
 
 // ---- snapshot sub-records (mirrors of the dicts Python's snapshot() emits) ----

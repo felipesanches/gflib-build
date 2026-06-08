@@ -32,6 +32,22 @@ pub const MAX_JOBS: usize = 256;
 /// clone). The "retry override-fixed" UI action re-queues failed families whose override has it.
 pub const OVERRIDE_MARKER: &str = "# gflib-build override";
 
+/// Signature of a family's effective gflib-build fix: a hash of the override config.yaml text plus its
+/// build_rules pre-build entry. Empty unless the config carries OVERRIDE_MARKER, so only fixes WE authored
+/// are tracked (never a natural upstream config.yaml). The config-watcher re-queues a failed family when
+/// this changes — editing the override or its staging step both flip the hash.
+pub fn config_signature(config_text: &str, rule: Option<&Vec<String>>) -> String {
+    if !config_text.contains(OVERRIDE_MARKER) {
+        return String::new();
+    }
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    config_text.hash(&mut h);
+    rule.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// Mutable shared state, guarded by one mutex; `snapshot()` reads it, workers mutate it.
 pub struct Shared {
     pub results: BTreeMap<String, Res>,
@@ -429,6 +445,7 @@ impl Orchestrator {
         self.spawn_status_writer();
         self.spawn_size_thread();
         self.spawn_control_watcher();
+        self.spawn_config_watcher();
     }
 
     /// --dry-run: when the replayed build finishes, pause a few seconds (so the 'complete' state shows)
@@ -722,6 +739,12 @@ impl Orchestrator {
                 slug
             };
             self.active.fetch_add(1, Ordering::Relaxed);
+            // record which gflib-build override config this attempt used, so the config-watcher can tell
+            // when we've since changed the fix and auto-rebuild (computed off-lock — it reads a file).
+            let sig = self.config_sig(&slug);
+            if let Some(r) = self.shared.lock().unwrap().results.get_mut(&slug) {
+                r.config_sig = sig;
+            }
             self.build_one(&slug, id);
             self.active.fetch_sub(1, Ordering::Relaxed);
             // a build just finished → refill the freed slot by thawing the oldest frozen build
@@ -1293,6 +1316,83 @@ impl Orchestrator {
                     }
                 }
                 thread::sleep(Duration::from_millis(700));
+            }
+        });
+    }
+
+    /// Content signature of the gflib-build override config.yaml (+ this family's build_rules entry) for
+    /// `slug`. Empty unless google/fonts has an override carrying OVERRIDE_MARKER — so only families we've
+    /// written a fix for are tracked, never ones with a natural upstream config.yaml.
+    fn config_sig(&self, slug: &str) -> String {
+        let Some(gf) = self.cfg.google_fonts.as_ref() else {
+            return String::new();
+        };
+        let txt = std::fs::read_to_string(gf.join(slug).join("config.yaml")).unwrap_or_default();
+        config_signature(&txt, self.build_rules.get(slug))
+    }
+
+    /// Auto-rebuild watcher: when a FAILED family's override-config signature changes (we wrote or edited a
+    /// fix), re-queue it — the hands-free equivalent of the "retry config-fixed" button. Re-queues only on
+    /// an actual signature change, so a still-failing build never loops; a removed override (empty sig) is
+    /// left alone. On the first run after a fix is written, the persisted sig is stale ("") so it fires once.
+    fn spawn_config_watcher(self: &Arc<Self>) {
+        if self.cfg.dry_run
+            || self.cfg.google_fonts.is_none()
+            || std::env::var_os("GFLIB_NO_AUTO_REBUILD").is_some()
+        {
+            return;
+        }
+        let me = Arc::clone(self);
+        thread::spawn(move || {
+            while !me.stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_secs(4));
+                let failed: Vec<(String, String)> = {
+                    let sh = me.shared.lock().unwrap();
+                    if sh.paused {
+                        continue;
+                    }
+                    sh.results
+                        .values()
+                        .filter(|r| r.status == "failed")
+                        .map(|r| (r.slug.clone(), r.config_sig.clone()))
+                        .collect()
+                };
+                let changed: Vec<String> = failed
+                    .into_iter()
+                    .filter(|(slug, old)| {
+                        let cur = me.config_sig(slug);
+                        cur != *old && !cur.is_empty()
+                    })
+                    .map(|(slug, _)| slug)
+                    .collect();
+                if changed.is_empty() {
+                    continue;
+                }
+                let mut n = 0;
+                {
+                    let mut sh = me.shared.lock().unwrap();
+                    for slug in &changed {
+                        if let Some(r) = sh.results.get_mut(slug) {
+                            if r.status != "failed" {
+                                continue; // re-check under the lock — may have been re-queued meanwhile
+                            }
+                            r.status = "queued".into();
+                            r.queued_kind = "rebuild".into();
+                            r.error.clear();
+                            sh.queue.push_back(slug.clone());
+                            n += 1;
+                        }
+                    }
+                    if n > 0 {
+                        sh.control_log.push(format!(
+                            "auto-rebuild: {} failed families whose override config changed",
+                            n
+                        ));
+                    }
+                }
+                if n > 0 {
+                    me.cond.notify_all();
+                }
             }
         });
     }
@@ -2797,6 +2897,23 @@ mod tests {
         assert_eq!(mirror_path(ar, "https://github.com/googlefonts/foo"), Path::new("/arch/googlefonts/foo.git"));
         assert_eq!(mirror_path(ar, "https://github.com/googlefonts/foo.git"), Path::new("/arch/googlefonts/foo.git"));
         assert_eq!(mirror_path(ar, "git@github.com:owner/bar.git"), Path::new("/arch/owner/bar.git"));
+    }
+
+    #[test]
+    fn config_signature_tracks_only_marked_overrides() {
+        // a natural upstream config (no marker) is never tracked -> empty -> never auto-rebuilt
+        assert_eq!(config_signature("sources:\n  - Foo.glyphs\n", None), "");
+        // a gflib-build override changes signature when its text changes...
+        let a = config_signature("# gflib-build override\nrecipe:\n  x:\n    - source: a\n", None);
+        let b = config_signature("# gflib-build override\nrecipe:\n  x:\n    - source: b\n", None);
+        assert!(!a.is_empty() && a != b);
+        // ...and when only its build_rules (staging) entry changes
+        let rule1 = vec!["cp a sources/a".to_string()];
+        let rule2 = vec!["cp b sources/b".to_string()];
+        let txt = "# gflib-build override\nrecipe:\n  x:\n    - source: a\n";
+        assert_ne!(config_signature(txt, Some(&rule1)), config_signature(txt, Some(&rule2)));
+        // identical inputs are stable (so a still-failing rebuild doesn't loop)
+        assert_eq!(config_signature(txt, Some(&rule1)), config_signature(txt, Some(&rule1)));
     }
 
     #[test]
