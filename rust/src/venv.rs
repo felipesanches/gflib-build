@@ -646,10 +646,13 @@ impl VenvManager {
                 String::from_utf8_lossy(&o.stdout).chars().take(200).collect::<String>())),
             Err(e) => return (String::new(), format!("venv create failed: {}", e)),
         }
-        // seed setuptools+wheel (legacy sdists import pkg_resources at build time)
+        // Seed setuptools<81 + wheel. setuptools 81 deprecated and 82 REMOVED pkg_resources, but this
+        // pinned font toolchain (gftools/fontmake + many deps) imports pkg_resources at BOTH build time
+        // (legacy sdists) and RUNTIME (`python -m gftools.builder` won't even import otherwise).
+        // setuptools' own warning says to "pin to Setuptools<81", so this is a real toolchain requirement.
         let _ = Command::new(&py)
             .args(["-m", "pip", "install", "-q", "--disable-pip-version-check", "--cache-dir",
-                   &self.pip_cache.to_string_lossy(), "setuptools", "wheel"])
+                   &self.pip_cache.to_string_lossy(), "setuptools<81", "wheel"])
             .output();
 
         let base_pkgs: HashSet<String> =
@@ -673,10 +676,12 @@ impl VenvManager {
 
         let mut relax: HashSet<String> = self.inner.lock().unwrap().relaxed.iter().cloned().collect();
         let mut conflict_relax: HashSet<String> = HashSet::new();
-        // targeted, per-cohort fallback (NOT a global pin): only enabled after a legacy sdist fails to
-        // build because setuptools >= 81 removed pkg_resources. Applied to pip's build env via PIP_CONSTRAINT.
-        let mut setuptools_pin = false;
+        // Constrain setuptools<81 for the whole install INCLUDING pip's isolated build envs (via
+        // PIP_CONSTRAINT). The pinned toolchain (gftools/fontmake + deps) imports pkg_resources, which
+        // setuptools 82 removed; setuptools' own warning says to "pin to Setuptools<81". So it's a real
+        // toolchain requirement, applied uniformly — not a per-cohort workaround.
         let con_path = vdir.join("gflib-constraints.txt");
+        let _ = std::fs::write(&con_path, "setuptools<81\n");
         // SELF-HEALING install: drop a pin pip can't satisfy / a base pin a cohort conflicts with, retry.
         for attempt in 0..8 {
             let eff = relax_requirements(&src_lines, &relax);
@@ -702,12 +707,7 @@ impl VenvManager {
                     let mut cmd = Command::new(&py);
                     cmd.args(["-m", "pip", "install", "--disable-pip-version-check", "--cache-dir",
                               &self.pip_cache.to_string_lossy(), "-r", &eff_path.to_string_lossy()]);
-                    if setuptools_pin {
-                        // constrain setuptools in BOTH the venv and pip's isolated build env so a legacy
-                        // sdist that imports pkg_resources at build time can build (only this cohort).
-                        let _ = std::fs::write(&con_path, "setuptools<81\nwheel\n");
-                        cmd.env("PIP_CONSTRAINT", &con_path);
-                    }
+                    cmd.env("PIP_CONSTRAINT", &con_path); // setuptools<81 in the venv AND build envs
                     cmd.stdout(Stdio::from(lf))
                         .stderr(lf2.map(Stdio::from).unwrap_or(Stdio::null()))
                         .status()
@@ -765,19 +765,6 @@ impl VenvManager {
                     return (String::new(), format!(
                         "transient: too many open files (system fd pressure) — retry (see {}.install.log)",
                         key));
-                }
-                // No pin left to relax. If a legacy sdist that MUST build (no wheel) failed only because
-                // setuptools >= 81 removed pkg_resources, retry THIS cohort once with a targeted
-                // setuptools<81 constraint (via PIP_CONSTRAINT, reaching pip's build env) — not a global pin.
-                if !setuptools_pin && log_text.to_lowercase().contains("no module named 'pkg_resources'") {
-                    setuptools_pin = true;
-                    let mut inner = self.inner.lock().unwrap();
-                    if inner.override_recorded.insert(format!("setuptools81:{}", key)) {
-                        inner.relaxations.push(format!(
-                            "cohort {}: pinned setuptools<81 for the build env (a legacy sdist needs pkg_resources)",
-                            key));
-                    }
-                    continue;
                 }
                 // nothing NEW to relax → a genuine failure; classify it like the Python tool
                 if let Some(syslib) = scan_missing_system_dep(&log_text) {
