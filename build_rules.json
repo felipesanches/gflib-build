@@ -92,6 +92,12 @@
       "pre_build": [
         "mkdir -p sources && cp -a \"Martel Sans Source Files/Martel_Sans_20150305.glyphs\" \"sources/Martel_Sans_20150305.glyphs\""
       ]
+    },
+    "ofl/bebasneue": {
+      "pre_build": [
+        "mkdir -p sources && cp -a \"sources/BebasNeueV2.0(2018).glyphs\" \"sources/BebasNeueV2.02018.glyphs\""
+      ],
+      "note": "ofl/bebasneue: source filename has parentheses (shell-special in the unquoted ninja $in); stage to a clean path the override config references."
     }
   }
 }
