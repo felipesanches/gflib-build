@@ -759,13 +759,6 @@ impl VenvManager {
                 }
             }
             if new_relax.is_empty() {
-                // the box's virtiofs fd exhaustion (ENFILE) can kill a heavy pip install mid-way — that's
-                // transient (auto-retried on the next build), not a real dependency failure.
-                if log_text.to_lowercase().contains("too many open files") {
-                    return (String::new(), format!(
-                        "transient: too many open files (system fd pressure) — retry (see {}.install.log)",
-                        key));
-                }
                 // nothing NEW to relax → a genuine failure; classify it like the Python tool
                 if let Some(syslib) = scan_missing_system_dep(&log_text) {
                     return (String::new(), format!("missing system library: {} (see {}.install.log)", syslib, key));
