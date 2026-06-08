@@ -20,6 +20,12 @@ pub fn is_transient_clone_error(err: &str) -> bool {
 /// Map a failure message to a short CAUSE + an actionable HINT (verbatim from Python).
 pub fn categorize_failure(error: &str) -> (&'static str, &'static str) {
     let low = error.to_lowercase();
+    if low.contains("too many open files") {
+        return (
+            "transient fetch error",
+            "the build host briefly ran out of file handles (virtiofs fd pressure) — retried automatically each time you start the build",
+        );
+    }
     if low.contains("no module named 'gftools'")
         || low.contains("no module named gftools")
         || low.contains("could not launch builder")

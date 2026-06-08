@@ -279,6 +279,7 @@ pub fn parse_unsatisfiable(text: &str) -> HashSet<String> {
 /// rather than blanket-pinning the build toolchain.
 pub fn parse_failed_wheel_builds(text: &str) -> HashSet<String> {
     let mut out = HashSet::new();
+    // (1) the explicit summary forms pip prints when a wheel BUILD (not metadata) fails.
     for marker in ["Failed building wheel for ", "Failed to build "] {
         let mut rest = text;
         while let Some(pos) = rest.find(marker) {
@@ -303,6 +304,57 @@ pub fn parse_failed_wheel_builds(text: &str) -> HashSet<String> {
                 }
             }
             rest = &after[1.min(after.len())..];
+        }
+    }
+    // (2) Modern pip (24+) fails an sdist during "Getting requirements to build wheel" with a bare
+    //     `subprocess-exited-with-error` and names NO package in a summary line. The failing package is
+    //     the most recent `Collecting <pkg>` before the error (pip builds an sdist's metadata right
+    //     after collecting it); a package's own `Building <pkg> version …` banner names it directly too.
+    let mut last_collecting: Option<String> = None;
+    for ln in text.lines() {
+        let t = ln.trim();
+        if let Some(rest) = t.strip_prefix("Collecting ") {
+            let tok = take_pkg(rest);
+            if !tok.is_empty() {
+                last_collecting = Some(tok.to_lowercase());
+            }
+        } else if let Some(rest) = t.strip_prefix("Building ") {
+            if rest.contains(" version ") {
+                // "Building lxml version 5.2.1." (not "Building wheel for X")
+                let tok = take_pkg(rest);
+                if !tok.is_empty() {
+                    out.insert(tok.to_lowercase());
+                }
+            }
+        } else if t.contains("did not run successfully") || t.contains("subprocess-exited-with-error") {
+            if let Some(p) = &last_collecting {
+                out.insert(p.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Packages pip is BUILDING from an sdist (its `Collecting <pkg>` is followed by a `.tar.gz`/`.zip`
+/// download, not a wheel). On a build failure we relax ALL of them in one pass so pip backtracks to
+/// versions that ship a binary wheel — the pre-py3.13 freeze pins dozens of pre-cp313 versions, and
+/// relaxing one-per-attempt is too slow (and risks an interrupted run on this fd-constrained box).
+pub fn parse_sdist_packages(text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut pending: Option<String> = None;
+    for ln in text.lines() {
+        let t = ln.trim();
+        if let Some(rest) = t.strip_prefix("Collecting ") {
+            let tok = take_pkg(rest);
+            pending = if tok.is_empty() { None } else { Some(tok.to_lowercase()) };
+        } else if t.starts_with("Using cached ") || t.starts_with("Downloading ") {
+            if t.contains(".tar.gz") || t.contains(".zip") {
+                if let Some(p) = pending.take() {
+                    out.insert(p);
+                }
+            } else {
+                pending = None; // a wheel — not a build candidate
+            }
         }
     }
     out
@@ -682,18 +734,19 @@ impl VenvManager {
             let log_text = std::fs::read_to_string(&log).unwrap_or_default();
             let bad = parse_unsatisfiable(&log_text);
             let conflicts = parse_conflict_pins(&log_text, &base_pkgs);
-            // a stale pin whose sdist won't build here → relax it so pip takes a wheel version instead
+            // a stale pin whose sdist won't build here → relax it so pip takes a wheel version instead.
+            // When ANY build fails, relax EVERY sdist-built package at once (the pre-py3.13 freeze pins
+            // many pre-cp313 versions) so we converge in ~1 retry rather than one-per-attempt.
             let failed_builds = parse_failed_wheel_builds(&log_text);
-            let new_relax: HashSet<String> = bad
-                .union(&conflicts)
-                .cloned()
-                .collect::<HashSet<_>>()
-                .union(&failed_builds)
-                .cloned()
-                .collect::<HashSet<_>>()
-                .difference(&relax)
-                .cloned()
-                .collect();
+            let sdist = if failed_builds.is_empty() {
+                HashSet::new()
+            } else {
+                parse_sdist_packages(&log_text)
+            };
+            let mut candidates: HashSet<String> = bad.union(&conflicts).cloned().collect();
+            candidates.extend(failed_builds.iter().cloned());
+            candidates.extend(sdist.iter().cloned());
+            let new_relax: HashSet<String> = candidates.difference(&relax).cloned().collect();
             // record (once) which build-failing pins we dropped, for the dashboard's relaxations list
             let fresh_failed: Vec<String> = failed_builds.difference(&relax).cloned().collect();
             if !fresh_failed.is_empty() {
@@ -706,6 +759,13 @@ impl VenvManager {
                 }
             }
             if new_relax.is_empty() {
+                // the box's virtiofs fd exhaustion (ENFILE) can kill a heavy pip install mid-way — that's
+                // transient (auto-retried on the next build), not a real dependency failure.
+                if log_text.to_lowercase().contains("too many open files") {
+                    return (String::new(), format!(
+                        "transient: too many open files (system fd pressure) — retry (see {}.install.log)",
+                        key));
+                }
                 // No pin left to relax. If a legacy sdist that MUST build (no wheel) failed only because
                 // setuptools >= 81 removed pkg_resources, retry THIS cohort once with a targeted
                 // setuptools<81 constraint (via PIP_CONSTRAINT, reaching pip's build env) — not a global pin.
@@ -752,16 +812,35 @@ mod tests {
     use super::*;
     #[test]
     fn parse_failed_wheel_builds_extracts_pkgs() {
-        // the exact shapes pip emits — used to relax a build-failing pin so pip takes a wheel version
-        let log = "Building wheel for openstep-plist (pyproject.toml): finished with status 'error'\n\
-                   ERROR: Failed building wheel for openstep-plist\n\
+        // explicit summary forms pip prints when a wheel BUILD fails
+        let log = "ERROR: Failed building wheel for openstep-plist\n\
                    ERROR: Failed to build 'cu2qu' when getting requirements to build wheel\n\
                    ERROR: Failed to build installable wheels for some pyproject.toml based projects (skia-pathops, compreffor)\n";
         let got = parse_failed_wheel_builds(log);
         for p in ["openstep-plist", "cu2qu", "skia-pathops", "compreffor"] {
             assert!(got.contains(p), "expected {} in {:?}", p, got);
         }
+        // modern pip (24+) names NO package in a summary — attribute to the preceding Collecting and
+        // the Building banner; a package installed as a WHEEL (jinja2) must NOT be relaxed.
+        let modern = "Collecting Jinja2==3.1.3\n  Using cached Jinja2-3.1.3-py3-none-any.whl\n\
+                      Collecting lxml==5.2.1\n  Using cached lxml-5.2.1.tar.gz\n\
+                      Getting requirements to build wheel: finished with status 'error'\n\
+                      error: subprocess-exited-with-error\n\
+                      Building lxml version 5.2.1.\n\
+                      x Getting requirements to build wheel did not run successfully.\n";
+        let m = parse_failed_wheel_builds(modern);
+        assert!(m.contains("lxml"), "expected lxml in {:?}", m);
+        assert!(!m.contains("jinja2"), "a wheel package must NOT be relaxed: {:?}", m);
         assert!(parse_failed_wheel_builds("Successfully installed everything").is_empty());
+    }
+    #[test]
+    fn parse_sdist_packages_finds_build_candidates() {
+        let log = "Collecting Jinja2==3.1.3\n  Using cached Jinja2-3.1.3-py3-none-any.whl\n\
+                   Collecting lxml==5.2.1\n  Using cached lxml-5.2.1.tar.gz (3.7 MB)\n\
+                   Collecting numpy==1.26\n  Downloading numpy-1.26.tar.gz\n";
+        let s = parse_sdist_packages(log);
+        assert!(s.contains("lxml") && s.contains("numpy"), "sdists: {:?}", s);
+        assert!(!s.contains("jinja2"), "a wheel is not a build candidate: {:?}", s);
     }
     #[test]
     fn pkg_name_and_normalize() {
