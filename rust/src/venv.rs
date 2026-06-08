@@ -273,6 +273,41 @@ pub fn parse_unsatisfiable(text: &str) -> HashSet<String> {
     bad
 }
 
+/// Packages whose wheel BUILD failed (an sdist that won't compile here). Relaxing their pin lets pip
+/// fall back to a newer version that ships a binary wheel — no build at all. This is the elegant fix
+/// for stale pins like `openstep-plist==0.3.1` (no cp313 wheel) on a newer Python: prefer the wheel
+/// rather than blanket-pinning the build toolchain.
+pub fn parse_failed_wheel_builds(text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for marker in ["Failed building wheel for ", "Failed to build "] {
+        let mut rest = text;
+        while let Some(pos) = rest.find(marker) {
+            let after = &rest[pos + marker.len()..];
+            if after.starts_with("installable wheels") {
+                // "Failed to build installable wheels for some pyproject.toml based projects (a, b)"
+                if let Some(lp) = after.find('(') {
+                    if let Some(rp) = after[lp..].find(')') {
+                        for p in after[lp + 1..lp + rp].split(',') {
+                            let tok = take_pkg(p.trim().trim_start_matches(['\'', '"']));
+                            if !tok.is_empty() {
+                                out.insert(tok.to_lowercase());
+                            }
+                        }
+                    }
+                }
+            } else {
+                // "Failed building wheel for X" / "Failed to build 'X'" / "Failed to build X"
+                let tok = take_pkg(after.trim_start_matches(['\'', '"']));
+                if !tok.is_empty() {
+                    out.insert(tok.to_lowercase());
+                }
+            }
+            rest = &after[1.min(after.len())..];
+        }
+    }
+    out
+}
+
 /// Base pins a cohort's own dep conflicts with (ResolutionImpossible) — only ones WE control.
 pub fn parse_conflict_pins(text: &str, base_pkgs: &HashSet<String>) -> HashSet<String> {
     let low = text.to_lowercase();
@@ -586,6 +621,10 @@ impl VenvManager {
 
         let mut relax: HashSet<String> = self.inner.lock().unwrap().relaxed.iter().cloned().collect();
         let mut conflict_relax: HashSet<String> = HashSet::new();
+        // targeted, per-cohort fallback (NOT a global pin): only enabled after a legacy sdist fails to
+        // build because setuptools >= 81 removed pkg_resources. Applied to pip's build env via PIP_CONSTRAINT.
+        let mut setuptools_pin = false;
+        let con_path = vdir.join("gflib-constraints.txt");
         // SELF-HEALING install: drop a pin pip can't satisfy / a base pin a cohort conflicts with, retry.
         for attempt in 0..8 {
             let eff = relax_requirements(&src_lines, &relax);
@@ -608,10 +647,16 @@ impl VenvManager {
             let status = match logf {
                 Ok(lf) => {
                     let lf2 = lf.try_clone().ok();
-                    Command::new(&py)
-                        .args(["-m", "pip", "install", "--disable-pip-version-check", "--cache-dir",
-                               &self.pip_cache.to_string_lossy(), "-r", &eff_path.to_string_lossy()])
-                        .stdout(Stdio::from(lf))
+                    let mut cmd = Command::new(&py);
+                    cmd.args(["-m", "pip", "install", "--disable-pip-version-check", "--cache-dir",
+                              &self.pip_cache.to_string_lossy(), "-r", &eff_path.to_string_lossy()]);
+                    if setuptools_pin {
+                        // constrain setuptools in BOTH the venv and pip's isolated build env so a legacy
+                        // sdist that imports pkg_resources at build time can build (only this cohort).
+                        let _ = std::fs::write(&con_path, "setuptools<81\nwheel\n");
+                        cmd.env("PIP_CONSTRAINT", &con_path);
+                    }
+                    cmd.stdout(Stdio::from(lf))
                         .stderr(lf2.map(Stdio::from).unwrap_or(Stdio::null()))
                         .status()
                 }
@@ -637,9 +682,43 @@ impl VenvManager {
             let log_text = std::fs::read_to_string(&log).unwrap_or_default();
             let bad = parse_unsatisfiable(&log_text);
             let conflicts = parse_conflict_pins(&log_text, &base_pkgs);
-            let new_relax: HashSet<String> =
-                bad.union(&conflicts).cloned().collect::<HashSet<_>>().difference(&relax).cloned().collect();
+            // a stale pin whose sdist won't build here → relax it so pip takes a wheel version instead
+            let failed_builds = parse_failed_wheel_builds(&log_text);
+            let new_relax: HashSet<String> = bad
+                .union(&conflicts)
+                .cloned()
+                .collect::<HashSet<_>>()
+                .union(&failed_builds)
+                .cloned()
+                .collect::<HashSet<_>>()
+                .difference(&relax)
+                .cloned()
+                .collect();
+            // record (once) which build-failing pins we dropped, for the dashboard's relaxations list
+            let fresh_failed: Vec<String> = failed_builds.difference(&relax).cloned().collect();
+            if !fresh_failed.is_empty() {
+                let mut inner = self.inner.lock().unwrap();
+                for p in &fresh_failed {
+                    if inner.override_recorded.insert(format!("build:{}", p)) {
+                        inner.relaxations.push(format!(
+                            "relaxed {} pin — its sdist won't build here; pip will use a wheel version", p));
+                    }
+                }
+            }
             if new_relax.is_empty() {
+                // No pin left to relax. If a legacy sdist that MUST build (no wheel) failed only because
+                // setuptools >= 81 removed pkg_resources, retry THIS cohort once with a targeted
+                // setuptools<81 constraint (via PIP_CONSTRAINT, reaching pip's build env) — not a global pin.
+                if !setuptools_pin && log_text.to_lowercase().contains("no module named 'pkg_resources'") {
+                    setuptools_pin = true;
+                    let mut inner = self.inner.lock().unwrap();
+                    if inner.override_recorded.insert(format!("setuptools81:{}", key)) {
+                        inner.relaxations.push(format!(
+                            "cohort {}: pinned setuptools<81 for the build env (a legacy sdist needs pkg_resources)",
+                            key));
+                    }
+                    continue;
+                }
                 // nothing NEW to relax → a genuine failure; classify it like the Python tool
                 if let Some(syslib) = scan_missing_system_dep(&log_text) {
                     return (String::new(), format!("missing system library: {} (see {}.install.log)", syslib, key));
@@ -671,6 +750,19 @@ impl VenvManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parse_failed_wheel_builds_extracts_pkgs() {
+        // the exact shapes pip emits — used to relax a build-failing pin so pip takes a wheel version
+        let log = "Building wheel for openstep-plist (pyproject.toml): finished with status 'error'\n\
+                   ERROR: Failed building wheel for openstep-plist\n\
+                   ERROR: Failed to build 'cu2qu' when getting requirements to build wheel\n\
+                   ERROR: Failed to build installable wheels for some pyproject.toml based projects (skia-pathops, compreffor)\n";
+        let got = parse_failed_wheel_builds(log);
+        for p in ["openstep-plist", "cu2qu", "skia-pathops", "compreffor"] {
+            assert!(got.contains(p), "expected {} in {:?}", p, got);
+        }
+        assert!(parse_failed_wheel_builds("Successfully installed everything").is_empty());
+    }
     #[test]
     fn pkg_name_and_normalize() {
         assert_eq!(req_pkg_name("Compreffor==0.5.0  # pin"), "compreffor");
