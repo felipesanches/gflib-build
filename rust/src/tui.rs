@@ -521,6 +521,11 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
                             source.control(&ControlSet { retry: Some(vec![slug]), ..Default::default() });
                         }
                     }
+                    KeyCode::Char('o') | KeyCode::Char('O') => {
+                        // re-queue every failed family we've written a gflib-build config override for
+                        // (e.g. the whole instantiateUfo-bypass set) — rebuilds exactly the fixed ones
+                        source.control(&ControlSet { retry_overrides: Some(true), ..Default::default() });
+                    }
                     _ => {}
                 }
             }
@@ -1303,7 +1308,7 @@ fn render_tabbar_body(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16
     } else if TABS[ui.tab] == "config" {
         " [↑↓]field  [←→/space]edit  [↵ or C]apply+save  [Tab/⇧Tab]tabs  [q]uit"
     } else {
-        " [Tab/⇧Tab]tabs  [↑↓]item  [←→]section  [↵]details  [p]ause(freeze)  [R]etry  [C]onfig  [q]uit"
+        " [Tab/⇧Tab]tabs  [↑↓]item  [←→]section  [↵]details  [p]ause  [R]etry  [O]retry-config-fixed  [C]onfig  [q]uit"
     };
     put(scr, footer_row, 0, footer, Color::DarkGrey, w);
     if TABS[ui.tab] == "config" && !ui.cfg_flash.is_empty() {

@@ -28,6 +28,9 @@ const CONFIG_CANDIDATES: [&str; 4] =
     ["sources/config.yaml", "sources/config.yml", "config.yaml", "config.yml"];
 const EXTRACT_TIMEOUT: u64 = 3600;
 pub const MAX_JOBS: usize = 256;
+/// Marker comment every gflib-build-authored override config.yaml carries (in the google/fonts build
+/// clone). The "retry override-fixed" UI action re-queues failed families whose override has it.
+pub const OVERRIDE_MARKER: &str = "# gflib-build override";
 
 /// Mutable shared state, guarded by one mutex; `snapshot()` reads it, workers mutate it.
 pub struct Shared {
@@ -1391,6 +1394,31 @@ impl Orchestrator {
                     }
                 }
                 log.push("retry ALL failed".into());
+            }
+            if set.retry_overrides == Some(true) {
+                // re-queue every FAILED family we've written a gflib-build override config.yaml for
+                // (the OVERRIDE_MARKER) — e.g. the whole instantiateUfo-bypass set — so a config fix
+                // is picked up without retrying genuinely-unfixed failures. (A handful of small reads
+                // under the lock, only for a user-initiated button press.)
+                let failed: Vec<String> = sh.results.values()
+                    .filter(|r| r.status == "failed").map(|r| r.slug.clone()).collect();
+                let mut n = 0;
+                if let Some(gf) = self.cfg.google_fonts.clone() {
+                    for slug in failed {
+                        let marked = std::fs::read_to_string(gf.join(&slug).join("config.yaml"))
+                            .map(|t| t.contains(OVERRIDE_MARKER)).unwrap_or(false);
+                        if marked {
+                            if let Some(r) = sh.results.get_mut(&slug) {
+                                r.status = "queued".into();
+                                r.queued_kind = "rebuild".into();
+                                r.error.clear();
+                                sh.queue.push_back(slug);
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+                log.push(format!("retry {} override-fixed families", n));
             }
             for l in &log {
                 sh.control_log.push(l.clone());

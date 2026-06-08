@@ -538,6 +538,7 @@ function render(){
   document.getElementById('ctl').innerHTML=
     '<button title="pause scheduling AND freeze (SIGSTOP) running builds to free CPU/RAM" onclick="ctl({paused:true})"'+(snap.paused?' disabled':'')+'>pause (freeze)</button> '+
     '<button title="thaw (SIGCONT) frozen builds and resume scheduling" onclick="ctl({paused:false})"'+(snap.paused?'':' disabled')+'>resume (thaw)</button>'+
+    ' <button class="tbtn" title="re-queue every FAILED family we have written a gflib-build config override for (e.g. the whole instantiateUfo-bypass set) — rebuilds exactly the fixed ones" onclick="if(confirm(\'Re-queue all failed families that have a gflib-build config override (the config-fixed set)?\'))ctl({retry_overrides:true})">↻ retry config-fixed</button>'+
     (listTab?' <input id="filter" placeholder="filter… (slug / cause)" oninput="setFilter(this.value)" value="'+E(FILTER)+'">':'')+
     ' <button class="tbtn" onclick="exportJSON()">⬇ JSON</button> <button class="tbtn" onclick="exportCSV()">⬇ CSV (built+failed)</button>'+
     ' <button class="tbtn" onclick="poll()" title="refresh now">↻</button>'+

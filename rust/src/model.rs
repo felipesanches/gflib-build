@@ -376,6 +376,7 @@ pub struct ControlSet {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub compare: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_all: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_overrides: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub build_debs: Option<bool>,
 }
 
@@ -417,5 +418,14 @@ mod tests {
         assert_eq!(cs.jobs, Some(6));
         assert_eq!(cs.retry, Some(vec!["ofl/x".to_string()]));
         assert_eq!(cs.paused, Some(true));
+    }
+    #[test]
+    fn control_set_retry_overrides() {
+        // the "retry config-fixed" UI button posts exactly this
+        let cs: ControlSet = serde_json::from_str(r#"{"retry_overrides":true}"#).unwrap();
+        assert_eq!(cs.retry_overrides, Some(true));
+        // and an unset retry_overrides is omitted (not null) so the control.json stays byte-compatible
+        let cs2 = ControlSet { retry: Some(vec!["ofl/y".into()]), ..Default::default() };
+        assert!(!serde_json::to_string(&cs2).unwrap().contains("retry_overrides"));
     }
 }
