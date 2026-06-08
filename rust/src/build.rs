@@ -33,11 +33,12 @@ pub const MAX_JOBS: usize = 256;
 pub const OVERRIDE_MARKER: &str = "# gflib-build override";
 
 /// Signature of a family's effective gflib-build fix: a hash of the override config.yaml text plus its
-/// build_rules pre-build entry. Empty unless the config carries OVERRIDE_MARKER, so only fixes WE authored
-/// are tracked (never a natural upstream config.yaml). The config-watcher re-queues a failed family when
-/// this changes — editing the override or its staging step both flip the hash.
+/// build_rules pre-build entry. Empty unless the config carries OVERRIDE_MARKER **or** the family has a
+/// build_rules entry — so only fixes WE authored are tracked (never a natural upstream config.yaml), but a
+/// build_rules-only fix (a pre-build / source patch with no override config) still auto-rebuilds. The
+/// config-watcher re-queues a failed family when this changes — editing the override OR its pre-build flips it.
 pub fn config_signature(config_text: &str, rule: Option<&Vec<String>>) -> String {
-    if !config_text.contains(OVERRIDE_MARKER) {
+    if !config_text.contains(OVERRIDE_MARKER) && rule.is_none() {
         return String::new();
     }
     use std::collections::hash_map::DefaultHasher;
@@ -2908,8 +2909,11 @@ mod tests {
 
     #[test]
     fn config_signature_tracks_only_marked_overrides() {
-        // a natural upstream config (no marker) is never tracked -> empty -> never auto-rebuilt
+        // a natural upstream config (no marker) with no build_rules entry is never tracked -> never rebuilt
         assert_eq!(config_signature("sources:\n  - Foo.glyphs\n", None), "");
+        // but a build_rules-only fix (no override config, yet a pre-build entry) IS tracked
+        let pre = vec!["touch sources/family.fea".to_string()];
+        assert!(!config_signature("sources:\n  - Foo.glyphs\n", Some(&pre)).is_empty());
         // a gflib-build override changes signature when its text changes...
         let a = config_signature("# gflib-build override\nrecipe:\n  x:\n    - source: a\n", None);
         let b = config_signature("# gflib-build override\nrecipe:\n  x:\n    - source: b\n", None);
