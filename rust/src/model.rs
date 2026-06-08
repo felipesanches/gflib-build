@@ -38,6 +38,8 @@ pub struct Res {
     #[serde(default)]
     pub builder_version: String, // M0: exact orchestrator version
     #[serde(default)]
+    pub python_version: String,  // M0: the Python interpreter that built it (multi-Python ladder)
+    #[serde(default)]
     pub cohort: String,
     #[serde(default)]
     pub note: String,            // transient ("checkout", "pre-build", "installing deps")
@@ -126,6 +128,7 @@ pub struct BuiltItem {
     #[serde(default)] pub compiler_version: String,
     #[serde(default)] pub builder: String,
     #[serde(default)] pub builder_version: String,
+    #[serde(default)] pub python_version: String, // M0: the Python that built it (multi-Python ladder)
     #[serde(default)] pub packaged: bool, // a debian/ packaging tree has been drafted on disk
     #[serde(default)] pub deb_status: String, // "" | built | validated | failed (from build-results.json)
     #[serde(default)] pub crater: String, // fontc_crater's verdict token (see crater::CraterStatus::token)

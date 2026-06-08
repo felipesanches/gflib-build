@@ -641,7 +641,7 @@ function openDetail(kind,id){
   (c.families.length?c.families:[{name:'(none assigned yet)',status:''}]).forEach(f=>lines.push('  '+f.name+(f.status?' ['+f.status+']':'')));
   lines.push('','requirements:');(c.requirements?c.requirements.split('\n'):['(none — the base cohort has no requirements file)']).forEach(r=>lines.push('  '+r));
  } else if(kind=='built'){const b=findBy(snap.built_recent,'slug',id);if(!b)return;slug=id;title='Built: '+b.slug;
-  lines=['backend: '+(b.backend||'?'),'output size: '+human(b.bytes),'vs shipped: '+(b.compare||'(not compared)'),'provenance: '+prov(b),'rebuild: gflib-build --only '+b.slug+' --rebuild --yes'];
+  lines=['backend: '+(b.backend||'?'),'output size: '+human(b.bytes),'vs shipped: '+(b.compare||'(not compared)'),'provenance: '+prov(b),'rebuild: gflib-build --only '+b.slug+' --rebuild --yes'];if(b.python_version)lines.splice(4,0,'python: '+b.python_version);
  } else if(kind=='failed'){const f=findBy(snap.failures_recent,'slug',id);slug=id;
   if(f){title='Failed: '+f.slug;lines=['provenance: '+prov(f),'rebuild: gflib-build --only '+f.slug+' --rebuild --yes','','error:','  '+(f.error||'')];if(f.rebuild_note)lines.unshift('⟳ REBUILD PENDING — '+f.rebuild_note,'');}
   else{// not in the recent window — fall back to the persistent failure history

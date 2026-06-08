@@ -18,7 +18,10 @@ pub struct Config {
     pub fontc_bin: Option<String>,
     pub builder3_bin: Option<String>,
     pub build_python: String,
-    pub base_python: String,            // interpreter used to CREATE cohort venvs
+    pub base_python: String,            // interpreter used to CREATE cohort venvs (= pythons[0])
+    pub pythons: Vec<String>,           // Python ladder, newest→oldest: a cohort whose pinned reqs have
+                                        // no wheel on the first rung falls back to an older one (keeping
+                                        // the exact pins) before relaxing. Single entry = legacy behavior.
     pub base_requirements: Option<PathBuf>, // pinned base toolchain (gftools/fontmake/…)
     pub build_rules: Option<PathBuf>,   // per-family pre-build commands (build_rules.json)
     pub manage_venvs: bool,
@@ -71,6 +74,7 @@ impl Default for Config {
             builder3_bin: None,
             build_python: "python3".into(),
             base_python: "python3".into(),
+            pythons: vec!["python3".into()],
             base_requirements: None,
             build_rules: None,
             manage_venvs: false,
@@ -185,7 +189,12 @@ pub fn parse(args: &[String]) -> Parsed {
             "--fontc-bin" => cfg.fontc_bin = Some(next(&mut i, a)),
             "--builder3-bin" => cfg.builder3_bin = Some(next(&mut i, a)),
             "--build-python" => cfg.build_python = next(&mut i, a),
-            "--base-python" => cfg.base_python = next(&mut i, a),
+            "--base-python" => { let x = next(&mut i, a); cfg.base_python = x.clone(); cfg.pythons = vec![x]; }
+            // --pythons python3.13,python3.11[,python3.10] — the fallback ladder (newest→oldest)
+            "--pythons" => {
+                let v: Vec<String> = next(&mut i, a).split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                if !v.is_empty() { cfg.base_python = v[0].clone(); cfg.pythons = v; }
+            }
             "--base-requirements" => cfg.base_requirements = Some(PathBuf::from(next(&mut i, a))),
             "--build-rules" => cfg.build_rules = Some(PathBuf::from(next(&mut i, a))),
             "--manage-venvs" => cfg.manage_venvs = true,

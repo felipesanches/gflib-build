@@ -1801,6 +1801,9 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
                 o.push(format!("output size: {}", human(b.bytes)));
                 o.push(format!("vs shipped: {}", if b.compare.is_empty() { "(not compared)" } else { &b.compare }));
                 o.push(format!("provenance: {}", prov_str(&b.compiler_version, &b.backend, &b.builder_version)));
+                if !b.python_version.is_empty() {
+                    o.push(format!("python: {}", b.python_version));
+                }
                 o.push(format!("fonts: {}", build_dir.join("out").join(b.slug.replace('/', "__")).display()));
                 o.push(format!("rebuild: gflib-build --only {} --rebuild --yes", b.slug));
                 if !b.log.is_empty() {

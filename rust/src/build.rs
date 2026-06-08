@@ -381,7 +381,7 @@ impl Orchestrator {
             op_stats: HashMap::new(),
         };
         let venvs = if cfg.manage_venvs {
-            Some(VenvManager::new(&cfg.build_dir, &cfg.base_python, cfg.base_requirements.clone()))
+            Some(VenvManager::new(&cfg.build_dir, &cfg.pythons, cfg.base_requirements.clone()))
         } else {
             None
         };
@@ -1082,13 +1082,16 @@ impl Orchestrator {
         let python = if let Some(v) = &self.venvs {
             let req = venv::read_requirements_from_mirror(&mirror, &fam.commit);
             self.set_result(slug, |r| r.note = "installing deps".into());
-            let (py, cohort, verr) = self.timed(slug, "venv", || v.get_python(&req, |_k| {}));
+            let (py, cohort, pyver, verr) = self.timed(slug, "venv", || v.get_python(&req, |_k| {}));
             if !verr.is_empty() {
                 let msg = format!("venv: {}", verr);
                 let (cause, _) = crate::classify::categorize_failure(&msg);
                 self.fail(slug, cause, &msg);
                 cleanup(&work, self.cfg.keep_work);
                 return;
+            }
+            if !pyver.is_empty() {
+                self.set_result(slug, |r| r.python_version = pyver.clone());
             }
             self.note_cohort(slug, &cohort, &req);
             // The cohort venv is now installed+marked on disk. Reflect it in the cohorts view
@@ -1891,6 +1894,7 @@ impl Orchestrator {
                     compiler_version: r.compiler_version.clone(),
                     builder: r.builder.clone(),
                     builder_version: r.builder_version.clone(),
+                    python_version: r.python_version.clone(),
                     packaged: drafted.contains(&r.slug.replace('/', "__")),
                     deb_status: deb_results.get(&r.slug).cloned().unwrap_or_default(),
                     crater: self.crater_by_slug.get(&r.slug).map(|s| s.token()).unwrap_or_default(),

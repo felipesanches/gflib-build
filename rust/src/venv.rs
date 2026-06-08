@@ -103,6 +103,17 @@ pub fn normalize_requirements(text: &str) -> String {
     lines.join("\n")
 }
 
+/// Cohort venv key for a Python-ladder rung: the default rung (idx 0) keeps the bare cohort key so every
+/// EXISTING venv is reused unchanged (zero rebuild when the ladder is enabled); each older rung appends
+/// the interpreter tag (`<key>-py311`) to get a distinct, Python-specific venv.
+pub fn rung_cohort_key(base_key: &str, idx: usize, py_tag: &str) -> String {
+    if idx == 0 {
+        base_key.to_string()
+    } else {
+        format!("{}-{}", base_key, py_tag)
+    }
+}
+
 pub fn cohort_key_for(req_text: &str) -> String {
     let norm = normalize_requirements(req_text);
     if norm.is_empty() {
@@ -540,21 +551,27 @@ struct Inner {
 pub struct VenvManager {
     root: PathBuf,
     pip_cache: PathBuf,
-    base_python: String,
+    base_python: String,       // = pythons[0]: the default rung (bare cohort key) + the base venv
+    pythons: Vec<String>,      // fallback ladder, newest→oldest
+    pytags: Mutex<HashMap<String, (String, String)>>, // python bin -> (tag "py311", full "3.11.15")
     base_req: Option<PathBuf>,
     inner: Mutex<Inner>,
 }
 
 impl VenvManager {
-    pub fn new(build_dir: &Path, base_python: &str, base_requirements: Option<PathBuf>) -> Self {
+    pub fn new(build_dir: &Path, pythons: &[String], base_requirements: Option<PathBuf>) -> Self {
         let root = build_dir.join("venvs");
         let pip_cache = build_dir.join("pip-cache");
         let _ = std::fs::create_dir_all(&root);
         let _ = std::fs::create_dir_all(&pip_cache);
+        let pythons: Vec<String> = if pythons.is_empty() { vec!["python3".into()] } else { pythons.to_vec() };
+        let base_python = pythons[0].clone();
         VenvManager {
             root,
             pip_cache,
-            base_python: base_python.to_string(),
+            base_python,
+            pythons,
+            pytags: Mutex::new(HashMap::new()),
             base_req: base_requirements,
             inner: Mutex::new(Inner {
                 locks: HashMap::new(),
@@ -566,6 +583,26 @@ impl VenvManager {
         }
     }
 
+    /// (tag, full_version) for a python binary, e.g. ("py311", "3.11.15"). None if not runnable. Cached
+    /// so a missing/ valid interpreter is probed once. The default rung (idx 0) never needs the tag.
+    fn pyinfo(&self, python: &str) -> Option<(String, String)> {
+        if let Some(v) = self.pytags.lock().unwrap().get(python) {
+            return Some(v.clone());
+        }
+        let out = Command::new(python)
+            .args(["-c", "import sys;v=sys.version_info;print('py%d%d %d.%d.%d'%(v[0],v[1],v[0],v[1],v[2]))"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout);
+        let mut it = s.split_whitespace();
+        let v = (it.next()?.to_string(), it.next().unwrap_or("").to_string());
+        self.pytags.lock().unwrap().insert(python.to_string(), v.clone());
+        Some(v)
+    }
+
     pub fn relaxations(&self) -> Vec<String> {
         self.inner.lock().unwrap().relaxations.clone()
     }
@@ -575,7 +612,8 @@ impl VenvManager {
     }
 
     pub fn ensure_base(&self) -> Result<String, String> {
-        let (py, err) = self.create("base", "");
+        let base_python = self.base_python.clone();
+        let (py, err) = self.create(&base_python, "base", "", true);
         if err.is_empty() {
             self.inner.lock().unwrap().ready.insert("base".into(), py.clone());
             Ok(py)
@@ -589,33 +627,59 @@ impl VenvManager {
         inner.locks.entry(key.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
     }
 
-    /// Get (create-or-reuse) the venv python for a cohort. Returns (python_path, cohort_key, error).
-    pub fn get_python<F: FnOnce(&str)>(&self, req_text: &str, on_install: F) -> (String, String, String) {
-        let key = cohort_key_for(req_text);
-        {
-            let inner = self.inner.lock().unwrap();
-            if let Some(py) = inner.ready.get(&key) {
-                return (py.clone(), key, String::new());
+    /// Get (create-or-reuse) the venv python for a cohort. Returns (python_path, cohort_key,
+    /// python_version, error). Walks the Python ladder: the default rung keeps the bare cohort key (so
+    /// existing venvs are reused unchanged); each older rung gets a `-py<tag>` suffix. A rung that fails
+    /// to install the EXACT pinned reqs falls through to the next (older) rung WITHOUT relaxing — only
+    /// the last rung relaxes, so we prefer "faithful pins on an older Python" over "relaxed pins on a
+    /// newer one". A single-rung ladder is byte-identical to the legacy single-Python path.
+    pub fn get_python<F: FnOnce(&str)>(&self, req_text: &str, on_install: F) -> (String, String, String, String) {
+        let base_key = cohort_key_for(req_text);
+        // Build the runnable rungs: (python, cohort key, python_version). Skip a non-default rung whose
+        // interpreter isn't installed; the default rung is always present.
+        let mut rungs: Vec<(String, String, String)> = Vec::new();
+        for (idx, python) in self.pythons.iter().enumerate() {
+            if idx == 0 {
+                let full = self.pyinfo(python).map(|(_, f)| f).unwrap_or_default();
+                rungs.push((python.clone(), rung_cohort_key(&base_key, 0, ""), full));
+            } else if let Some((tag, full)) = self.pyinfo(python) {
+                rungs.push((python.clone(), rung_cohort_key(&base_key, idx, &tag), full));
             }
         }
-        let lock = self.lock_for(&key);
-        let _g = lock.lock().unwrap(); // serialize creation of THIS cohort under full parallelism
-        {
+        // fast path: any rung's venv already built (no lock churn)?
+        for (_, key, pyver) in &rungs {
             let inner = self.inner.lock().unwrap();
-            if let Some(py) = inner.ready.get(&key) {
-                return (py.clone(), key, String::new());
+            if let Some(py) = inner.ready.get(key) {
+                return (py.clone(), key.clone(), pyver.clone(), String::new());
             }
         }
-        on_install(&key);
-        let (py, err) = self.create(&key, req_text);
-        if err.is_empty() {
-            self.inner.lock().unwrap().ready.insert(key.clone(), py.clone());
+        on_install(&base_key);
+        let n = rungs.len();
+        let mut last_err = String::new();
+        for (i, (python, key, pyver)) in rungs.iter().enumerate() {
+            let lock = self.lock_for(key);
+            let _g = lock.lock().unwrap(); // serialize creation of THIS cohort under full parallelism
+            {
+                let inner = self.inner.lock().unwrap();
+                if let Some(py) = inner.ready.get(key) {
+                    return (py.clone(), key.clone(), pyver.clone(), String::new());
+                }
+            }
+            let allow_relax = i == n - 1; // relax pins only on the oldest rung
+            let (py, err) = self.create(python, key, req_text, allow_relax);
+            if err.is_empty() {
+                self.inner.lock().unwrap().ready.insert(key.clone(), py.clone());
+                return (py.clone(), key.clone(), pyver.clone(), String::new());
+            }
+            last_err = err; // keep the exact pins → try the next, older rung
         }
-        (py, key, err)
+        (String::new(), base_key, String::new(), last_err)
     }
 
-    /// Create (or reuse) the venv for `key`. Faithful port of the Python `_create`.
-    fn create(&self, key: &str, req_text: &str) -> (String, String) {
+    /// Create (or reuse) the venv for `key`, using interpreter `python`. When `allow_relax` is false the
+    /// install runs ONCE with the exact pins (a missing wheel just fails, so the caller can try an older
+    /// Python rung); when true it runs the self-healing relax loop. Faithful port of the Python `_create`.
+    fn create(&self, python: &str, key: &str, req_text: &str, allow_relax: bool) -> (String, String) {
         let vdir = self.root.join(key);
         let py = vdir.join("bin").join("python");
         let ready = vdir.join(".gflib-installed");
@@ -679,7 +743,7 @@ impl VenvManager {
             }
         }
         let _ = std::fs::remove_dir_all(&vdir);
-        let rc = Command::new(&self.base_python).args(["-m", "venv", &vdir.to_string_lossy()]).output();
+        let rc = Command::new(python).args(["-m", "venv", &vdir.to_string_lossy()]).output();
         match rc {
             Ok(o) if o.status.success() => {}
             Ok(o) => return (String::new(), format!("venv create rc={:?}: {}", o.status.code(),
@@ -733,7 +797,8 @@ impl VenvManager {
         // The cap is generous (the loop exits early the moment an attempt finds nothing NEW to relax);
         // it must exceed the count of distinct pre-cp313 sdist pins a cohort can carry, since pip only
         // surfaces ONE wheel-build failure per run, so each is relaxed one attempt at a time.
-        for attempt in 0..24 {
+        let max_attempts = if allow_relax { 24 } else { 1 };
+        for attempt in 0..max_attempts {
             let eff = relax_requirements(&src_lines, &relax);
             let _ = std::fs::write(&eff_path, eff.join("\n") + "\n");
             let mut header = String::new();
@@ -798,6 +863,11 @@ impl VenvManager {
                     }
                 }
                 return (py.to_string_lossy().to_string(), String::new());
+            }
+            if !allow_relax {
+                // a faithful single attempt failed → let get_python try an OLDER Python rung instead of
+                // relaxing the pins here (and don't record a relaxation we didn't actually apply).
+                return (String::new(), format!("pinned reqs unsatisfiable on this Python (see venvs/{}.install.log)", key));
             }
             let log_text = std::fs::read_to_string(&log).unwrap_or_default();
             let bad = parse_unsatisfiable(&log_text);
@@ -949,6 +1019,25 @@ mod tests {
         assert_eq!(relax_requirements(&lines, &relaxed)[0].split_whitespace().next().unwrap(), "gftools");
     }
     #[test]
+    fn rung_key_keeps_default_bare_and_tags_fallbacks() {
+        let base = cohort_key_for("gftools==0.9.99");
+        // default rung (idx 0) keeps the bare key → existing venvs reuse, zero rebuild
+        assert_eq!(rung_cohort_key(&base, 0, "py313"), base);
+        // older rungs get a distinct, Python-tagged venv
+        assert_eq!(rung_cohort_key(&base, 1, "py311"), format!("{}-py311", base));
+        assert_ne!(rung_cohort_key(&base, 1, "py311"), rung_cohort_key(&base, 2, "py310"));
+    }
+    #[test]
+    fn pyinfo_reports_a_tag_and_skips_missing_interpreters() {
+        let bd = std::env::temp_dir().join(format!("_vmpy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bd);
+        let vm = VenvManager::new(&bd, &["python3".to_string()], None);
+        let (tag, full) = vm.pyinfo("python3").expect("python3 must be runnable");
+        assert!(tag.starts_with("py3") && full.starts_with("3."), "tag={} full={}", tag, full);
+        assert!(vm.pyinfo("python-does-not-exist-zzz").is_none());
+        let _ = std::fs::remove_dir_all(&bd);
+    }
+    #[test]
     fn reuses_a_venv_with_a_matching_marker() {
         // The drop-in property: a venv whose .gflib-installed marker matches the requirements is
         // returned as-is — never rebuilt. (Proven offline: no real `python -m venv` / pip needed.)
@@ -966,10 +1055,10 @@ mod tests {
         let want = sha_hex("sha256sum", "wheel\n|gflib-policy:setuptools<81");
         std::fs::write(vdir.join(".gflib-installed"), format!("{}\n", &want[..want.len().min(16)])).unwrap();
 
-        let vm = VenvManager::new(&bd, "python3", Some(basereq));
+        let vm = VenvManager::new(&bd, &["python3".to_string()], Some(basereq));
         // on_install is a "starting" notification (called before create() regardless of reuse). The
         // real reuse signal: create() returns early WITHOUT rmtree, so the dummy file is untouched.
-        let (py, key, err) = vm.get_python("", |_| {});
+        let (py, key, _pyver, err) = vm.get_python("", |_| {});
         assert_eq!(key, "base");
         assert!(err.is_empty(), "reuse should not error: {}", err);
         assert_eq!(py, dummy_py.to_string_lossy(), "must return the existing venv's python");
