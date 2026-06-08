@@ -282,7 +282,7 @@ impl Orchestrator {
         let mut results = BTreeMap::new();
         let mut families = BTreeMap::new();
         // (slug, prior_duration) for queued families — sorted longest-first below to shrink the tail
-        let mut queued_with_dur: Vec<(String, f64)> = Vec::new();
+        let mut queued_with_dur: Vec<(String, f64, bool)> = Vec::new(); // (slug, prior_dur, requested_rebuild)
         for f in fams {
             let slug = f.slug.clone();
             families.insert(slug.clone(), f);
@@ -323,14 +323,21 @@ impl Orchestrator {
             r.slug = slug.clone();
             r.status = status.into();
             if status == "queued" {
+                // `force` is an explicit --retrigger of THIS family (a subset request); --rebuild rebuilds
+                // everything, so it isn't a per-family priority signal.
+                let requested = force;
                 r.queued_kind = if cfg.rebuild || force { "rebuild".into() } else { kind.into() };
-                queued_with_dur.push((slug.clone(), prior_dur));
+                queued_with_dur.push((slug.clone(), prior_dur, requested));
             }
             results.insert(slug, r);
         }
-        // longest-first: families with a known long prior build go first; never-built (dur 0) last
-        queued_with_dur.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let queue: VecDeque<String> = queued_with_dur.into_iter().map(|(s, _)| s).collect();
+        // requested rebuilds (--retrigger) first; then longest-first (known long prior build) so big
+        // families parallelize early; never-built (dur 0) last.
+        queued_with_dur.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let queue: VecDeque<String> = queued_with_dur.into_iter().map(|(s, _, _)| s).collect();
 
         let failure_history = persist::read_failure_history(&cfg.build_dir);
         // jobs 0 = inspect-only: keep the loaded data + UI live but spawn NO build workers.
@@ -1379,7 +1386,7 @@ impl Orchestrator {
                             r.status = "queued".into();
                             r.queued_kind = "rebuild".into();
                             r.error.clear();
-                            sh.queue.push_back(slug.clone());
+                            sh.queue.push_front(slug.clone()); // requested rebuild → jump the queue
                             n += 1;
                         }
                     }
@@ -1490,7 +1497,7 @@ impl Orchestrator {
                         r.status = "queued".into();
                         r.queued_kind = "retry".into();
                         r.error.clear();
-                        sh.queue.push_back(slug);
+                        sh.queue.push_front(slug); // requested retry → ahead of not-yet-built families
                     }
                 }
                 log.push("retry ALL failed".into());
@@ -1512,7 +1519,7 @@ impl Orchestrator {
                                 r.status = "queued".into();
                                 r.queued_kind = "rebuild".into();
                                 r.error.clear();
-                                sh.queue.push_back(slug);
+                                sh.queue.push_front(slug); // requested rebuild → jump the queue
                                 n += 1;
                             }
                         }
