@@ -687,6 +687,13 @@ impl VenvManager {
 
         let mut relax: HashSet<String> = self.inner.lock().unwrap().relaxed.iter().cloned().collect();
         let mut conflict_relax: HashSet<String> = HashSet::new();
+        // Packages whose pinned sdist won't compile on this interpreter (no cp* wheel at the pinned
+        // version): once relaxed to a bare name, pip's resolver can still BACKTRACK onto an even older
+        // pre-cp313 sdist (e.g. lxml 4.9.4) and fail to build again. Forcing `--only-binary` on exactly
+        // these packages makes pip take the newest matching WHEEL instead — no compile, no system -dev
+        // lib, and no hardcoded version floor. If a package genuinely has no wheel anywhere, pip then
+        // fails clearly ("no matching distribution"), which the missing-system-lib classifier catches.
+        let mut wheel_only: HashSet<String> = HashSet::new();
         // Constrain setuptools<81 for the whole install INCLUDING pip's isolated build envs (via
         // PIP_CONSTRAINT). The pinned toolchain (gftools/fontmake + deps) imports pkg_resources, which
         // setuptools 82 removed; setuptools' own warning says to "pin to Setuptools<81". So it's a real
@@ -694,7 +701,10 @@ impl VenvManager {
         let con_path = vdir.join("gflib-constraints.txt");
         let _ = std::fs::write(&con_path, "setuptools<81\n");
         // SELF-HEALING install: drop a pin pip can't satisfy / a base pin a cohort conflicts with, retry.
-        for attempt in 0..8 {
+        // The cap is generous (the loop exits early the moment an attempt finds nothing NEW to relax);
+        // it must exceed the count of distinct pre-cp313 sdist pins a cohort can carry, since pip only
+        // surfaces ONE wheel-build failure per run, so each is relaxed one attempt at a time.
+        for attempt in 0..24 {
             let eff = relax_requirements(&src_lines, &relax);
             let _ = std::fs::write(&eff_path, eff.join("\n") + "\n");
             let mut header = String::new();
@@ -718,6 +728,13 @@ impl VenvManager {
                     let mut cmd = Command::new(&py);
                     cmd.args(["-m", "pip", "install", "--disable-pip-version-check", "--cache-dir",
                               &self.pip_cache.to_string_lossy(), "-r", &eff_path.to_string_lossy()]);
+                    // force a wheel for every package whose sdist already failed to build here, so the
+                    // resolver cannot regress onto an even older pre-cp313 sdist of the same package
+                    if !wheel_only.is_empty() {
+                        let mut wo: Vec<_> = wheel_only.iter().cloned().collect();
+                        wo.sort();
+                        cmd.args(["--only-binary", &wo.join(",")]);
+                    }
                     cmd.env("PIP_CONSTRAINT", &con_path); // setuptools<81 in the venv AND build envs
                     cmd.stdout(Stdio::from(lf))
                         .stderr(lf2.map(Stdio::from).unwrap_or(Stdio::null()))
@@ -757,6 +774,19 @@ impl VenvManager {
             let mut candidates: HashSet<String> = bad.union(&conflicts).cloned().collect();
             candidates.extend(failed_builds.iter().cloned());
             candidates.extend(sdist.iter().cloned());
+            // every package whose wheel/sdist build failed must be wheel-forced on the next attempt
+            // (not just relaxed), or pip can pick its old sdist again and re-fail the same way. Track
+            // what's NEWLY wheel-forced so we still retry even when the failing package was already
+            // relaxed (e.g. a conflict-relaxed pin that pip then backtracked onto a failing sdist).
+            let new_wheel: Vec<String> = failed_builds
+                .iter()
+                .chain(sdist.iter())
+                .filter(|p| !wheel_only.contains(*p))
+                .cloned()
+                .collect();
+            for p in &new_wheel {
+                wheel_only.insert(p.clone());
+            }
             let new_relax: HashSet<String> = candidates.difference(&relax).cloned().collect();
             // record (once) which build-failing pins we dropped, for the dashboard's relaxations list
             let fresh_failed: Vec<String> = failed_builds.difference(&relax).cloned().collect();
@@ -769,8 +799,8 @@ impl VenvManager {
                     }
                 }
             }
-            if new_relax.is_empty() {
-                // nothing NEW to relax → a genuine failure; classify it like the Python tool
+            if new_relax.is_empty() && new_wheel.is_empty() {
+                // nothing NEW to relax OR wheel-force → a genuine failure; classify it like the Python tool
                 if let Some(syslib) = scan_missing_system_dep(&log_text) {
                     return (String::new(), format!("missing system library: {} (see {}.install.log)", syslib, key));
                 }
