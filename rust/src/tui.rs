@@ -1283,7 +1283,13 @@ fn render_tabbar_body(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16
     let mut row = body_top;
     if !snap.building.is_empty() && !ui.detail && sep_row.saturating_sub(row) >= 3 {
         let cap = snap.building.len().min(5).min((sep_row - row) as usize - 2).max(1);
-        let mut hdr = format!(" ▶ Now building ({}) ", snap.building.len());
+        let total = snap.building.len();
+        let mut hdr = if snap.frozen_builds > 0 && snap.frozen_builds <= total {
+            // job limit lowered → excess builds are SIGSTOP-frozen (not killed), draining to the limit
+            format!(" ▶ Now building ({} — {} active, {} frozen) ", total, total - snap.frozen_builds, snap.frozen_builds)
+        } else {
+            format!(" ▶ Now building ({}) ", total)
+        };
         while hdr.chars().count() < (w as usize).saturating_sub(1) {
             hdr.push('-');
         }

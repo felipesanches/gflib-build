@@ -38,6 +38,12 @@ pub fn sigterm_received() -> bool {
     SIGTERM_RECEIVED.load(Ordering::SeqCst)
 }
 
+/// Request the same graceful shutdown SIGTERM triggers (used by the UI "Restart" path, which sets it
+/// from inside the daemon rather than via an external signal).
+pub fn request_sigterm() {
+    SIGTERM_RECEIVED.store(true, Ordering::SeqCst);
+}
+
 /// Double-fork into a background daemon. Returns true in the daemon (which should run the build) and
 /// false in the original parent (which can then attach a monitor). Redirects the daemon's stdio to
 /// `daemon.log` and writes `daemon.pid`. Call this BEFORE spawning any threads.
@@ -101,4 +107,22 @@ pub fn run_daemon(orch: &Arc<Orchestrator>, linger: Duration) {
     orch.finalize(); // synchronous final status + reports before the daemon exits
     orch.request_stop();
     persist::clear_pid(&orch.cfg.build_dir);
+    respawn_if_requested(orch);
+}
+
+/// After a graceful shutdown, re-launch a fresh daemon if a UI "Restart" asked for it. The pidfile is
+/// already cleared, so the fresh process starts a build (not a monitor). Re-spawn with the same args; if
+/// it fails the daemon simply stays stopped (re-run manually) — it is never left frozen. Called from BOTH
+/// the detached loop (run_daemon) and the foreground exit path (main).
+pub fn respawn_if_requested(orch: &Arc<Orchestrator>) {
+    if !orch.restart_requested() {
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        match std::process::Command::new(&exe).args(&args).spawn() {
+            Ok(_) => eprintln!("gflib-build: restart — re-launched a fresh daemon"),
+            Err(e) => eprintln!("gflib-build: restart re-launch failed: {} (re-run manually)", e),
+        }
+    }
 }

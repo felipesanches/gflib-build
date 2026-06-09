@@ -180,6 +180,7 @@ pub struct Orchestrator {
     pub shared: Arc<Mutex<Shared>>,
     pub cond: Arc<Condvar>,
     pub stop: Arc<AtomicBool>,
+    pub restart_requested: Arc<AtomicBool>, // UI "Restart": graceful-stop then re-spawn (see run_daemon)
     pub start_time: f64,
     pub resumed_elapsed: f64,
     pub active: AtomicUsize,
@@ -395,6 +396,7 @@ impl Orchestrator {
             shared: Arc::new(Mutex::new(shared)),
             cond: Arc::new(Condvar::new()),
             stop: Arc::new(AtomicBool::new(false)),
+            restart_requested: Arc::new(AtomicBool::new(false)),
             start_time: now(),
             resumed_elapsed: state.elapsed_so_far, // cumulative clock survives restart/migration (R1)
             active: AtomicUsize::new(0),
@@ -1766,29 +1768,25 @@ impl Orchestrator {
         self.cond.notify_all();
     }
 
-    /// Re-exec the daemon in place to apply startup-only settings (the web "Restart" button / a config
-    /// change that isn't live). Flush state, reap in-flight children (so nothing orphans), then exec the
-    /// same binary+args minus --detach/--no-detach (we're already the daemon — don't re-fork). The new
-    /// process resumes from state.json; interrupted builds re-queue. Returns only if exec fails.
+    pub fn restart_requested(&self) -> bool {
+        self.restart_requested.load(Ordering::SeqCst)
+    }
+
+    /// The UI "Restart" button. Routes through the SAME graceful shutdown SIGTERM/`--stop` uses (set the
+    /// flag the daemon loop polls) plus a restart marker; run_daemon then finalizes, clears the pidfile,
+    /// and RE-SPAWNS a fresh daemon. We do NOT re-exec in place — in the monitor/daemon split that fought
+    /// the monitor's web port and could leave the daemon frozen. If the re-spawn fails the daemon simply
+    /// stays stopped (re-run manually) — never bricked. (Foreground non-detached daemons just stop.)
     fn restart_self(self: &Arc<Self>) {
         if self.cfg.dry_run {
             return; // the mockup never touches the real session
         }
         self.shared.lock().unwrap().control_log.push(
-            "restart requested — re-exec'ing the daemon; in-flight builds resume from saved state".into());
+            "restart requested via the UI — finishing the current snapshot, then re-launching the daemon".into());
         self.save_state();
-        self.request_stop(); // SIGCONT+SIGKILL the in-flight builder groups → no orphans across the exec
-        let exe = match std::env::current_exe() {
-            Ok(e) => e,
-            Err(e) => { self.shared.lock().unwrap().control_log.push(format!("restart: current_exe failed: {}", e)); return; }
-        };
-        let args: Vec<std::ffi::OsString> = std::env::args_os()
-            .skip(1)
-            .filter(|a| a != "--detach" && a != "--no-detach")
-            .collect();
-        use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(exe).args(&args).exec(); // replaces this process on success
-        self.shared.lock().unwrap().control_log.push(format!("restart failed (daemon left running): {}", err));
+        self.restart_requested.store(true, Ordering::SeqCst);
+        crate::daemon::request_sigterm(); // run_daemon's loop polls this → clean finalize + re-spawn
+        self.cond.notify_all();
     }
 
     /// Send `sig` to every in-flight builder process group regardless of freeze state — used to reap

@@ -208,6 +208,7 @@ fn run_build(mut cfg: config::Config) {
     orch.finalize(); // synchronous final status + migration.json + timings.json before we exit
     orch.request_stop();
     persist::clear_pid(&cfg.build_dir);
+    daemon::respawn_if_requested(&orch); // UI "Restart": re-launch after a clean foreground shutdown
 }
 
 fn run_attach(cfg: &config::Config) {

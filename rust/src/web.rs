@@ -13,16 +13,27 @@ use std::sync::Arc;
 
 pub fn run(source: Arc<dyn Source>, port: u16) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
+    listener.set_nonblocking(true)?;
     eprintln!("gflib-build web dashboard: http://127.0.0.1:{}/", port);
-    for stream in listener.incoming() {
-        if let Ok(stream) = stream {
-            let src = Arc::clone(&source);
-            std::thread::spawn(move || {
-                let _ = handle(stream, src);
-            });
+    // Poll for connections so we can also notice a graceful shutdown (SIGTERM / UI "Restart") and return,
+    // letting main() finalize + re-spawn. (A monitor never sets the flag, so its server keeps serving.)
+    loop {
+        if crate::daemon::sigterm_received() {
+            return Ok(());
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let src = Arc::clone(&source);
+                std::thread::spawn(move || {
+                    let _ = handle(stream, src);
+                });
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
         }
     }
-    Ok(())
 }
 
 fn handle(mut stream: TcpStream, source: Arc<dyn Source>) -> std::io::Result<()> {
@@ -563,7 +574,9 @@ function render(){
  // ---- pinned now-building (every tab) ----
  const bl=snap.building||[];let pin='';
  if(bl.length&&!pre){const cap=Math.min(bl.length,5);
-  pin='<div class="pin"><div class="sec">▶ Now building ('+bl.length+')</div>'+bl.slice(0,cap).map(b=>R(buildingRow(b))).join('')+
+  const fz=snap.frozen_builds||0; // job limit lowered → excess builds SIGSTOP-frozen (draining to limit)
+  const lbl=(fz>0&&fz<=bl.length)?(bl.length+' — '+(bl.length-fz)+' active, '+fz+' frozen'):(''+bl.length);
+  pin='<div class="pin"><div class="sec">▶ Now building ('+lbl+')</div>'+bl.slice(0,cap).map(b=>R(buildingRow(b))).join('')+
    (bl.length>cap?'<div class="ln muted">  … (+'+(bl.length-cap)+' more)</div>':'')+'</div>';}
  document.getElementById('pin').innerHTML=pin;
  // ---- body per tab: charts (web-only) first, then the same content as the TUI ----
