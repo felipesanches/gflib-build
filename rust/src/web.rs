@@ -663,6 +663,7 @@ function render(){
  else if(tab=='archive')body+=archiveView();
  else if(tab=='fontspector')body+=fsView();
  else if(tab=='crater')body+=craterView();
+ else if(tab=='packaging')body+=packagingView();
  else if(tab=='overview')body+='<div class="panes">'+sections(tab).map(s=>'<div>'+renderSec(s)+'</div>').join('')+'</div>'; // multi-pane
  else{body+=(tab=='stats'?statsPrefix():'')+sections(tab).map(renderSec).join('');}
  document.getElementById('body').innerHTML=body;
@@ -857,6 +858,44 @@ function ring(done,total,sub){
   '<text x="44" y="58" text-anchor="middle" fill="#7c8aa0" font-size="9">'+E(sub||'')+'</text></svg>';
 }
 function legend(slices){return '<div class="legend">'+slices.filter(s=>(s.value||0)>0).map(s=>'<span><i style="background:'+s.color+'"></i>'+E(s.label)+' '+(s.value||0)+'</span>').join('')+'</div>'}
+
+// ---- packaging tab: deb toolchain (left) + package-status pie (right), then the per-family list ----
+// canonical package-status order / colour / tooltip for the pie + secondary bar (colours match the rows)
+const PKG_STATES=[
+ ['lint-clean','#22c55e','validated AND lintian clean (no errors or warnings)'],
+ ['validated','#15803d','dpkg-deb: control parses and the archive contains a .ttf/.otf — well-formed and really contains fonts'],
+ ['built','#06b6d4','.deb produced but did NOT pass validation (control failed to parse, or no fonts inside)'],
+ ['drafted','#eab308','a debian/ tree is drafted on disk; the .deb is not built yet'],
+ ['draftable','#64748b','built family, ready to draft a debian/ tree'],
+ ['deb-failed','#ef4444','dpkg-deb failed to build the .deb'],
+];
+function pkgStatusKey(b){const ds=b.deb_status||'';
+ if(ds=='lint-clean'||ds=='validated'||ds=='built')return ds;
+ if(ds=='failed')return 'deb-failed';
+ return b.packaged?'drafted':'draftable';}
+function pkgCounts(){const cnt={};(snap.packages||[]).forEach(b=>{const k=pkgStatusKey(b);cnt[k]=(cnt[k]||0)+1});return cnt;}
+function packagingView(){
+ const secs=sections('packaging');
+ // deb toolchain on the LEFT half, package-status pie on the RIGHT half; per-family list below (full width)
+ const left=secs[0]?renderSec(secs[0]):'';
+ return '<div class="panes"><div>'+left+'</div><div>'+packagingPie()+'</div></div>'+(secs[1]?renderSec(secs[1]):'');
+}
+function packagingPie(){
+ const pk=snap.packages||[],cnt=pkgCounts(),total=pk.length||1;
+ const slices=PKG_STATES.filter(s=>cnt[s[0]]).map(s=>({label:s[0],value:cnt[s[0]],color:s[1],tip:s[2]}));
+ if(!slices.length)return chartCard('package status','<div class="muted">(no packages yet)</div>');
+ return chartCard('package status — '+pk.length+' families','<div class="dwrap">'+donutT(slices,64)+pieLegend(slices,total)+'</div>');
+}
+// donut with a <title> tooltip per slice (label · count · % · explanation)
+function donutT(slices,cx){
+ const r=cx-9,C=2*Math.PI*r,total=slices.reduce((a,s)=>a+(s.value||0),0)||1;let off=0,arcs='';
+ slices.forEach(s=>{const len=C*(s.value||0)/total;if(len>0){const pct=Math.round(100*s.value/total);
+  arcs+='<circle cx="'+cx+'" cy="'+cx+'" r="'+r+'" fill="none" stroke="'+s.color+'" stroke-width="14" stroke-dasharray="'+len+' '+(C-len)+'" stroke-dashoffset="'+(-off)+'" transform="rotate(-90 '+cx+' '+cx+')"><title>'+E(s.label+': '+s.value+' ('+pct+'%) — '+(s.tip||''))+'</title></circle>';off+=len;}});
+ if(!arcs)arcs='<circle cx="'+cx+'" cy="'+cx+'" r="'+r+'" fill="none" stroke="#1e293b" stroke-width="14"/>';
+ return '<svg width="'+(cx*2)+'" height="'+(cx*2)+'" viewBox="0 0 '+(cx*2)+' '+(cx*2)+'">'+arcs+'</svg>';
+}
+function pieLegend(slices,total){return '<div class="legend">'+slices.map(s=>{const pct=Math.round(100*s.value/total);
+ return '<span title="'+E(s.tip||'')+'"><i style="background:'+s.color+'"></i>'+E(s.label)+' '+s.value+' ('+pct+'%)</span>';}).join('')+'</div>'}
 
 function charts(t){
  const c=snap.counts||{};
