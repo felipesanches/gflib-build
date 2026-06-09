@@ -86,6 +86,7 @@ pub struct Shared {
     pub qa_init: bool,                        // QA subsystem ready (binary resolved + queue seeded, or disabled)
     pub build_debs: bool,                     // SETTING (live): auto-draft+build .debs for built families
     pub packaged: HashSet<String>,            // families already packaged this session (de-dup; cleared on rebuild)
+    pub pkg_now: String,                      // package worker's current activity ("packaging <slug>" / "linting <slug>" / "")
     pub fontspector: Option<crate::model::FontspectorView>, // live aggregate (also written to _summary.json)
     // cohort map (R1: preserved across resume/migration; populated by R2's VenvManager later)
     pub cohort_members: BTreeMap<String, Vec<String>>,
@@ -380,6 +381,7 @@ impl Orchestrator {
             qa_init: false,
             build_debs: cfg.build_debs,
             packaged: HashSet::new(),
+            pkg_now: String::new(),
             fontspector: None,
             cohort_members: state.cohort_members,
             cohort_reqs: state.cohort_reqs,
@@ -1696,11 +1698,13 @@ impl Orchestrator {
                     // step never ran — so installing lintian after the fact still covers the whole backlog
                     // of already-"validated" packages. Sleep only when there's nothing left to lint.
                     if !self.relint_one(&pkg_root, &mut results) {
+                        self.shared.lock().unwrap().pkg_now.clear(); // truly idle: nothing to package or lint
                         thread::sleep(Duration::from_millis(500));
                     }
                     continue;
                 }
             };
+            self.shared.lock().unwrap().pkg_now = format!("packaging {}", slug); // publish activity for the queue view
             // gather inputs under the lock, then package OUTSIDE it (dpkg-deb is slow)
             let (res, fam, cohort_req) = {
                 let sh = self.shared.lock().unwrap();
@@ -1797,6 +1801,7 @@ impl Orchestrator {
             Some(x) => x,
             None => return false,
         };
+        self.shared.lock().unwrap().pkg_now = format!("linting {}", slug); // publish activity for the queue view
         let pool = pkg_root.join("pool");
         // None => the .deb is gone (or lintian wouldn't spawn); record an empty tag set so the package is
         // marked terminal (lint_tags present) and we don't spin on it forever.
@@ -1979,6 +1984,24 @@ impl Orchestrator {
             v.sort_by(|a, b| (b.severity == "E").cmp(&(a.severity == "E")).then(b.count.cmp(&a.count)));
             v
         };
+        // lint queue progress: lintable = packages with a .deb; done = those lintian has run on (lint_tags present)
+        let (lint_total, lint_done) = deb_obj
+            .as_ref()
+            .map(|obj| {
+                let mut total = 0usize;
+                let mut done = 0usize;
+                for (_s, r) in obj.iter() {
+                    if r.get("built").and_then(|b| b.as_bool()).unwrap_or(false) {
+                        total += 1;
+                        if r.get("lint_tags").is_some() {
+                            done += 1;
+                        }
+                    }
+                }
+                (total, done)
+            })
+            .unwrap_or((0, 0));
+        let lint_pending = lint_total.saturating_sub(lint_done);
         let sh = self.shared.lock().unwrap();
         let mut counts = Counts::default();
         let mut backends = Backends::default();
@@ -2283,6 +2306,7 @@ impl Orchestrator {
             v
         });
 
+        let pkg_pending = counts.built.saturating_sub(lint_total); // built families not yet packaged (read before `counts` moves)
         Snapshot {
             elapsed: self.elapsed(),
             disk_used_delta: 0,
@@ -2304,6 +2328,11 @@ impl Orchestrator {
             queued_list,
             fail_categories,
             lint_categories,
+            pkg_now: sh.pkg_now.clone(),
+            pkg_pending,
+            lint_total,
+            lint_done,
+            lint_pending,
             cohorts_ready: self
                 .venvs
                 .as_ref()

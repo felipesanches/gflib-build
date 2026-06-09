@@ -885,11 +885,23 @@ function pkgStatusKey(b){const ds=b.deb_status||'';
 function pkgCounts(){const cnt={};(snap.packages||[]).forEach(b=>{const k=pkgStatusKey(b);cnt[k]=(cnt[k]||0)+1});return cnt;}
 function packagingView(){
  const secs=sections('packaging');
- // deb toolchain on the LEFT half, package-status pie on the RIGHT half; lintian-category breakdown and
- // the per-family list below (full width)
+ // deb toolchain on the LEFT half; packaging-queue panel + package-status pie on the RIGHT half;
+ // lintian-category breakdown and the per-family list below (full width)
  const left=secs[0]?renderSec(secs[0]):'';
- return '<div class="panes"><div>'+left+'</div><div>'+packagingPie()+'</div></div>'+
+ return '<div class="panes"><div>'+left+'</div><div>'+packagingQueue()+packagingPie()+'</div></div>'+
    lintCatChart()+lintCatSection()+(secs[1]?renderSec(secs[1]):'');
+}
+// the .deb packaging/lint queue — mirrors the main build queue (live progress + current activity + backlog)
+function packagingQueue(){
+ const now=snap.pkg_now||'',lt=snap.lint_total||0,ld=snap.lint_done||0,lp=snap.lint_pending||0,pp=snap.pkg_pending||0;
+ const pct=lt?Math.floor(100*ld/lt):0,gw=lt?100*ld/lt:0;
+ const lintAvail=(snap.deb_tools||[]).some(t=>t.name=='lintian'&&t.present);
+ const act=now?('▶ '+E(now)):(snap.paused?'paused (the global pause also halts packaging/linting)':'idle — nothing to package or lint');
+ return '<div class="chart"><div class="ctitle">packaging queue</div>'+
+  '<div class="'+(now?'y':'muted')+'" style="margin:2px 0 5px">'+act+'</div>'+
+  '<div class="barwrap" style="height:14px"><div class="seg" style="width:'+gw+'%;background:#22c55e"></div><div class="seg" style="width:'+(100-gw)+'%;background:#334155"></div><div class="barlbl">lintian '+ld+' / '+lt+' ('+pct+'%)</div></div>'+
+  '<div class="legend"><span title="built families whose .deb is not built yet">to package: '+pp+'</span><span title="packages with a .deb that lintian has not run on yet">to lint: '+lp+'</span>'+
+   (lintAvail?'':'<span class="r" title="install lintian via the deb toolchain panel to drain the lint queue">⚠ lintian not installed — lint queue stalled</span>')+'</div></div>';
 }
 // lintian findings grouped by tag (the packaging analogue of the build "Failures by cause" view)
 function lintcatRow(c){const isE=c.severity=='E';

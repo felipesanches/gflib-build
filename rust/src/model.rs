@@ -335,6 +335,12 @@ pub struct Snapshot {
     #[serde(default)] pub queued_list: Vec<QueuedItem>,
     #[serde(default)] pub fail_categories: Vec<FailCategory>,
     #[serde(default)] pub lint_categories: Vec<LintCategory>, // lintian findings grouped by tag (packaging)
+    // packaging/lint queue (the .deb pipeline, mirroring the main build queue)
+    #[serde(default)] pub pkg_now: String,      // current package-worker activity ("packaging/linting <slug>" or "")
+    #[serde(default)] pub pkg_pending: usize,    // built families not yet packaged (.deb to build)
+    #[serde(default)] pub lint_total: usize,     // packages with a .deb (lintable)
+    #[serde(default)] pub lint_done: usize,      // of those, how many lintian has already run on
+    #[serde(default)] pub lint_pending: usize,   // lintable packages still awaiting lintian
     #[serde(default)] pub cohorts: Vec<CohortView>,
     #[serde(default)] pub cohorts_ready: usize,
     #[serde(default)] pub tool_packages: Vec<ToolPkg>, // build-tool packages + their dependent families

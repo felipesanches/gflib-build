@@ -902,10 +902,32 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                     (format!("{:>9}", human(b.bytes)), Color::Grey),
                 ]
             }).collect();
-            let mut secs = vec![SectionR {
-                title: "Deb toolchain  (install any ✗ to enable deb building/validation — auto-detected, recovers in ~5s)".into(),
-                dview: "", rows: dt_rows, keys: snap.deb_tools.iter().map(|t| t.name.clone()).collect(),
-            }];
+            // packaging/lint queue summary (mirrors the main build queue: live activity + backlog)
+            let lint_avail = snap.deb_tools.iter().any(|t| t.name == "lintian" && t.present);
+            let (act, acol) = if !snap.pkg_now.is_empty() {
+                (format!("▶ {}", snap.pkg_now), Color::Yellow)
+            } else if snap.paused {
+                ("paused (the global pause also halts packaging/linting)".into(), Color::Grey)
+            } else {
+                ("idle — nothing to package or lint".into(), Color::Grey)
+            };
+            let pct = if snap.lint_total > 0 { 100 * snap.lint_done / snap.lint_total } else { 0 };
+            let prog = format!(
+                "lintian {}/{} ({}%)   ·   to package: {}   ·   to lint: {}{}",
+                snap.lint_done, snap.lint_total, pct, snap.pkg_pending, snap.lint_pending,
+                if lint_avail { "" } else { "   ·   lintian NOT installed — lint queue stalled" }
+            );
+            let q_rows: Vec<Vec<(String, Color)>> = vec![
+                vec![(format!("  {}", act), acol)],
+                vec![(format!("  {}", prog), if lint_avail { Color::Cyan } else { Color::Red })],
+            ];
+            let mut secs = vec![
+                SectionR { title: "Packaging queue".into(), dview: "", rows: q_rows, keys: vec![] },
+                SectionR {
+                    title: "Deb toolchain  (install any ✗ to enable deb building/validation — auto-detected, recovers in ~5s)".into(),
+                    dview: "", rows: dt_rows, keys: snap.deb_tools.iter().map(|t| t.name.clone()).collect(),
+                },
+            ];
             if !snap.lint_categories.is_empty() {
                 let lc_rows: Vec<Vec<(String, Color)>> = snap.lint_categories.iter().map(|c| {
                     let col = if c.severity == "E" { Color::Red } else { Color::DarkYellow };
