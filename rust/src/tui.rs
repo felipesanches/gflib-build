@@ -902,16 +902,30 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                     (format!("{:>9}", human(b.bytes)), Color::Grey),
                 ]
             }).collect();
-            vec![
-                SectionR {
-                    title: "Deb toolchain  (install any ✗ to enable deb building/validation — auto-detected, recovers in ~5s)".into(),
-                    dview: "", rows: dt_rows, keys: snap.deb_tools.iter().map(|t| t.name.clone()).collect(),
-                },
-                SectionR {
-                    title: "Packaging — per-family status  (draftable → drafted → built → validated → lintian: clean / warn / fail · ENTER = debian/ metadata)".into(),
-                    dview: "package", rows, keys: snap.packages.iter().map(|b| b.slug.clone()).collect(),
-                },
-            ]
+            let mut secs = vec![SectionR {
+                title: "Deb toolchain  (install any ✗ to enable deb building/validation — auto-detected, recovers in ~5s)".into(),
+                dview: "", rows: dt_rows, keys: snap.deb_tools.iter().map(|t| t.name.clone()).collect(),
+            }];
+            if !snap.lint_categories.is_empty() {
+                let lc_rows: Vec<Vec<(String, Color)>> = snap.lint_categories.iter().map(|c| {
+                    let col = if c.severity == "E" { Color::Red } else { Color::DarkYellow };
+                    vec![
+                        (format!("{:>4}  ", c.count), col),
+                        (format!("{} {:<42}", if c.severity == "E" { "E" } else { "W" }, head(&c.tag, 42)), col),
+                        (format!(" {} pkgs", c.count), Color::Grey),
+                    ]
+                }).collect();
+                secs.push(SectionR {
+                    title: "Lintian findings by category  (E = error · W = warning · ENTER = affected packages)".into(),
+                    dview: "lintcat", rows: lc_rows,
+                    keys: snap.lint_categories.iter().map(|c| format!("{}:{}", c.severity, c.tag)).collect(),
+                });
+            }
+            secs.push(SectionR {
+                title: "Packaging — per-family status  (draftable → drafted → built → validated → lintian: clean / warn / fail · ENTER = debian/ metadata)".into(),
+                dview: "package", rows, keys: snap.packages.iter().map(|b| b.slug.clone()).collect(),
+            });
+            secs
         }
         "tools" => {
             // build-tool packages, classified python/rust: the M5 (Python->Rust) burn-down view.
@@ -1984,6 +1998,21 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
                 o.push(String::new());
                 o.push("what to do:".into());
                 o.push(format!("  {}", fc.hint));
+            }
+        }
+        "lintcat" => {
+            if let Some(c) = snap.lint_categories.get(sel) {
+                o.push(format!("lintian {}: {}", if c.severity == "E" { "error" } else { "warning" }, c.tag));
+                o.push(format!("packages affected: {}", c.count));
+                o.push(format!("lintian tag docs: https://lintian.debian.org/tags/{}", c.tag));
+                o.push(String::new());
+                o.push("affected packages:".into());
+                if c.families.is_empty() {
+                    o.push("  (none)".into());
+                }
+                for s in &c.families {
+                    o.push(format!("  {}", s));
+                }
             }
         }
         "history" => {

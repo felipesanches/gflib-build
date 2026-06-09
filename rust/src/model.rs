@@ -144,6 +144,15 @@ pub struct FailCategory {
     #[serde(default)] pub families: Vec<String>,
 }
 
+/// One lintian finding tag grouped across packages (the packaging analogue of FailCategory).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LintCategory {
+    #[serde(default)] pub tag: String,
+    #[serde(default)] pub severity: String, // "E" (error) | "W" (warning)
+    #[serde(default)] pub count: usize,      // packages affected
+    #[serde(default)] pub families: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CohortView {
     #[serde(default)] pub key: String,
@@ -325,6 +334,7 @@ pub struct Snapshot {
     #[serde(default)] pub packages: Vec<BuiltItem>, // ALL built families (uncapped) for the packaging tab
     #[serde(default)] pub queued_list: Vec<QueuedItem>,
     #[serde(default)] pub fail_categories: Vec<FailCategory>,
+    #[serde(default)] pub lint_categories: Vec<LintCategory>, // lintian findings grouped by tag (packaging)
     #[serde(default)] pub cohorts: Vec<CohortView>,
     #[serde(default)] pub cohorts_ready: usize,
     #[serde(default)] pub tool_packages: Vec<ToolPkg>, // build-tool packages + their dependent families

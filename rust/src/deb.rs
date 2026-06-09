@@ -238,10 +238,16 @@ pub fn package_one_family(
         let pkg_dir = pkg_root.join(util::slug_to_logname(slug));
         let r = build_one_deb(&pkg_dir, &pool, &pkg, &version, fam, &fonts, lint_present);
         out.deb_built = r.built;
-        out.deb_result = Some(serde_json::json!({
+        let mut dr = serde_json::json!({
             "built": r.built, "validated": r.validated, "deb_bytes": r.deb_bytes,
             "lint": r.lint, "error": r.error, "package": pkg, "version": version,
-        }));
+        });
+        // only record lint_tags when lintian actually ran — its absence marks a package as still
+        // needing a (re-)lint, so the retroactive pass can tell "clean (no tags)" from "not yet linted".
+        if r.lint_ran {
+            dr["lint_tags"] = serde_json::json!(tags_json(&r.lint_tags));
+        }
+        out.deb_result = Some(dr);
     }
     out.index_entry = Some(serde_json::json!({
         "slug": slug, "package": pkg, "version": version, "license": spdx,
@@ -589,6 +595,8 @@ struct DebResult {
     validated: bool,
     deb_bytes: u64,
     lint: String,
+    lint_ran: bool,                  // lintian actually executed (distinguishes "clean, no tags" from "not run")
+    lint_tags: Vec<(char, String)>,  // distinct (severity, tag) findings, for category grouping
     error: String,
 }
 
@@ -705,7 +713,11 @@ fn build_one_deb(
     let report_path = pool.join(format!("{}_{}.lintian.txt", pkg, version));
     res.lint = if lint {
         match run_lintian(&deb_path, &report_path) {
-            Some(s) => s,
+            Some((s, tags)) => {
+                res.lint_ran = true;
+                res.lint_tags = tags;
+                s
+            }
             None => {
                 let _ = std::fs::remove_file(&report_path);
                 "lintian failed to run".into()
@@ -782,9 +794,22 @@ pub fn package_metadata(build_dir: &Path, slug: &str) -> String {
     out
 }
 
-/// Run lintian on `deb`, save the full report to `report_path`, and return the summary string
-/// ("clean" | "N warnings" | "N errors, M warnings"). None if lintian could not be spawned.
-fn run_lintian(deb: &Path, report_path: &Path) -> Option<String> {
+/// Parse a lintian output line `E: pkg: tag args…` (or `W: …`) into (severity, tag). Other lines → None.
+fn lint_line_tag(line: &str) -> Option<(char, String)> {
+    let sev = line.as_bytes().first().copied()? as char;
+    if sev != 'E' && sev != 'W' {
+        return None;
+    }
+    let rest = line.strip_prefix("E: ").or_else(|| line.strip_prefix("W: "))?;
+    let after_pkg = rest.splitn(2, ": ").nth(1)?; // drop the "pkg: " prefix
+    let tag = after_pkg.split_whitespace().next()?;
+    Some((sev, tag.to_string()))
+}
+
+/// Run lintian on `deb`, save the full report to `report_path`, and return (summary, distinct findings).
+/// summary is "clean" | "N warnings" | "N errors, M warnings"; findings are distinct (severity, tag)
+/// pairs (a package counts once per tag) for category grouping. None if lintian could not be spawned.
+fn run_lintian(deb: &Path, report_path: &Path) -> Option<(String, Vec<(char, String)>)> {
     let o = std::process::Command::new("lintian").arg(deb).output().ok()?;
     let txt = String::from_utf8_lossy(&o.stdout);
     let body = if txt.trim().is_empty() {
@@ -795,25 +820,39 @@ fn run_lintian(deb: &Path, report_path: &Path) -> Option<String> {
     let _ = std::fs::write(report_path, body.as_bytes());
     let e = txt.lines().filter(|l| l.starts_with("E:")).count();
     let w = txt.lines().filter(|l| l.starts_with("W:")).count();
-    Some(if e > 0 {
+    let mut tags: Vec<(char, String)> = Vec::new();
+    for l in txt.lines() {
+        if let Some(t) = lint_line_tag(l) {
+            if !tags.contains(&t) {
+                tags.push(t);
+            }
+        }
+    }
+    let summary = if e > 0 {
         format!("{} errors, {} warnings", e, w)
     } else if w > 0 {
         format!("{} warnings", w)
     } else {
         "clean".into()
-    })
+    };
+    Some((summary, tags))
+}
+
+/// (severity, tag) pairs as JSON-friendly [sev, tag] string arrays.
+fn tags_json(tags: &[(char, String)]) -> Vec<[String; 2]> {
+    tags.iter().map(|(s, t)| [s.to_string(), t.clone()]).collect()
 }
 
 /// Retroactively lint an already-built .deb (no rebuild): runs lintian on `pool/<pkg>_<ver>_all.deb`,
-/// saves the report, and returns the summary. None if the .deb is missing or lintian can't be spawned.
-/// Lets a freshly-installed lintian cover the whole backlog of already-validated packages.
-pub fn relint_deb(pool: &Path, pkg: &str, version: &str) -> Option<String> {
+/// saves the report, and returns (summary, [sev,tag] findings). None if the .deb is missing or lintian
+/// can't be spawned. Lets a freshly-installed lintian cover the whole backlog of already-validated packages.
+pub fn relint_deb(pool: &Path, pkg: &str, version: &str) -> Option<(String, Vec<[String; 2]>)> {
     let deb = pool.join(format!("{}_{}_all.deb", pkg, version));
     if !deb.is_file() {
         return None;
     }
     let report_path = pool.join(format!("{}_{}.lintian.txt", pkg, version));
-    run_lintian(&deb, &report_path)
+    run_lintian(&deb, &report_path).map(|(s, tags)| (s, tags_json(&tags)))
 }
 
 /// Public: the built .deb path for a slug (for download), or None if not built.
@@ -973,6 +1012,21 @@ mod tests {
         assert_eq!(license_for("ufl/z").0, "UFL-1.0");
         assert!(license_for("googlefonts/w").2); // unknown prefix -> fallback flagged
         assert!(!license_for("ofl/x").2);
+    }
+
+    #[test]
+    fn lintian_line_tag_parsing() {
+        assert_eq!(lint_line_tag("E: fonts-gf-kosugi: no-copyright-file"), Some(('E', "no-copyright-file".into())));
+        // tag followed by args (path, parenthetical) -> just the tag
+        assert_eq!(
+            lint_line_tag("E: fonts-gf-robotoslab: no-changelog usr/share/doc/fonts-gf-robotoslab/changelog.Debian.gz (non-native package)"),
+            Some(('E', "no-changelog".into()))
+        );
+        assert_eq!(lint_line_tag("W: pkg: spelling-error-in-description foo bar"), Some(('W', "spelling-error-in-description".into())));
+        // non-finding lines are ignored
+        assert_eq!(lint_line_tag("N: 1 hint"), None);
+        assert_eq!(lint_line_tag(""), None);
+        assert_eq!(lint_line_tag("I: pkg: some-info"), None); // only E/W are findings we group
     }
 
     #[test]

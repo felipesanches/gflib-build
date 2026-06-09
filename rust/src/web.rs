@@ -767,6 +767,8 @@ function openDetail(kind,id){
   lines=['kind: '+q.kind,'',why];
  } else if(kind=='failcat'){const c=findBy(snap.fail_categories,'cat',id);if(!c)return;title='Failure cause: '+c.cat;
   lines=['families affected: '+c.count,'','affected families:'];(c.families&&c.families.length?c.families:['(none)']).forEach(s=>lines.push('  '+s));lines.push('','what to do:','  '+(c.hint||''));
+ } else if(kind=='lintcat'){const c=(snap.lint_categories||[]).find(x=>x.severity+':'+x.tag==id);if(!c)return;title='lintian '+(c.severity=='E'?'error':'warning')+': '+c.tag;
+  lines=['severity: '+(c.severity=='E'?'ERROR':'warning'),'packages affected: '+c.count,'lintian tag docs: https://lintian.debian.org/tags/'+c.tag,'','affected packages:'];(c.families&&c.families.length?c.families:['(none)']).forEach(s=>lines.push('  '+s));
  } else if(kind=='history'){const h=findBy(snap.failure_history,'slug',id);if(!h)return;slug=id;title='Failed (history): '+h.slug;
   lines=['cause: '+h.cause,'provenance: '+prov(h),'rebuild: gflib-build --only '+h.slug+' --rebuild --yes','','error:','  '+(h.error||'')];
  } else if(kind=='task'){const t=findBy(snap.tasks,'key',id);if(!t)return;title='Pipeline task: '+t.name;
@@ -883,10 +885,20 @@ function pkgStatusKey(b){const ds=b.deb_status||'';
 function pkgCounts(){const cnt={};(snap.packages||[]).forEach(b=>{const k=pkgStatusKey(b);cnt[k]=(cnt[k]||0)+1});return cnt;}
 function packagingView(){
  const secs=sections('packaging');
- // deb toolchain on the LEFT half, package-status pie on the RIGHT half; per-family list below (full width)
+ // deb toolchain on the LEFT half, package-status pie on the RIGHT half; lintian-category breakdown and
+ // the per-family list below (full width)
  const left=secs[0]?renderSec(secs[0]):'';
- return '<div class="panes"><div>'+left+'</div><div>'+packagingPie()+'</div></div>'+(secs[1]?renderSec(secs[1]):'');
+ return '<div class="panes"><div>'+left+'</div><div>'+packagingPie()+'</div></div>'+
+   lintCatChart()+lintCatSection()+(secs[1]?renderSec(secs[1]):'');
 }
+// lintian findings grouped by tag (the packaging analogue of the build "Failures by cause" view)
+function lintcatRow(c){const isE=c.severity=='E';
+ return {segs:[[Rp(c.count,4)+'  ',isE?'r':'o'],[(isE?'E ':'W ')+L(c.tag,38),isE?'r':'o'],[' '+c.count+' '+(c.count==1?'package':'packages'),'muted']],det:['lintcat',c.severity+':'+c.tag]}}
+function lintCatChart(){const cats=(snap.lint_categories||[]).slice(0,10).map(c=>({label:(c.severity=='E'?'E ':'W ')+c.tag,value:c.count,color:c.severity=='E'?'#ef4444':'#fb923c'}));
+ return cats.length?'<div class="chartrow">'+chartCard('lintian findings by category (top 10 · red=error · amber=warning)',barChart(cats))+'</div>':'';}
+function lintCatSection(){const cats=snap.lint_categories||[];
+ if(!cats.length)return '';
+ return renderSec({title:'Lintian findings by category  (E = error · W = warning · click a row for the affected packages)',rows:cats.map(lintcatRow)});}
 function packagingPie(){
  const pk=snap.packages||[],cnt=pkgCounts(),total=pk.length||1;
  const slices=PKG_STATES.filter(s=>cnt[s[0]]).map(s=>({label:s[0],value:cnt[s[0]],color:s[1],tip:s[2]}));

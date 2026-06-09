@@ -1778,14 +1778,16 @@ impl Orchestrator {
         if !crate::deb::on_path("lintian") {
             return false; // lintian not installed yet — nothing to do (the toolchain panel flags it)
         }
-        // a result needs linting if it built a .deb but has no real lintian verdict yet
+        // a result needs (re-)linting if it built a .deb but has no recorded lint_tags breakdown yet —
+        // this covers BOTH packages linted when lintian was absent AND ones linted by an older binary
+        // that recorded a verdict but no tags. A real lint (or a terminal failure) always writes
+        // lint_tags, so processed packages drop out and the sweep converges.
         let pick = results.iter().find_map(|(slug, r)| {
             if !r.get("built").and_then(|b| b.as_bool()).unwrap_or(false) {
                 return None;
             }
-            let lint = r.get("lint").and_then(|v| v.as_str()).unwrap_or("");
-            if !(lint.is_empty() || lint == "not run (lintian absent)") {
-                return None; // already has a clean/warnings/errors verdict (or a terminal failure)
+            if r.get("lint_tags").is_some() {
+                return None; // already has a tag breakdown (linted, or marked terminal)
             }
             let pkg = r.get("package").and_then(|v| v.as_str())?;
             let ver = r.get("version").and_then(|v| v.as_str())?;
@@ -1796,10 +1798,13 @@ impl Orchestrator {
             None => return false,
         };
         let pool = pkg_root.join("pool");
-        // None => the .deb is gone (or lintian wouldn't spawn); mark terminal so we don't spin on it forever
-        let verdict = crate::deb::relint_deb(&pool, &pkg, &ver).unwrap_or_else(|| "no .deb on disk".into());
+        // None => the .deb is gone (or lintian wouldn't spawn); record an empty tag set so the package is
+        // marked terminal (lint_tags present) and we don't spin on it forever.
+        let (verdict, tags) = crate::deb::relint_deb(&pool, &pkg, &ver)
+            .unwrap_or_else(|| ("no .deb on disk".into(), Vec::new()));
         if let Some(obj) = results.get_mut(&slug).and_then(|v| v.as_object_mut()) {
             obj.insert("lint".into(), serde_json::json!(verdict));
+            obj.insert("lint_tags".into(), serde_json::json!(tags));
         }
         write_deb_results(pkg_root, results);
         true
@@ -1910,34 +1915,70 @@ impl Orchestrator {
         // the lock — it has its own cache mutex, no central-lock dependency.
         let deb_tools = crate::deb::deb_tools_cached();
         // per-package deb-build status from packaging/build-results.json (read once, before the lock)
-        let deb_results: std::collections::HashMap<String, (String, String)> = std::fs::read_to_string(
+        let deb_obj: Option<serde_json::Map<String, serde_json::Value>> = std::fs::read_to_string(
             self.cfg.build_dir.join("packaging").join("build-results.json"),
         )
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| v.get("results").and_then(|r| r.as_object()).cloned())
-        .map(|obj| {
-            obj.iter()
-                .map(|(slug, res)| {
-                    let built = res.get("built").and_then(|b| b.as_bool()).unwrap_or(false);
-                    let validated = res.get("validated").and_then(|b| b.as_bool()).unwrap_or(false);
-                    let lint = res.get("lint").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    // once lintian has run, the lintian verdict supersedes "validated":
-                    //   errors   -> lintian-fail    (a regression — dpkg-deb ok, but lintian found errors)
-                    //   warnings -> lint-warn        (passed lintian, no errors, but with warnings)
-                    //   clean    -> lint-clean       (passed lintian with nothing at all)
-                    //   not run  -> validated        (dpkg-deb ok; lintian hasn't run yet)
-                    let st = if validated {
-                        if lint.contains("error") { "lintian-fail" }
-                        else if lint == "clean" { "lint-clean" }
-                        else if lint.contains("warning") { "lint-warn" }
-                        else { "validated" }
-                    } else if built { "built" } else { "failed" };
-                    (slug.clone(), (st.to_string(), lint))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+        .and_then(|v| v.get("results").and_then(|r| r.as_object()).cloned());
+        let deb_results: std::collections::HashMap<String, (String, String)> = deb_obj
+            .as_ref()
+            .map(|obj| {
+                obj.iter()
+                    .map(|(slug, res)| {
+                        let built = res.get("built").and_then(|b| b.as_bool()).unwrap_or(false);
+                        let validated = res.get("validated").and_then(|b| b.as_bool()).unwrap_or(false);
+                        let lint = res.get("lint").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        // once lintian has run, the lintian verdict supersedes "validated":
+                        //   errors   -> lintian-fail    (a regression — dpkg-deb ok, but lintian found errors)
+                        //   warnings -> lint-warn        (passed lintian, no errors, but with warnings)
+                        //   clean    -> lint-clean       (passed lintian with nothing at all)
+                        //   not run  -> validated        (dpkg-deb ok; lintian hasn't run yet)
+                        let st = if validated {
+                            if lint.contains("error") { "lintian-fail" }
+                            else if lint == "clean" { "lint-clean" }
+                            else if lint.contains("warning") { "lint-warn" }
+                            else { "validated" }
+                        } else if built { "built" } else { "failed" };
+                        (slug.clone(), (st.to_string(), lint))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // group lintian findings by (severity, tag) across all packages — the packaging analogue of
+        // fail_categories. Each package contributes once per distinct tag it carries.
+        let lint_categories: Vec<crate::model::LintCategory> = {
+            let mut cat: BTreeMap<(String, String), (usize, Vec<String>)> = BTreeMap::new();
+            if let Some(obj) = deb_obj.as_ref() {
+                for (slug, res) in obj.iter() {
+                    let tags = match res.get("lint_tags").and_then(|v| v.as_array()) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    for t in tags {
+                        let arr = match t.as_array() {
+                            Some(a) => a,
+                            None => continue,
+                        };
+                        let sev = arr.first().and_then(|x| x.as_str()).unwrap_or("");
+                        let tag = arr.get(1).and_then(|x| x.as_str()).unwrap_or("");
+                        if tag.is_empty() {
+                            continue;
+                        }
+                        let e = cat.entry((sev.to_string(), tag.to_string())).or_insert((0, Vec::new()));
+                        e.0 += 1;
+                        e.1.push(slug.clone());
+                    }
+                }
+            }
+            let mut v: Vec<crate::model::LintCategory> = cat
+                .into_iter()
+                .map(|((severity, tag), (count, families))| crate::model::LintCategory { tag, severity, count, families })
+                .collect();
+            // errors before warnings, then most-affected first
+            v.sort_by(|a, b| (b.severity == "E").cmp(&(a.severity == "E")).then(b.count.cmp(&a.count)));
+            v
+        };
         let sh = self.shared.lock().unwrap();
         let mut counts = Counts::default();
         let mut backends = Backends::default();
@@ -2262,6 +2303,7 @@ impl Orchestrator {
             packages,
             queued_list,
             fail_categories,
+            lint_categories,
             cohorts_ready: self
                 .venvs
                 .as_ref()
