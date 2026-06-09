@@ -15,17 +15,12 @@ and version built — or failed to build — every family**. It prefers [`fontc`
 The whole run is driven from a **live dashboard** — a terminal UI or a browser — that you can detach
 from and reattach to while builds keep running in the background.
 
-```
- Google Fonts library build                                   elapsed 01:23:45
- disk used 142.8GiB  free 290.0GiB                            412/1503 attempted (27%)
- Phase: building
- [#####████████──────────────────────────────────────────]  built 412 · failed 7 · 1084 left
-  config  overview  queue  cohorts  built  failures  stats        [Tab] switch tabs
- ▶ Now building (8) ─────────────────────────────────────────────────────────
-  ofl/notosanstc          02:10  checkout        ofl/cairoplay     00:41  fontc
- ▷ Recent failures (7) ──────────────────────────────────────────────────────
-  ofl/foldit              gftools.builder exit 1: KeyError 'instances'
-```
+![The gflib-build web dashboard, packaging view: live build progress, the package/lint queue, and a package-status breakdown](docs/screenshots/dashboard-packaging.png)
+
+![Lintian findings grouped by category, with per-family packaging status](docs/screenshots/dashboard-lintian-findings.png)
+
+*The browser dashboard (`--ui web`), shown here on the optional `.deb`-packaging view. The same live
+state renders identically in the terminal UI (`--ui curses`).*
 
 ## Why
 
