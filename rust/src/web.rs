@@ -481,25 +481,37 @@ function showIf(k,cf){const s=x=>(cf[x]==null?'':''+cf[x]);
 const CHOICES={source:['metadata','archive'],backend:['auto','fontc','fontmake','both']};
 // the keys the daemon actually honours live (same set as the TUI's cfg_apply_live) → editable form controls
 const LIVE_APPLY={backend:1,jobs:1,percent:1,compare:1,build_debs:1};
+// logical groupings for the config panel (related settings under one sub-header)
+const GROUPS=[
+ {t:'Sources & paths', k:['source','google_fonts','archive','build_dir']},
+ {t:'Build engine',    k:['backend','fontc_bin','build_fontc','manage_venvs','jobs','timeout']},
+ {t:'Scope',           k:['percent','retry_failed','populate_archive']},
+ {t:'QA & packaging',  k:['compare','fontspector_qa','build_debs']},
+];
+// one form control per field: live → an editable widget that posts straight to control.json;
+// otherwise a real (greyed) widget that shows the current value but isn't editable on a running build.
+function cfgCell(f,cf){
+ const v=cf[f.k], live=LIVE_APPLY[f.k];
+ if(f.t=='bool') // a REAL checkbox (disabled+greyed when not live); its state alone conveys the value
+  return '<input type="checkbox"'+(v?' checked':'')+(live?' onchange="ctl({'+f.k+':this.checked})"':' disabled')+'>';
+ if(f.t=='choice'){const ch=CHOICES[f.k]||[];
+  if(live)return '<select onchange="ctl({'+f.k+':this.value})">'+ch.map(o=>'<option'+(o==v?' selected':'')+'>'+E(o)+'</option>').join('')+'</select>';
+  return '<span class="muted">'+E(ch.includes(v)?v:(ch[0]||''))+'</span>';}
+ if(live&&f.t=='step')
+  return '<input type="number"'+(f.k=='percent'?' min="1" max="100"':' min="1"')+' value="'+E(v==null?'':v)+'" onchange="ctl({'+f.k+':+this.value})">';
+ return '<span class="muted">'+E(v==null?(f.k=='timeout'?'0':''):''+v)+'</span>';
+}
 function cfgView(){const cf=snap.config||{};
- let h='<div class="sec">Configuration — edit settings (live where possible)</div><table class="cfg">';
- SCHEMA.filter(f=>showIf(f.k,cf)).forEach(f=>{
-  let v=cf[f.k],cell;
-  if(LIVE_APPLY[f.k]){
-   // an editable form control that posts the change straight to control.json
-   if(f.t=='choice'){const ch=CHOICES[f.k]||[];cell='<select onchange="ctl({'+f.k+':this.value})">'+ch.map(o=>'<option'+(o==v?' selected':'')+'>'+E(o)+'</option>').join('')+'</select>';}
-   else if(f.t=='bool')cell='<input type="checkbox"'+(v?' checked':'')+' onchange="ctl({'+f.k+':this.checked})">';
-   else cell='<input type="number"'+(f.k=='percent'?' min="1" max="100"':' min="1"')+' value="'+E(v==null?'':v)+'" onchange="ctl({'+f.k+':+this.value})"> <span class="muted">(live)</span>';
-  } else {
-   let val;
-   if(f.t=='bool')val=v?'[x] yes':'[ ] no';
-   else if(f.t=='choice'){const ch=CHOICES[f.k]||[];val='‹ '+(ch.includes(v)?v:(ch[0]||''))+' ›';}
-   else val=(v==null?(f.k=='timeout'?'0':''):''+v);
-   cell='<span class="muted">'+E(val)+'  (restart: C)</span>';
-  }
-  h+='<tr><td class="w">'+E(f.l)+'</td><td>'+cell+'</td></tr>';
+ let h='<div class="sec">Configuration</div>';
+ h+='<div class="ln muted">Editable controls apply live. Greyed settings are fixed at startup — change them via CLI flags (or the terminal config tab), then restart to apply.</div>';
+ h+='<div class="ln"><button class="tbtn" onclick="if(confirm(\'Restart the daemon now? In-flight builds are interrupted and resume from saved state.\'))ctl({restart:true})">↻ Restart daemon</button></div>';
+ GROUPS.forEach(g=>{
+  const fs=SCHEMA.filter(f=>g.k.includes(f.k)&&showIf(f.k,cf));
+  if(!fs.length)return;
+  h+='<div class="sec">'+E(g.t)+'</div><table class="cfg">';
+  fs.forEach(f=>{h+='<tr><td class="w">'+E(f.l)+'</td><td>'+cfgCell(f,cf)+'</td></tr>';});
+  h+='</table>';
  });
- h+='</table>';
  const dr=snap.dep_relaxations||[];
  if(dr.length)h+='<div class="sec">auto-fixed dependencies (no manual pinning needed)</div>'+dr.map(l=>'<div class="ln y">'+E(l)+'</div>').join('');
  const cl=snap.control_log||[];

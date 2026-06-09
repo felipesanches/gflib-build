@@ -386,6 +386,7 @@ pub struct ControlSet {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_all: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_overrides: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub build_debs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub restart: Option<bool>, // re-exec the daemon (apply startup-only settings)
 }
 
 #[cfg(test)]
@@ -435,5 +436,8 @@ mod tests {
         // and an unset retry_overrides is omitted (not null) so the control.json stays byte-compatible
         let cs2 = ControlSet { retry: Some(vec!["ofl/y".into()]), ..Default::default() };
         assert!(!serde_json::to_string(&cs2).unwrap().contains("retry_overrides"));
+        assert!(!serde_json::to_string(&cs2).unwrap().contains("restart"));
+        // the web "Restart daemon" button posts exactly this
+        assert_eq!(serde_json::from_str::<ControlSet>(r#"{"restart":true}"#).unwrap().restart, Some(true));
     }
 }

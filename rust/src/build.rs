@@ -1557,6 +1557,9 @@ impl Orchestrator {
             self.ensure_workers(j);
         }
         self.cond.notify_all();
+        if set.restart == Some(true) {
+            self.restart_self(); // exec's the daemon — does not return on success
+        }
     }
 
     fn spawn_status_writer(self: &Arc<Self>) {
@@ -1761,6 +1764,31 @@ impl Orchestrator {
         self.signal_running(SIGCONT);
         self.signal_running(SIGKILL);
         self.cond.notify_all();
+    }
+
+    /// Re-exec the daemon in place to apply startup-only settings (the web "Restart" button / a config
+    /// change that isn't live). Flush state, reap in-flight children (so nothing orphans), then exec the
+    /// same binary+args minus --detach/--no-detach (we're already the daemon — don't re-fork). The new
+    /// process resumes from state.json; interrupted builds re-queue. Returns only if exec fails.
+    fn restart_self(self: &Arc<Self>) {
+        if self.cfg.dry_run {
+            return; // the mockup never touches the real session
+        }
+        self.shared.lock().unwrap().control_log.push(
+            "restart requested — re-exec'ing the daemon; in-flight builds resume from saved state".into());
+        self.save_state();
+        self.request_stop(); // SIGCONT+SIGKILL the in-flight builder groups → no orphans across the exec
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => { self.shared.lock().unwrap().control_log.push(format!("restart: current_exe failed: {}", e)); return; }
+        };
+        let args: Vec<std::ffi::OsString> = std::env::args_os()
+            .skip(1)
+            .filter(|a| a != "--detach" && a != "--no-detach")
+            .collect();
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(exe).args(&args).exec(); // replaces this process on success
+        self.shared.lock().unwrap().control_log.push(format!("restart failed (daemon left running): {}", err));
     }
 
     /// Send `sig` to every in-flight builder process group regardless of freeze state — used to reap

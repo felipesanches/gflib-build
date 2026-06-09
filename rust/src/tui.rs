@@ -80,24 +80,40 @@ struct CfgField {
 
 /// The schema in display order — (key, label, kind, live). Mirrors Python's CONFIG_SCHEMA.
 fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
+    // ordered by group (see cfg_group) so the config tab renders related fields under one sub-header
     vec![
+        // Sources & paths
         ("source", "worklist source", CfgKind::Choice(&SOURCE_CHOICES), false),
         ("google_fonts", "google/fonts clone", CfgKind::Path, false),
         ("archive", "repo archive", CfgKind::Path, false),
         ("build_dir", "build output dir", CfgKind::Path, false),
+        // Build engine
         ("backend", "build backend", CfgKind::Choice(&BACKEND_CHOICES), true),
         ("fontc_bin", "fontc binary", CfgKind::Path, false),
         ("build_fontc", "build fontc from source (if none)", CfgKind::Bool, false),
-        ("jobs", "parallel jobs", CfgKind::Step { step: 1.0, min: 1.0, max: 256.0 }, true),
-        ("percent", "percent of library", CfgKind::Step { step: 5.0, min: 1.0, max: 100.0 }, true),
-        ("timeout", "per-build timeout (0=off)", CfgKind::Step { step: 30.0, min: 0.0, max: 100000.0 }, true),
-        ("populate_archive", "populate archive (fetch repos)", CfgKind::Bool, true),
         ("manage_venvs", "cohort venvs", CfgKind::Bool, false),
+        ("jobs", "parallel jobs", CfgKind::Step { step: 1.0, min: 1.0, max: 256.0 }, true),
+        ("timeout", "per-build timeout (0=off)", CfgKind::Step { step: 30.0, min: 0.0, max: 100000.0 }, true),
+        // Scope
+        ("percent", "percent of library", CfgKind::Step { step: 5.0, min: 1.0, max: 100.0 }, true),
         ("retry_failed", "retry ALL failed (incl. genuine errors)", CfgKind::Bool, false),
+        ("populate_archive", "populate archive (fetch repos)", CfgKind::Bool, true),
+        // QA & packaging
         ("compare", "compare to shipped", CfgKind::Bool, true),
         ("fontspector_qa", "fontspector QA on green builds", CfgKind::Bool, false),
         ("build_debs", "build .deb packages (auto-package built families)", CfgKind::Bool, true),
     ]
+}
+
+/// The config-panel sub-section a field belongs to (drives the grouped headers in render_config).
+fn cfg_group(key: &str) -> &'static str {
+    match key {
+        "source" | "google_fonts" | "archive" | "build_dir" => "Sources & paths",
+        "backend" | "fontc_bin" | "build_fontc" | "manage_venvs" | "jobs" | "timeout" => "Build engine",
+        "percent" | "retry_failed" | "populate_archive" => "Scope",
+        "compare" | "fontspector_qa" | "build_debs" => "QA & packaging",
+        _ => "Other",
+    }
 }
 
 /// Python `{:g}` — trim a float to the shortest exact decimal (no trailing .0 for integers).
@@ -1508,6 +1524,7 @@ fn render_config(scr: &mut Screen, snap: &Snapshot, ui: &Ui, top: u16, bottom: u
 
     // scroll the fields if they'd overflow into the reserved panel rows (keep the active one visible)
     let mut field_budget = bottom.saturating_sub(row + 2).max(1) as usize;
+    field_budget = field_budget.saturating_sub(4).max(1); // reserve rows for up to 4 sub-section headers
     let mut fstart = 0usize;
     if vis.len() > field_budget {
         let afield = ui.cfg_active.min(vis.len().saturating_sub(1));
@@ -1518,12 +1535,23 @@ fn render_config(scr: &mut Screen, snap: &Snapshot, ui: &Ui, top: u16, bottom: u
             field_budget -= 1;
         }
     }
+    let mut prev_group = "";
     for idx in fstart..vis.len().min(fstart + field_budget) {
         let f = &ui.cfg_fields[vis[idx]];
+        let g = cfg_group(f.key);
+        if g != prev_group {
+            prev_group = g;
+            if row + 1 < bottom {
+                let mut hd = format!("─ {} ", g);
+                while hd.chars().count() < (w as usize).saturating_sub(2) { hd.push('─'); }
+                put(scr, row, 1, &hd, Color::DarkGrey, w);
+                row += 1;
+            }
+        }
         let active = ui.cfg_active == idx;
         let editable = cfg_editable(ui.setup, f);
         let valstr = match &f.kind {
-            CfgKind::Bool => if f.bval { "[x] yes".to_string() } else { "[ ] no".to_string() },
+            CfgKind::Bool => if f.bval { "[x]".to_string() } else { "[ ]".to_string() },
             CfgKind::Choice(_) => format!("‹ {} ›", f.value),
             _ => f.value.clone(),
         };
