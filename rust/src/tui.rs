@@ -1283,10 +1283,19 @@ fn render_tabbar_body(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16
     let mut row = body_top;
     if !snap.building.is_empty() && !ui.detail && sep_row.saturating_sub(row) >= 3 {
         let cap = snap.building.len().min(5).min((sep_row - row) as usize - 2).max(1);
+        // Break the count down by STAGE: only the compile stage (run_builder) can be paused/frozen; the
+        // venv-install ("installing deps") + checkout stages can't, which is why pausing/lowering jobs
+        // doesn't visibly freeze families still installing dependencies.
         let total = snap.building.len();
-        let mut hdr = if snap.frozen_builds > 0 && snap.frozen_builds <= total {
-            // job limit lowered → excess builds are SIGSTOP-frozen (not killed), draining to the limit
-            format!(" ▶ Now building ({} — {} active, {} frozen) ", total, total - snap.frozen_builds, snap.frozen_builds)
+        let compile = snap.running_builds.min(total);
+        let frozen = snap.frozen_builds.min(compile);
+        let other = total.saturating_sub(compile); // venv-install / checkout / pre-build (not freezable)
+        let mut parts: Vec<String> = Vec::new();
+        if compile > frozen { parts.push(format!("{} compiling", compile - frozen)); }
+        if frozen > 0 { parts.push(format!("{} frozen", frozen)); }
+        if other > 0 { parts.push(format!("{} installing/setup", other)); }
+        let mut hdr = if parts.len() > 1 {
+            format!(" ▶ Now building ({} — {}) ", total, parts.join(", "))
         } else {
             format!(" ▶ Now building ({}) ", total)
         };

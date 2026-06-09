@@ -577,8 +577,11 @@ function render(){
  // ---- pinned now-building (every tab) ----
  const bl=snap.building||[];let pin='';
  if(bl.length&&!pre){const cap=Math.min(bl.length,5);
-  const fz=snap.frozen_builds||0; // job limit lowered → excess builds SIGSTOP-frozen (draining to limit)
-  const lbl=(fz>0&&fz<=bl.length)?(bl.length+' — '+(bl.length-fz)+' active, '+fz+' frozen'):(''+bl.length);
+  // Break down by STAGE: only the compile stage can be paused/frozen; venv-install ("installing deps")
+  // + checkout can't — which is why pausing/lowering jobs doesn't visibly freeze families still installing.
+  const tot=bl.length,comp=Math.min(snap.running_builds||0,tot),fz=Math.min(snap.frozen_builds||0,comp),oth=Math.max(0,tot-comp);
+  const ps=[];if(comp>fz)ps.push((comp-fz)+' compiling');if(fz>0)ps.push(fz+' frozen');if(oth>0)ps.push(oth+' installing/setup');
+  const lbl=ps.length>1?(tot+' — '+ps.join(', ')):(''+tot);
   pin='<div class="pin"><div class="sec">▶ Now building ('+lbl+')</div>'+bl.slice(0,cap).map(b=>R(buildingRow(b))).join('')+
    (bl.length>cap?'<div class="ln muted">  … (+'+(bl.length-cap)+' more)</div>':'')+'</div>';}
  document.getElementById('pin').innerHTML=pin;
