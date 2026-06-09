@@ -888,7 +888,7 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                     "lint-clean" => ("✓ lint-clean", Color::Green), // validated + lintian clean (strictest)
                     "lint-warn" => ("lint-warn", Color::Yellow),    // validated + lintian warnings, no errors
                     "lintian-fail" => ("lintian-fail", Color::Red), // validated by dpkg-deb but lintian errors
-                    "validated" => ("validated", Color::DarkGreen), // dpkg-deb ok; lintian not run yet
+                    "validated" => ("validated", Color::DarkCyan),  // dpkg-deb ok; lintian not run yet
                     "built" => ("built", Color::Cyan),
                     "failed" => ("deb-failed", Color::DarkRed),
                     _ if b.packaged => ("drafted", Color::DarkYellow),

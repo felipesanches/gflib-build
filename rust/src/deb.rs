@@ -214,11 +214,14 @@ pub fn package_one_family(
 
     // Write every file, checking each result; on ANY failure skip the family entirely (do not index
     // it — a half-written tree is not a real package).
+    // also installed into the binary .deb's /usr/share/doc (see build_one_deb), so keep the strings
+    let copyright_txt = copyright(fam, dep5, &holder);
+    let changelog_txt = changelog(&pkg, &version, slug, &fam.commit, epoch);
     let writes: Vec<(PathBuf, String)> = vec![
         (debian.join("control"), control(&pkg, fam, spdx)),
         (rules_path.clone(), rules(&pkg, has_ttf, has_otf)),
-        (debian.join("copyright"), copyright(fam, dep5, &holder)),
-        (debian.join("changelog"), changelog(&pkg, &version, slug, &fam.commit, epoch)),
+        (debian.join("copyright"), copyright_txt.clone()),
+        (debian.join("changelog"), changelog_txt.clone()),
         (debian.join("watch"), watch(&fam.url)),
         (debian.join("source/format"), "3.0 (quilt)\n".to_string()),
         (
@@ -236,7 +239,7 @@ pub fn package_one_family(
 
     if build_debs {
         let pkg_dir = pkg_root.join(util::slug_to_logname(slug));
-        let r = build_one_deb(&pkg_dir, &pool, &pkg, &version, fam, &fonts, lint_present);
+        let r = build_one_deb(&pkg_dir, &pool, &pkg, &version, fam, &fonts, lint_present, &copyright_txt, &changelog_txt);
         out.deb_built = r.built;
         let mut dr = serde_json::json!({
             "built": r.built, "validated": r.validated, "deb_bytes": r.deb_bytes,
@@ -603,6 +606,7 @@ struct DebResult {
 /// Assemble + validate a binary .deb for one family from its built fonts. Stages a tree under
 /// `pkg_dir/_build/`, runs `dpkg-deb --root-owner-group --build` into `pool/`, then validates with
 /// `dpkg-deb --info`/`--contents` (+ `lintian` when present).
+#[allow(clippy::too_many_arguments)]
 fn build_one_deb(
     pkg_dir: &Path,
     pool: &Path,
@@ -611,6 +615,8 @@ fn build_one_deb(
     fam: &model::Family,
     fonts: &[PathBuf],
     lint: bool,
+    copyright_txt: &str,
+    changelog_txt: &str,
 ) -> DebResult {
     let mut res = DebResult::default();
     let famn = pkg.strip_prefix("fonts-gf-").unwrap_or(pkg);
@@ -656,6 +662,27 @@ fn build_one_deb(
     if std::fs::write(ctrl_dir.join("control"), binary_control(pkg, version, fam, installed_kb)).is_err() {
         res.error = "write DEBIAN/control failed".into();
         return res;
+    }
+
+    // /usr/share/doc/<pkg>/ : copyright + gzipped Debian changelog. Their absence is the universal
+    // no-copyright-file / no-changelog lintian error across the whole library.
+    let doc_dir = stage.join("usr/share/doc").join(pkg);
+    if std::fs::create_dir_all(&doc_dir).is_err() {
+        res.error = "doc mkdir failed".into();
+        return res;
+    }
+    if std::fs::write(doc_dir.join("copyright"), copyright_txt).is_err() {
+        res.error = "write copyright failed".into();
+        return res;
+    }
+    // changelog.Debian.gz — write plain, then `gzip -9 -n` (no name/mtime → reproducible & lintian-clean).
+    let clog_plain = doc_dir.join("changelog.Debian");
+    if std::fs::write(&clog_plain, changelog_txt).is_ok() {
+        let _ = std::process::Command::new("gzip").args(["-9", "-n", "-f"]).arg(&clog_plain).output();
+    }
+    if clog_plain.exists() {
+        // gzip unavailable/failed: drop the uncompressed file so we don't trip changelog-file-not-compressed
+        let _ = std::fs::remove_file(&clog_plain);
     }
 
     // build the .deb

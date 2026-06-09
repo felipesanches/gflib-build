@@ -247,14 +247,14 @@ fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> std::
 const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
 <title>gflib-build dashboard</title>
 <style>
- :root{--g:#86efac;--r:#fca5a5;--c:#67e8f9;--y:#fde68a;--o:#fb923c;--muted:#7c8aa0;--dr:#c77d7d;--w:#fff;--gr:#cbd5e1;--m:#f0abfc;--bg:#0b0e14;--panel:#11161f;--line:#1e293b;--secbg:#0e1420;--hover:#16202f;--pinbg:#1a1505}
- body[data-theme=light]{--g:#15803d;--r:#b91c1c;--c:#0e7490;--y:#a16207;--o:#c2620a;--muted:#64748b;--dr:#b45454;--w:#0b1220;--gr:#1e293b;--m:#a21caf;--bg:#f6f7f9;--panel:#ffffff;--line:#e2e8f0;--secbg:#eef2f7;--hover:#e8edf3;--pinbg:#fdf6e3}
+ :root{--g:#86efac;--r:#fca5a5;--c:#67e8f9;--dc:#0e9bbd;--y:#fde68a;--o:#fb923c;--muted:#7c8aa0;--dr:#c77d7d;--w:#fff;--gr:#cbd5e1;--m:#f0abfc;--bg:#0b0e14;--panel:#11161f;--line:#1e293b;--secbg:#0e1420;--hover:#16202f;--pinbg:#1a1505}
+ body[data-theme=light]{--g:#15803d;--r:#b91c1c;--c:#0e7490;--dc:#0e6d85;--y:#a16207;--o:#c2620a;--muted:#64748b;--dr:#b45454;--w:#0b1220;--gr:#1e293b;--m:#a21caf;--bg:#f6f7f9;--panel:#ffffff;--line:#e2e8f0;--secbg:#eef2f7;--hover:#e8edf3;--pinbg:#fdf6e3}
  body{background:var(--bg);color:var(--gr);font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:10px 12px}
  /* W5: responsive multi-pane (overview sections side by side on wide screens) */
  .panes{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
  @media(max-width:900px){.panes{grid-template-columns:1fr}}
  .w5{font-size:11px}
- .g{color:var(--g)}.r{color:var(--r)}.c{color:var(--c)}.y{color:var(--y)}.muted{color:var(--muted)}.dr{color:var(--dr)}.w{color:var(--w)}.gr{color:var(--gr)}.m{color:var(--m)}.o{color:var(--o)}.b{font-weight:600}
+ .g{color:var(--g)}.r{color:var(--r)}.c{color:var(--c)}.dc{color:var(--dc)}.y{color:var(--y)}.muted{color:var(--muted)}.dr{color:var(--dr)}.w{color:var(--w)}.gr{color:var(--gr)}.m{color:var(--m)}.o{color:var(--o)}.b{font-weight:600}
  .t{font-size:15px;color:var(--w);font-weight:600}
  .sub{color:var(--c)}
  .right{float:right}
@@ -423,7 +423,7 @@ function debStatus(b){const ds=b.deb_status||'',lint=b.deb_lint||'';
  if(ds=='lintian-fail')return ['lintian-fail','r','Validated by dpkg-deb, but lintian reported ERRORS — lintian: '+lint+'.'];
  if(ds=='lint-clean')return ['lint-clean','g b','Validated AND lintian clean (no errors or warnings). '+DEB_VTIP];
  if(ds=='lint-warn')return ['lint-warn','o','Validated, and lintian found NO errors — only warnings. lintian: '+lint+'.'];
- if(ds=='validated')return ['validated','g',DEB_VTIP+((lint&&lint!='not run (lintian absent)')?' lintian: '+lint+'.':' (lintian has not run yet)')];
+ if(ds=='validated')return ['validated','dc',DEB_VTIP+((lint&&lint!='not run (lintian absent)')?' lintian: '+lint+'.':' (lintian has not run yet)')];
  if(ds=='built')return ['built','c','The .deb was produced, but it did NOT pass validation: the control failed to parse or the archive has no .ttf/.otf.'];
  if(ds=='failed')return ['deb-failed','r','dpkg-deb failed to build the .deb for this family.'];
  if(b.packaged)return ['drafted','y','A debian/ packaging tree is drafted on disk; the .deb has not been built yet.'];
@@ -872,7 +872,7 @@ const PKG_STATES=[
  ['lint-clean','#22c55e','validated AND lintian clean (no errors or warnings)'],
  ['lint-warn','#fb923c','validated; lintian passed with NO errors, only warnings'],
  ['lintian-fail','#ef4444','validated by dpkg-deb but lintian reported errors'],
- ['validated','#15803d','dpkg-deb ok (control parses, contains fonts); lintian has not run yet'],
+ ['validated','#0e9bbd','dpkg-deb ok (control parses, contains fonts); lintian has not run yet'],
  ['built','#06b6d4','.deb produced but did NOT pass dpkg-deb validation (control failed, or no fonts inside)'],
  ['drafted','#eab308','a debian/ tree is drafted on disk; the .deb is not built yet'],
  ['draftable','#64748b','built family, ready to draft a debian/ tree'],
