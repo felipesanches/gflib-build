@@ -1,207 +1,246 @@
 # Architecture
 
-> **Note:** the official implementation is now the **Rust** code in [`../rust/`](../rust/); the
-> original single-file Python program (`gflib_build.py`) has been removed (it lives in git history).
-> The pipeline, schemas and archive-safety invariants below are implementation-agnostic and remain
-> accurate — the Rust implementation is a faithful realization of this design.
+> The only implementation is the **Rust** code in [`../rust/`](../rust/). The earlier single-file
+> Python program has been removed (it lives in git history). The on-disk JSON schemas it defined are
+> kept intact, so a status/state/control file written by either side is still mutually readable.
 
 `gflib-build` orchestrates building every buildable family in the Google Fonts library from pristine
-archived sources, and renders progress through a pluggable frontend. The actual font
-compile is delegated to a separate interpreter/venv (gftools.builder + fontmake) and/or
-the `fontc` binary.
+archived sources, and renders progress through one of several interchangeable UIs. The actual font
+compile is delegated to a separate interpreter/venv (`gftools.builder` + `fontmake`), to the `fontc`
+binary, or to a Rust-native `builder3` — so the engine never imports a font toolchain itself.
 
-## Module map (sections within `gflib_build.py`)
+## High-level shape: daemon + monitor, joined by files
 
-| Section | Responsibility |
-|---|---|
-| `Family`, `Result` | dataclasses: the work item and its evolving state |
-| discovery | `parse_metadata`, `discover` (METADATA-driven), `discover_from_archive` (mirror-driven, `--source archive`), `sample_evenly` — build the worklist, sample for `--percent` |
-| mirror/git | `mirror_path`, `git`, `ensure_mirror`, `extract_tree`, `preclean_outputs` — archive-safe source access |
-| bootstrap | `ensure_google_fonts` (shallow-clone if absent), `populate_archive` (parallel mirror-missing, append-only), `scan_cohorts`, `setup_wizard` (editable ncurses form), `detect_fontc`/`detect_archive`/`detect_cargo`, `build_fontc_from_source` |
-| detach/monitor | `daemonize` (double-fork), `read_daemon_pid`, `MonitorState` (read-only view from `status.json`), `run_monitor`; `Orchestrator._status_writer` writes `status.json` every ~1 s |
-| persistence/timing | `load_config`/`save_config` (`gflib-build.config`); `Orchestrator._record_op`/`phase_durations`/`write_timings` (per-op + per-phase timing → `timings.json`); per-family log `logs/<slug>.log` (pipeline narrative + full gftools output) |
-| config | `resolve_config`, `read_requirements`, `normalize_requirements`, `cohort_key_for`, `read_requirements_from_mirror` |
-| `VenvManager` | dependency cohorts: one shared venv per distinct requirements set |
-| building | `run_builder` (backend-aware), `collect_outputs`, `sha256`, `compare_to_shipped` |
-| `Orchestrator` | the **UI-agnostic core**: queue, worker pool, state, events, scheduling |
-| frontends | `Frontend` base + `Curses/Plain/Json/None` + `FRONTENDS` registry + `pick_frontend` |
-| report | `cohorts_report` — read-only cohort preview |
-| main | argument parsing and wiring |
+A build is owned by a single background **daemon** — the `Orchestrator` in `build.rs`. It writes an
+atomic `status.json` snapshot about once a second and reads live commands from `control.json`. Every
+UI is a thin **monitor**: it renders a `Snapshot` and posts back a `ControlSet`. The terminal UI, the
+web UI, and any external tool therefore observe the same state through the same files, and exactly one
+daemon owns a build directory at a time.
 
-## Pipeline task-list (`Orchestrator._drive`, background thread)
+The seam between them is the `Source` trait (`monitor.rs`):
 
-`run()` starts a single background **driver** thread that walks the run through an
-end-to-end **task-list** — so the *entire* interaction (not just the builds) renders live
-in the UI. Each step is a `Task` (`key/name/status/t0/t1/done/total/detail`) exposed via
-`snapshot()["tasks"]`; the active step also drives the legacy `phase`/`phase_done`/
-`phase_total`/`phase_label` fields (for the banner + per-phase timing):
+```rust
+trait Source {
+    fn snapshot(&self) -> Snapshot;      // what to render
+    fn build_dir(&self) -> PathBuf;
+    fn is_live(&self) -> bool;           // true: we own the build; false: read-only monitor
+    fn control(&self, set: &ControlSet); // live → apply in-process; monitor → write control.json
+    fn request_stop(&self) {}            // live only
+}
+```
 
-1. **`clone_gf`** — `ensure_google_fonts()` shallow-clones google/fonts if the worklist
-   needs METADATA and no clone is present (skipped otherwise).
-2. **`build_fontc`** — `build_fontc_from_source()` (`cargo build --release`) when the user
-   opted in and no binary was found/given (skipped otherwise). Sets `args.fontc_bin`.
-3. **`discover`** — `discover()` / `discover_from_archive()` + `sample_evenly()` build the
-   worklist, then `_enqueue()` populates the queue.
-4. **`build`** (streaming — NO barriers) — `archive` pre-warm and `build` run **concurrently**:
-   - A background **archive pre-warmer** (`populate_archive()`, only if `--populate-archive`)
-     mirrors missing repos ahead of the builders using idle I/O. It reports each repo the
-     instant its clone *completes* (`as_completed`), appending to `self.archive_log` →
-     `snapshot()["archive_recent"]` (a live, growing list).
-   - The **build worker pool** starts immediately and is self-sufficient: each `_build_one`
-     **mirrors-on-demand**, **assigns its cohort** (`VenvManager.get_python` →
-     `_note_cohort` rebuilds `self.cohorts` live), and compiles — the moment that family's
-     repo is available. So nothing waits on a global "mirror-all then scan-all then build"
-     barrier; cohorts are evaluated per-repo as repos land.
-   - A shared **per-repo clone lock** (`KeyedLocks`, `self.clone_locks`) is used by BOTH the
-     pre-warmer and the workers, so a repo is never `git clone --mirror`'d twice. Clones go
-     through `git_clone_mirror()` which is **abortable** (polls `stop`) and removes a partial
-     mirror on abort/timeout — so shutdown/`--stop`/completion never blocks on a slow clone.
-5. **`done`** — set in `_drive`'s `finally` (even on error: `phase_error` is recorded, and
-   the in-flight task is marked `failed`), which also saves state and closes the events file.
+Two types implement it: the live `Orchestrator` (a real build) and `MonitorState` (attached to
+someone else's daemon, reading `status.json`). A third, `SetupState`, is a static source for the
+first-run config wizard. Because both UIs render against `Source`, the dashboard is identical whether
+you launched the build or are just watching it.
 
-`scan_cohorts()` / `cohorts_report()` remain for the read-only `--cohorts-report` preview.
+`MonitorState` re-parses `status.json` only when its mtime changes and throttles its filesystem stat
+to a few times a second, so the dashboard stays snappy even over a networked filesystem.
 
-`main()` only resolves paths, runs the **setup wizard**, and validates (fail-fast) *before*
-the driver; every expensive/long step (clone, fontc, discover, mirror, cohorts, build) runs
-inside the driver so it shows in the task-list. `join()` awaits the driver. Frontends treat
-`phase == "done"` as the completion signal. Read-only paths (`--list`/`--cohorts-report`)
-discover synchronously in `main()` (no driver/UI).
+## Module map (`rust/src/`)
 
-### Live config (control channel)
+For a one-line responsibility per module see [`../rust/README.md`](../rust/README.md). The
+load-bearing modules for this document:
 
-The monitor's **config tab** edits live-applicable settings and writes them to
-`<build-dir>/control.json` (`write_control`, a `{seq, set}` doc). The daemon runs a
-`_control_watcher` thread that polls it and calls `apply_live(set)` when `seq` increases
-(seeded from the file at start so a stale control isn't re-applied on resume):
-- **percent ↑** → `_extend_worklist` re-samples `self._all_families` and enqueues the
-  newly-included families (so `all_done()` goes False and the build keeps going);
-- **jobs ↑** → `_ensure_workers` spawns more worker threads (atomically; monotonic ids);
-- **backend / timeout / compare / populate_archive** → update `self.args` (each subsequent
-  build reads it).
+| Module | Role in this design |
+|--------|---------------------|
+| `build.rs` | the `Orchestrator`: worker pool, per-family pipeline, live-control application, the archive pre-warmer, the package worker |
+| `daemon.rs` | double-fork detach, SIGTERM/`--stop`, post-build linger, restart/respawn |
+| `monitor.rs` | the `Source` trait, `MonitorState`, `SetupState` |
+| `persist.rs` | atomic status/state/control IO + `daemon.pid` liveness |
+| `model.rs` | the serde schema: `Snapshot`, `Res`, `StateFile`, `Control`/`ControlSet` |
+| `venv.rs` | dependency **cohorts**, the multi-Python ladder, self-healing pin relaxation |
+| `discover.rs` | worklist discovery (metadata + archive), `--percent` sampling, fontc/archive auto-detect |
+| `rules.rs` · `classify.rs` · `provenance.rs` | pre-build commands · failure taxonomy · M0 version strings |
+| `crater.rs` · `fontspector.rs` · `deb.rs` | fontc_crater comparison · QA pass · `.deb` packaging |
+| `mirror.rs` · `config.rs` · `util.rs` | abortable mirror cloning · CLI/config-file · sizing helpers |
+| `tui.rs` · `web.rs` | crossterm dashboard · hand-rolled `std::net` HTTP dashboard |
 
-Completion is decided WITHOUT setting the global `stop` on `all_done()` — the build loop
-re-checks, **under `self.lock`**, whether a live bump queued more work and respawns workers
-if so; `stop` is reserved for real shutdown and is set only once the build is truly done (to
-abort the pre-warmer). The control thread is joined before the final status write. Drive
-config from one monitor at a time (single-file `seq` is last-writer-wins).
+## The streaming build pipeline
 
-### Detach-by-default & auto-attach
+`Orchestrator::new()` builds the worklist (from a google/fonts clone's METADATA, or from the bare
+mirrors directly with `--source archive`), reconciles it against any prior `state.json`, applies
+`--percent` sampling, and enqueues the families that still need work. `Orchestrator::start()` then
+spawns, with **no global barriers**, all of:
 
-A fresh interactive (curses) build **detaches by default** (`daemonize()`): the build runs
-in a background daemon and the foreground process attaches a read-only **monitor**. Quitting
-the monitor with `q` frees the shell while the build keeps running. Re-running the program
-(from the same or any other terminal) detects the live daemon via `read_daemon_pid()` and
-**auto-attaches the monitor — skipping the wizard entirely** — so you resume straight to live
-updates. `--stop` cancels; `plain`/`json`/`none` UIs stay in the foreground for scripting.
+- the **worker pool** (`--jobs` threads running `worker_loop`), each of which pulls a slug and runs
+  the per-family pipeline below;
+- the **archive pre-warmer** (`spawn_archive_prewarmer`, only with `--mirror-missing`): a modest pool
+  that proactively `git clone --mirror`s every worklist repo whose mirror is absent, so the archive
+  reaches 100% regardless of build pace. It shares a per-repo clone lock (`clone_locks`) with the
+  workers, so no repo is ever cloned twice;
+- the **status writer** (`spawn_status_writer`): writes `status.json` every ~1 s and the derived
+  `migration.json` / `timings.json` every ~10 s;
+- the **size thread**: samples build-dir size, free space, archive size + repo count, and the
+  on-disk cohort-venv set;
+- the **control watcher** and **config watcher** (see below);
+- optionally the **QA pool** (`--fontspector`) and the **package worker** (`.deb` building).
 
-## Per-family build pipeline (`Orchestrator._build_one`)
+Nothing waits on a "mirror-all, then scan-all, then build" barrier: each worker mirrors-on-demand,
+assigns its cohort, and compiles the moment that family's repo is available. Cohorts are evaluated
+per-repo as repos land.
 
-1. **`ensure_mirror`** — locate the bare mirror for the repo; confirm the pinned commit
-   exists (a read-only `cat-file -e`, with a `remote update` retry if missing). With
-   `--mirror-missing`, an absent repo is cloned `--mirror` (append-only; never deletes).
-2. **`extract_tree`** — stream the committed tree at the pinned commit into
-   `<build-dir>/work/<slug>` via `git archive | tar -x`. This is the only way sources
-   are read: **read-only on the mirror, no checkout, no working tree in the mirror.**
-3. **interpreter selection** — if `--manage-venvs`, read the extracted `requirements.txt`
-   and obtain the cohort venv (`VenvManager.get_python`); else use `--build-python`.
-4. **backend attempts** (`_backend_order`: `fontc` then `fontmake` for `auto`) — for each
-   attempt: a fresh extraction on fallback, `preclean_outputs` (wipe committed
-   `fonts/`, `*_ufo/`, `build*.ninja`, …), `resolve_config`, then `run_builder`.
-5. **`collect_outputs`** — copy produced `.ttf`/`.otf` found under `FONT_SUBDIRS`
-   (`work/fonts/{ttf,variable,otf}`, `work/fonts`, and the extraction root `work/`) into
-   `<build-dir>/out/<slug>`, matched against the family's shipped filenames; record bytes
-   and any missing shipped files (`out_missing`).
-6. **`compare_to_shipped`** (with `--compare`) — sha256 the built vs shipped binaries →
-   `identical` / `differ` / `missing`.
-7. **cleanup** — a `try/finally` always removes `work/<slug>` (unless `--keep-work`);
-   failures also drop partial `out/<slug>` debris. So nothing leaks and nothing is left
-   inside any repo.
+### Per-family build pipeline (`Orchestrator::build_one`)
+
+1. **locate the mirror** — `mirror_path()` maps the repo URL to its bare mirror under the archive.
+   With `--mirror-missing` an absent repo is cloned `--mirror` (append-only, one clone per repo under
+   `clone_locks`); without it, an absent mirror fails the family cleanly.
+2. **cohort venv** (with `--manage-venvs`) — read the family's `requirements.txt` **read-only** from
+   the mirror (`read_requirements_from_mirror`, a `git show`, no checkout), then obtain the shared
+   cohort interpreter via `VenvManager::get_python`. Without `--manage-venvs`, every family builds
+   with the single `--build-python`.
+3. **backend attempts** — `backend_order()` yields `["fontc","fontmake"]` for `auto` (fontc-first,
+   fontmake fallback, only if a fontc binary is present), or a single backend, or `both`. For each
+   attempt:
+   - **`extract_tree`** streams the committed tree at the pinned commit into `work/<slug>` via
+     `git archive | tar -x` — the only way sources are ever read;
+   - any registered **pre-build commands** (`rules::run_pre_build`) run in the extracted tree;
+   - **`preclean_outputs`** wipes committed build artifacts (`fonts/`, `*_ufo/`, `build*.ninja`, …)
+     so everything is regenerated;
+   - **`resolve_config`** picks the gftools-builder config (see below);
+   - **`run_builder`** compiles.
+4. **`collect_outputs`** copies freshly-built (`mtime`-gated) `.ttf`/`.otf` whose names match the
+   family's shipped binaries into `out/<slug>`, recording bytes and any missing shipped files. It
+   also scans the stray `../fonts` dir an override config may write to, without ever mis-attributing
+   another concurrently-building family's fonts.
+5. **compare** (with `--compare`, metadata mode) — sha256 built vs shipped → `identical` / `differ` /
+   `missing`. This, plus the recorded backend, is the Rust-migration signal.
+6. **cleanup** — a guard always removes `work/<slug>` (unless `--keep-work`). Nothing leaks, and
+   nothing is ever left inside a repo.
+
+On success, `build_one` records the result and the M0 provenance; on failure, `fail()` records the
+cause (classified by `classify.rs`), appends a durable line to `failure-history.jsonl`, and archives
+the failing log under `logs/failed/`. Provenance is recorded on **both** success and failure.
+
+`--backend both` branches into `build_both`, which builds fontc and fontmake into separate output
+dirs and compares them — the fontc_crater-style equivalence check.
 
 ### Config resolution (`resolve_config`)
 
-`gftools.builder` `chdir`s to the **config file's parent directory** and resolves
-`sources:` relative to there. Therefore:
+`gftools.builder` `chdir`s to the config file's parent and resolves `sources:` relative to there, so:
 
-1. **google/fonts override** (`<google-fonts>/<slug>/config.yaml`): copied into the
-   extraction **root** as `__gflib_override_config.yaml`, because override configs use
-   repo-root-relative source paths.
-2. **in-repo `config_yaml`** (from METADATA): used **in place** — its `sources:` are
-   already relative to its own directory.
-3. **auto-discovered** `sources/config.yaml` (etc.) as a fallback.
+1. a **google/fonts override** (`<google-fonts>/<slug>/config.yaml`) is staged into the extraction
+   **root** as `__gflib_override_config.yaml`, because override configs use repo-root-relative paths;
+2. an **in-repo `config_yaml`** (from METADATA) is used in place — its `sources:` are already
+   relative to its own directory;
+3. otherwise an **auto-discovered** `sources/config.yaml` (etc.) is tried.
 
-## Build backends
+### Build backends (`run_builder`)
 
-`run_builder` runs `python -m gftools.builder <config>` with `SOURCE_DATE_EPOCH=0` and
-the interpreter's `bin/` prepended to `PATH` (gftools.builder shells out to
-`fontmake`/`ninja`/`ttfautohint` **by name**). The Rust path adds
-`--experimental-fontc <bin>`. `auto` tries `fontc` first and falls back to `fontmake`,
-recording the backend that actually built each family — the **Rust-migration metric**.
+When `--builder3-bin` is given, `run_builder` invokes the Rust-native `builder3` binary directly (no
+Python). Otherwise it runs `python -m gftools.builder <config>` with `SOURCE_DATE_EPOCH=0`, the
+interpreter's `bin/` prepended to `PATH` (gftools.builder shells out to `fontmake`/`ninja`/
+`ttfautohint` by name), and `--experimental-fontc <bin>` for the fontc backend. Each child runs in
+its **own process group** so a freeze/kill reaches the whole `python → fontmake → ninja` tree.
 
-## Self-healing dependency installs (`VenvManager._create`)
+## Live config (the control channel)
 
-`pip install` runs against an `effective-requirements.txt` (base + cohort). If it fails, the
-log is scanned (`_parse_unsatisfiable`) for packages pip "could not find a version that
-satisfies" (a pinned version absent from PyPI — e.g. a stale setuptools_scm dev pin). Those
-pins are dropped (`relax_requirements` keeps the package, removes the `==ver`) and the install
-is retried — up to a few rounds, each relaxing any newly-reported unsatisfiable pin. Base-pin
-relaxations are cached in `self._relaxed` (under the global lock) and shared by every later
-cohort, so the failing first attempt happens once, not per cohort. Each relaxation is recorded
-in `self.relaxations` → `snapshot()["dep_relaxations"]` (shown in the config tab). Valid pins
-are never touched, so reproducibility holds for everything that resolves.
+A monitor's config tab edits live-applicable settings and writes them to `control.json` via
+`persist::write_control`, a `{seq, set}` document that bumps `seq` on every change. The daemon's
+control watcher (`spawn_control_watcher`) polls the file and calls `apply_live(set)` only when `seq`
+increases. `apply_live` clamps and applies:
 
-## Dependency cohorts (`VenvManager`)
+- **jobs** → updates the live target and spawns more workers (`ensure_workers`);
+- **percent ↑** → re-samples the full family list and enqueues the newly-included families, so the
+  build keeps going;
+- **paused** → freezes/thaws every in-flight build (see the regulator);
+- **backend / compare / build_debs** → each subsequent build reads the new setting;
+- **retry / retry_all / retry_overrides / repackage_all / restart** → one-shot actions.
 
-`cohort_key_for(requirements)` = `"base"` if empty, else `"c-" + sha1(normalized)[:12]`,
-where normalization strips comments/whitespace and sorts lines. One venv per cohort under
-`<build-dir>/venvs/<key>/`, created lazily under a **per-cohort lock** (so a venv installs
-exactly once under parallelism), with a shared `pip-cache`. The `base` venv is created up
-front. `_ready` (cohort → interpreter) is read/written under a single global lock.
+The **config watcher** (`spawn_config_watcher`) is the hands-free analogue of the "retry config-fixed"
+button: when a FAILED family's override-config signature changes (we wrote or edited a fix), it
+re-queues that family automatically. It fires only on an actual signature change, so a still-failing
+build never loops.
 
-## Concurrency model
+## Detach-by-default & auto-attach (`daemon.rs`)
 
-- A `queue.Queue` of slugs feeds a pool of `--jobs` daemon worker threads. Each build is
-  an isolated **subprocess**, so the GIL is released during the compile and threads
-  suffice (also, `gftools.builder` does a global `os.chdir`, so process isolation is
-  required for parallel correctness).
-- Shared `Orchestrator` state (`results`, `failures`) is guarded by `self.lock`;
-  `snapshot()` takes a consistent copy under it.
-- `events.jsonl` writes are serialized by a dedicated lock.
-- Termination: a worker exits when `all_done()` (every result terminal) **and** the queue
-  is empty. `stop` (set by `join()`/the frontend loop once `all_done()`, by SIGINT, or by
-  a frontend on quit) is also checked right after dequeue so no new build starts during
-  shutdown.
+A fresh interactive build **detaches by default**: `daemonize()` double-forks into a background
+daemon (redirecting stdio to `daemon.log`, writing `daemon.pid`) and the foreground process attaches
+a read-only monitor. `daemonize()` must run **before** any worker thread is spawned, because `fork()`
+keeps only the calling thread in the child. Quitting the monitor frees the shell while the build keeps
+running.
 
-## State & events (consumable by any frontend or external tool)
+Re-running the program detects the live daemon via `read_daemon_pid()` (which probes liveness with
+`kill -0`, so a stale pidfile reads as gone) and **auto-attaches the monitor**, skipping the wizard.
+`--stop` sends SIGTERM for a graceful shutdown. After completion the daemon **lingers** (~30 min by
+default) so a live retry or control still works; new work resets the linger timer. A UI "Restart"
+routes through the same graceful path and then `respawn_if_requested` re-launches a fresh daemon.
 
-`<build-dir>/state.json` — full resumable state, written after every **terminal**
-transition (built/failed) and at shutdown (the in-progress `building`/`started`
-transition is recorded only in `events.jsonl`):
-```json
-{ "saved_at": <epoch>, "build_dir": "...",
-  "results": { "ofl/dmsans": { "status": "built", "backend": "fontmake",
-    "cohort": "c-...", "started": ..., "ended": ..., "out_bytes": ..., "out_missing": 0,
-    "compare": "differ", "log": "logs/ofl__dmsans.fontmake.log", "config_used": "..." } } }
-```
+## Dependency cohorts & self-healing installs (`venv.rs`)
 
-`<build-dir>/events.jsonl` — append-only stream, one JSON object per line:
-```
-{"t": 0.0,  "type": "started", "slug": "...", "worker": 1}
-{"t": 1.3,  "type": "venv",    "slug": "...", "cohort": "c-..."}
-{"t": 31.2, "type": "built",   "slug": "...", "backend": "fontmake", "bytes": ..., "compare": "differ", "missing": 0, "dur": 31.2}
-{"t": 8.5,  "type": "failed",  "slug": "...", "error": "..."}
-```
+Families with identical requirements share one venv, keyed by a content hash:
+`cohort_key_for(requirements)` is `"base"` for empty requirements, else `"c-" + sha1[..12]` of the
+normalized text (comments/whitespace stripped, lines sorted, `-r` includes inlined, QA-only tools
+filtered out). One venv per cohort lives under `<build-dir>/venvs/<key>/`, created lazily under a
+per-cohort lock with a shared `pip-cache`. Each venv carries a `.gflib-installed` marker (a hash of
+the requirements it was built for) so a stale/half-installed venv is rebuilt, never reused. The hashes
+use coreutils `sha1sum`/`sha256sum`, so cohort keys and markers are byte-identical across runs.
 
-`Orchestrator.snapshot()` returns the live aggregate a frontend renders:
-`elapsed`, `disk_used_delta`, `disk_free`, `jobs`, `paused`, `total`,
-`counts{built,failed,building,queued,skipped}`, `backends{fontc,fontmake}`,
-`building[{slug,worker,dur,backend,note}]`, `failures_recent[{slug,error,log}]`,
-`cohorts_ready`, `done`.
+The **multi-Python ladder** (`--pythons`): when several interpreters are configured, the default rung
+keeps the bare cohort key (so existing venvs are reused unchanged) and each older rung appends a
+`-py<tag>` suffix. A rung that can't install the **exact** pinned requirements falls through to the
+next older rung **without relaxing** — only the last rung relaxes — so the tool prefers "faithful pins
+on an older Python" over "relaxed pins on a newer one". A commit-date heuristic skips rungs whose
+interpreter is too new for the freeze era.
+
+The **self-healing install** runs `pip install` against an assembled `effective-requirements.txt`
+(base toolchain minus any pin the family overrides, plus the family's own pins). On failure the log is
+parsed for pins pip can't satisfy, ResolutionImpossible conflicts, and sdists that won't build here;
+those are relaxed (or wheel-forced) and the install is retried, up to a bounded number of rounds.
+Globally-bad base pins are cached and shared by later cohorts. Valid pins are never touched, so
+reproducibility holds for everything that resolves. Each relaxation is surfaced in the snapshot's
+`dep_relaxations` (shown in the config tab).
+
+## Concurrency & the job regulator
+
+- A shared `VecDeque` of slugs (`Shared::queue`) feeds the worker pool; each build is an isolated
+  **subprocess**, so threads suffice and `gftools.builder`'s global `chdir` can't corrupt a sibling
+  build.
+- Mutable orchestrator state lives in one `Shared` struct behind a single `Mutex`; `snapshot()` takes
+  a consistent copy under it. A `Condvar` wakes parked workers when work or capacity changes.
+- The **job regulator** keeps exactly `jobs` builds *actively* compiling. Lowering `jobs` below the
+  number of running builds **freezes the newest excess with SIGSTOP** rather than killing it; as
+  builds finish, freed slots **thaw the oldest frozen build first** (drain in-progress before starting
+  new). A global pause freezes everything. Frozen time does not count toward a build's timeout.
+- Termination: a worker idles when the queue is empty; the daemon's `done` is reached when nothing is
+  queued, nothing is building, no worker is in flight, and (when enabled) the QA and packaging
+  backlogs have drained. `request_stop` thaws then SIGKILLs any in-flight builder groups so nothing
+  orphans when the daemon exits.
+
+## State, events & schema (`persist.rs`, `model.rs`)
+
+All persistence lives under `--build-dir`, written atomically (temp + rename) so a reader never sees a
+torn file:
+
+- **`status.json`** — the live `Snapshot` (counts, backends, in-flight builds, cohorts, archive view,
+  fail categories, M0 tooling/builder versions, QA + crater + packaging views, …), rewritten ~1 s.
+- **`state.json`** — the full resumable `StateFile`: per-family `Res` results, the cohort map, and the
+  cumulative elapsed clock. Written after every terminal transition and at shutdown.
+- **`failure-history.jsonl`** — append-only durable record of how families broke (never erased by a
+  later success).
+- **`events.jsonl`** — append-only `{t, type, slug, …}` stream (`started` / `venv` / `built` /
+  `failed` / `archived`) that external tools can tail.
+- **`control.json`** — the live-control channel a monitor bumps and the daemon applies.
+- **`daemon.pid`** — the detached daemon's PID, for attach/stop.
+- **`migration.json`** / **`timings.json`** — derived reports refreshed periodically.
+
+Every schema struct is `#[serde(default)]`-friendly, so a partial or older file still deserializes.
 
 ## Archive-safety invariants (enforced by construction)
 
-- The bare mirrors are read with `git archive` / `git show` / `cat-file` only. The sole
-  writes git ever does to the archive are `clone --mirror` (new repos, `--mirror-missing`)
-  and `remote update --prune` (updates refs; never removes commits). **No checkout, no
-  gc, no delete.**
-- Every byte the tool produces lives under `--build-dir`. Source repos are never written.
-- Each build starts from a fresh extraction with committed outputs pre-cleaned.
+These are non-negotiable and hold regardless of UI or backend:
+
+- The bare mirrors are read with **`git archive` / `git show` / `rev-parse` / `cat-file` only**. The
+  sole writes git ever does to the archive are `clone --mirror` (new repos, only under
+  `--mirror-missing`) and `remote update` (refs only; never removes commits). **No checkout, no gc,
+  no delete.**
+- **Every byte the tool produces lives under `--build-dir`.** Source repos and the archive are never
+  written by the build.
+- Each build starts from a **fresh extraction** with committed outputs pre-cleaned, so a prior
+  attempt can never contaminate the next.
+- Per-family `work/<slug>` is always cleaned up (a guard runs even on panic/early-return), so nothing
+  leaks and nothing is left inside any repo.
+
+---
+
+*Written with the assistance of an AI agent (Claude Opus 4.8) under the guidance of @felipesanches.*

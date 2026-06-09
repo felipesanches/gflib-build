@@ -1,86 +1,90 @@
 # Extending gflib-build
 
-The build **core** (`Orchestrator`) is deliberately decoupled from any UI. You can add a
-new frontend in-process, or drive an entirely separate (e.g. web) UI out-of-process from
-the files the core writes. You can also add a build backend.
+The build **core** (the `Orchestrator` in `build.rs`) is deliberately decoupled from any UI. You can
+add a new frontend in-process, drive an entirely separate UI out-of-process from the files the core
+writes, or add a build backend.
+
+The seam is the **`Source` trait** (`rust/src/monitor.rs`):
+
+```rust
+pub trait Source: Send + Sync {
+    fn snapshot(&self) -> Snapshot;          // the live aggregate state
+    fn build_dir(&self) -> PathBuf;
+    fn is_live(&self) -> bool;               // true for the live orchestrator, false for a read-only monitor
+    fn control(&self, set: &ControlSet);     // apply a live command (jobs / percent / pause / retry / …)
+    fn request_stop(&self) {}                // stop the build (live only); default no-op
+}
+```
+
+It is implemented by **both** the live `Orchestrator` (a build you own) and the read-only
+`MonitorState` (a build someone else's daemon owns), so anything written against `Source` works in
+both cases — you can render your own build *or* monitor a running one with the same code.
 
 ## Option A — a new in-process frontend
 
-A frontend is any object with a blocking `run()` that observes the orchestrator and
-returns when the run is done (or the user quits). Subclass `Frontend` and register it.
+A frontend is just code that takes an `Arc<dyn Source>`, renders `source.snapshot()` in a loop, and
+calls `source.control(&set)` to send live commands. Use the existing frontends as references:
 
-```python
-class MyFrontend(Frontend):
-    def run(self):
-        while True:
-            snap = self.orch.snapshot()      # thread-safe aggregate (see ARCHITECTURE.md)
-            # ... render snap['counts'], snap['building'], snap['failures_recent'], ...
-            if snap["done"]:
-                self.orch.stop.set()
-                break
-            time.sleep(0.5)
+- `web.rs` — `pub fn run(source: Arc<dyn Source>, port: u16)` serves a browser dashboard.
+- `tui.rs` — the crossterm dashboard loop.
 
-FRONTENDS["mine"] = MyFrontend               # register the frontend
-```
+To wire a new `--ui myui` in:
 
-Then add `"mine"` to the `--ui` argparse `choices` list in `build_argparser` (mirroring
-the backend step in Option C, step 2) — otherwise `argparse` rejects `--ui mine` with an
-"invalid choice" error before the registry is ever consulted.
+1. Add `"myui"` to the `ui` choices documented in `config.rs` (the `--ui` parser accepts any string;
+   keep the doc comment and `pick_frontend` in sync).
+2. Add a match arm in `main.rs`'s frontend dispatch (the `match pick_frontend(&cfg.ui)` block) that
+   constructs your frontend with the `Arc<dyn Source>`.
 
-Guidelines:
-- **Poll `self.orch.snapshot()`** for the live aggregate; it copies state under the lock.
-- To stream per-event detail, diff successive snapshots (as `PlainFrontend` does) or tail
-  `events.jsonl`.
-- Set `self.orch.stop` when you want workers to wind down (they finish in-flight builds).
-- Read `self.orch.paused` / call `.set()`/`.clear()` to pause dispatch.
-- Don't import heavy/optional libraries at module top level — import inside `run()` so the
-  dependency is only required when that frontend is actually selected (this is why
-  `CursesFrontend` imports `curses` lazily and falls back to `plain` if it's unavailable).
+Render `snapshot()` fields (`counts`, `building`, `failures_recent`, `queued_list`, …); don't compute
+display state the core could own — prefer adding it to `model.rs` + `Orchestrator::snapshot()` so
+every frontend benefits.
 
-## Option B — an out-of-process / web UI (no Python coupling)
+## Option B — an out-of-process / web UI (no Rust coupling)
 
-Run the build with `--ui none` (or `--ui json`) and consume the two files the core keeps
-under `--build-dir`:
+Run the build with `--ui none` and consume the files the daemon keeps under `--build-dir`, or talk to
+the built-in web server:
 
-- **`state.json`** — poll it for the full current state (atomic replace on each write).
-- **`events.jsonl`** — `tail -f` it for an append-only stream of
-  `started` / `venv` / `built` / `failed` events.
+- **`status.json`** — the full `Snapshot`, rewritten atomically ~once a second. Poll it.
+- **`control.json`** — write a `ControlSet` here (the daemon polls and applies it). Unset keys are
+  omitted, so partial updates are fine.
+- Or, against `--ui web`: `GET /api/status` returns the snapshot and `POST /api/control` accepts a
+  `ControlSet` — the exact channel the built-in UIs use.
 
-A web server can watch these and push to the browser; nothing needs to link against the
-harness. `--ui json` additionally prints one `snapshot()` JSON object per second to
-stdout, convenient for piping into another process.
-
-The schemas are documented in [ARCHITECTURE.md](ARCHITECTURE.md#state--events-consumable-by-any-frontend-or-external-tool).
+The schema is the serde types in `model.rs` (`Snapshot`, `ControlSet`). Nothing needs to link against
+the tool.
 
 ## Option C — a build backend
 
-Backends are selected by `Orchestrator._backend_order()` and executed by `run_builder`.
-Today: `fontmake` (Python) and `fontc` (Rust, via `gftools.builder --experimental-fontc`).
-To add one (e.g. a future fully-native Rust builder):
+Backends are run by the `Orchestrator` in `build.rs` (`run_backend_into` and the backend-ordering
+logic). Today: `fontc` (Rust), `fontmake` (Python), `both` (build each and compare), and the Rust
+`builder3` orchestrator, selected by `--backend {auto,fontc,fontmake,both}`. To add one (e.g. a new
+fully-native Rust builder):
 
-1. Extend `run_builder` to assemble that backend's command line.
-2. Add the name to `_backend_order` (e.g. put it first in the `auto` chain) and to the
-   `--backend` argparse `choices`.
-3. The per-family `Result.backend` field and the `backends` snapshot counter then track
-   it automatically — feeding the Rust-migration metric.
+1. Assemble its command line in `build.rs` (alongside the existing backends).
+2. Put it in the backend order — e.g. first in the `auto` chain so it's tried before the fallbacks.
+3. Add the name to the `--backend` field comment in `config.rs` **and** to the `--backend` line in
+   the help text (`print_help` in `main.rs`), so the documented choices stay in sync.
 
-Because the loop already does a **fresh extraction per backend attempt**, adding a new
-preferred backend that falls back to the existing ones is safe and "from scratch".
+The per-family `backend` field and the `backends` snapshot counter then track it automatically —
+that record is the **Rust-migration metric** (M2–M4). Because the loop does a **fresh extraction per
+backend attempt**, adding a preferred backend that falls back to the existing ones is safe and
+"from scratch".
 
 ## Testing locally
 
-- `--list` and `--cohorts-report` are read-only and instant — good smoke tests of
-  discovery and cohort logic without building anything.
-- `--percent 1 --only ofl/<family>` builds a single known family end-to-end.
-- `--keep-work` preserves the extraction under `work/<slug>` for inspection.
-- Cohort logic is unit-testable directly: `cohort_key_for(text)` is a pure function, and
-  `VenvManager` can be exercised against a temp `--build-dir` with a trivial
-  `--base-requirements`.
+- `--list` and `--cohorts-report` are read-only and instant — good smoke tests of discovery and
+  cohort logic without building anything.
+- `--demo` (a.k.a. `--dry-run`/`--mock`) replays a recorded session live — exercises the UIs with no
+  real clone/venv/compile.
+- `--only ofl/<family>` builds a single known family end-to-end.
+- `cargo test` covers the unit-level logic (serde round-trips, parsers, cohort/venv behavior). Add a
+  test when you touch any of those.
 
 ## Conventions
 
-- Pure standard library only in the harness (it must run on a stock laptop with just
-  Python 3.8+). All third-party font tooling lives in the build venv(s), invoked as
-  subprocesses.
-- Never write into the source repos or the archive (see the archive-safety invariants in
-  ARCHITECTURE.md). New code that touches a mirror must use read-only git plumbing.
+- **Minimal dependencies** — the tool builds with only `serde`, `serde_json`, and `crossterm`.
+- **Never write into the source repos or the archive** — the archive-safety invariants
+  (read-only `git archive`, append-only archive, all output under the build dir) are non-negotiable;
+  new code that touches a mirror must use read-only git plumbing.
+
+See [`../CONTRIBUTING.md`](../CONTRIBUTING.md) for the broader contributor workflow.

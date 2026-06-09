@@ -1,649 +1,194 @@
 # gflib-build
 
-A from-scratch, **archive-safe** harness to build the **entire Google Fonts library**
-on your own machine (outside the dev VM), with a **live dashboard**, a **Rust-first**
-build strategy, and **dependency cohorts** that share virtual environments.
+**Build the entire Google Fonts library from source, on your own machine — fontc-first, with a live dashboard.**
 
-> 🦀 **The official implementation is Rust, in [`rust/`](rust/).** The original Python tool
-> (`gflib_build.py`) has been **removed** — Rust is now canonical. The Python source remains in the
-> git history if ever needed for reference. The Rust implementation is feature-complete (core
-> pipeline, TUI + web UIs, discovery, persistence, live control, dependency-cohort venvs, the archive
-> mirror pre-warmer, the full Configuration editor + setup wizard, and M0 provenance) — see
-> [`rust/README.md`](rust/README.md) to build and run it.
->
-> Build & run:
-> ```sh
-> (cd rust && cargo build --release)
-> ./rust/target/release/gflib-build            # uses ./gflib-data/ for everything
-> # or install a PATH launcher:  rust/install-cli.sh   then just:  gflib-build
-> ```
+> ⚠️ **Experimental — a very early prototype.** This is research tooling under active
+> development. Flags, the on-disk schema, and behavior can change without notice, and many
+> features are incomplete or rough. It is not production-ready. See [Caveats & pitfalls](#caveats--pitfalls).
 
-**Documentation:** this README is the overview + spec. The on-disk schema, archive-safety
-invariants and pipeline it describes are **implementation-agnostic** and remain accurate; the
-historical `python3 gflib_build.py <flags>` command examples below map **1:1** to the same flags on
-the `gflib-build` binary. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) covers the internals;
-[`docs/EXTENDING.md`](docs/EXTENDING.md) shows how to add a frontend/backend;
-[`docs/cohort-map.md`](docs/cohort-map.md) is the generated full-library cohort map.
+`gflib-build` clones every buildable family in the [Google Fonts](https://github.com/google/fonts)
+library, compiles each one from its pristine upstream source, and records **exactly which compiler
+and version built — or failed to build — every family**. It prefers [`fontc`](https://github.com/googlefonts/fontc)
+(the Rust font compiler) and falls back to `fontmake` (Python), so the per-family record doubles as a
+**measurement of how much of the library already builds with the Rust toolchain**.
 
----
-
-## Quick start — zero to built
-
-With no existing data, a single command bootstraps everything. On first run it opens the
-**Configuration tab** (the setup wizard) to set up your build, then drives the whole pipeline live
-in the TUI:
-
-```sh
-gflib-build            # the Rust binary; uses ./gflib-data/ for everything
-```
-
-The Configuration tab is an **interactive ncurses form** with the settings pre-populated to
-their current values — you edit any field, watch the live "Plan" update, then **▶ Start**:
-
-```
- Google Fonts library build — Configuration                       first-time setup
-  1 config   2 overview   3 cohorts   4 failures   5 stats   (others appear after ▶ Start)
- set up your build, then ▶ Start   [↑↓/Tab]move  [space]toggle  [←→]cursor/step/cycle  …
-
- ▸ worklist source              ‹ metadata ›
-   google/fonts clone           gflib-data/google-fonts
-   repo archive                 /home/you/repo_archive        (auto-detected)
-   build output dir             gflib-data/build
-   build backend                ‹ auto ›
-   fontc binary (auto-detected) /home/you/fontc/target/release/fontc
-   parallel jobs                8
-   percent of library (←/→ ±5)  100
-   use per-build timeout        [ ] no
-   populate archive (mirror missing)  [x] yes
-   cohort venvs                 [ ] no
- Plan -----------------------------------------------------------------------
-   google/fonts : use existing clone (…)
-   archive      : POPULATE — mirror any missing upstream repos → /home/you/repo_archive
-   build        : backend=auto  jobs=8  scope=full library
-   fontc        : /home/you/fontc/target/release/fontc
-   timeout      : none (stop manually)
-  Start    Cancel
-```
-
-Every field is pre-filled with the resolved default and editable: `↑`/`↓` or `Tab` move
-between fields; `space` toggles a checkbox; `←`/`→` move the **text cursor** (Home/End jump,
-Backspace/Delete edit at the caret), **cycle** a `‹choice›`, or **±5-step** the percent;
-type for finer/other values. Conditional fields appear as relevant — ticking **use
-per-build timeout** reveals a seconds field (unticked = builds never time out, stop them in
-the UI); the **fontc** binary is auto-detected, and if missing the form offers *build fontc
-from source* or lets you type a path; the **repo archive** is auto-detected too. Navigate to
-**▶ Start build** and press Enter (or `Esc`/Cancel). Then it runs the pipeline — **clone →
-populate archive + build (streaming)** — live, landing on the Configuration tab. `--yes` skips
-the Configuration screen, `--wizard` forces it; `C` returns to it from the live dashboard.
-
-> Cloning google/fonts is a few GB; mirroring all upstream repos can be tens of GB and take
-> a long time. Sources are read-only and **archives are never deleted**.
-
----
-
-## Specifications (as given by Felipe)
-
-This tool is built to the following requirements. They are recorded here verbatim in
-intent so nothing is lost as the tool evolves.
-
-1. **Run outside the VM.** Produce the build *rules* so they can be executed
-   independently on the laptop (which now has plenty of local storage).
-2. **Live, interactive terminal UI** (ncurses or a similar terminal-app library)
-   giving real-time feedback on:
-   - **(A)** which families were already built,
-   - **(B)** which ones are being built at a given moment,
-   - **(C)** how much space was used so far,
-   - **(D)** how long the build has been running,
-   - **(E)** how many failures happened so far — **with detailed logs of the failures**.
-3. **Clean any pre-built font project** — to save space and to guarantee we build
-   everything **from scratch**.
-4. The build must be based on the **pristine original state of the cloned (archived)
-   repos**.
-5. The build procedure **must not change the repos themselves**; instead, save all
-   assets in a **separate build directory**.
-6. **Never delete the archives.**
-7. **Save these specification messages in this README.** (This section.)
-8. **Keep the build system in its own git repository, and commit often.**
-9. **Optimize total build time** by employing **parallelism**.
-10. **Be smart about installing Python dependencies** when they are needed for build
-    steps. If many families use the same set of Python dependencies, place them in a
-    **cohort** so they can **share a single virtual environment**.
-11. **Reduce reliance on Python.** If a family can be built with **Rust +
-    gftools-builder3 (fontc)**, that is the success path. Families that still need
-    **gftools-builder2 / Python** (e.g. for pre-build steps or Python-only deps) are
-    fine as their own cohorts.
-12. **Long-term goal: migrate everything to Rust.** This tool also *measures* how much
-    of the library already builds with the Rust path, to track that migration.
-13. **The terminal UI must be optional and modular.** Some users prefer a traditional
-    terminal program; others may feed everything to a web interface. Build it modular so
-    others can customize the frontend.
-14. **Allow building only a percentage of the library** (e.g. 5%) instead of the whole
-    thing — useful for validating the tool during development.
-15. **Bootstrap from nothing.** With `--source metadata` (and by default, no flags), the
-    tool should `git clone` google/fonts, read all `METADATA.pb`, **create/populate a local
-    archive** of upstream repos (building one from scratch if none exists), generate the
-    cohorts, and build them all — so any user can bootstrap the whole process. All of it
-    shown live on an ncurses UI the user can observe and **navigate** as the data updates.
-16. **Configuration screen.** It must **ask the user before** doing those heavy things
-    (cloning, mirroring) — via the Configuration tab, not silent. (No separate "wizard": the
-    first-run setup screen *is* the Configuration tab.)
-17. **The Configuration screen is an editable ncurses form** with fields pre-populated with the default
-    settings that the user can edit and then move on. Specifically: text fields render a
-    movable cursor; a *build timeout* checkbox reveals a seconds field only when ticked
-    (otherwise builds never time out — the user can still stop them in the UI); *percent of
-    library* reacts to ←/→ in ±5 steps yet stays typeable for finer control; the *fontc*
-    binary is auto-detected (offering to build it from source, or to type a path, if not
-    found); and a pre-existing **repo archive is auto-detected** too.
-18. **Persist the chosen settings** to a config file and pre-fill them on the next run.
-19. **Auto-detect cargo**; if missing, give the user clear install instructions.
-20. **Save all build log output** so failures can be read for troubleshooting.
-21. **Time-measure every operation** to surface bottlenecks and guide performance work.
-22. **Detach & reattach.** The user can quit the program and leave the builds running
-    autonomously; reopening shows the live stats of what's going on.
-23. **The entire interaction is ncurses.** The bootstrap operations (clone fontc, build
-    fontc, clone google/fonts, populate archive, scan cohorts, build) all show up as a live
-    **task-list with emoji status** (✅ done · 🔄 running · ⏳ pending · ❌ failed · ➖ n/a),
-    plus per-task percentage and elapsed time — not plain CLI prints.
-24. **Quit frees the shell; resume is instant.** Pressing `q` returns to the shell with the
-    build still running; re-running the program (from the same or a different terminal)
-    reattaches straight to live updates **without showing the setup interface again**.
-25. **Live archive list.** As repos are populated into the archive, their names appear in a
-    gradually growing list in the UI.
-26. **Arrow-key tabs.** The dashboard's view tabs are driven by the ←/→ arrows (number keys
-    still jump directly).
-27. **Now-building shows checkouts.** A family appears in the "Now building" list (with a
-    `checkout` tag) from the moment its source is being extracted, not only once it compiles.
-28. **List selection + detail.** On every tab, `↑`/`↓` select an item in that tab's list and
-    `↵` opens a detail overlay (a failure's full error + log tail, a cohort's requirements,
-    etc.); `Esc`/`←`/`↵` returns.
-29. **Cumulative clock.** The elapsed timer represents the real time spent so far across
-    reopen/resume — it is not reset to zero when the program is reopened.
-30. **`C` returns to the setup wizard** from the live dashboard (to change settings / start
-    over); the running build is replaced only if the user actually starts a new one.
-31. **Dynamic, streaming pipeline (no barriers).** Mirroring, cohort assignment, and building
-    run concurrently: a repo is evaluated for its cohort and built the moment it's available
-    in the archive — the build does not wait for "populate archive" to finish. An archive
-    pre-warmer mirrors ahead using idle I/O; a shared per-repo clone lock means no repo is
-    cloned twice; clones are abortable so shutdown never blocks. The archive list grows live.
-32. **Configuration tab + LIVE config changes.** A "config" tab shows the live settings and
-    edits them; applying takes effect on the RUNNING build with no restart — raising percent
-    fetches/cohorts/builds the newly-included families, raising jobs starts more parallel
-    workers (via a `control.json` the daemon polls). Drive config from one monitor at a time.
-33. **Self-healing dependencies — no manual pin management.** If a venv's `pip install` can't
-    satisfy a pinned version (a stale/dev pin absent from PyPI), the installer automatically
-    drops just that pin, lets pip backtrack to a compatible version, retries, and records the
-    relaxation in the config tab. Valid pins are kept, so reproducibility holds for everything
-    that resolves; the user never has to hand-edit `requirements-build.txt` to unblock a build.
-34. **Config tab is leftmost + the default view**, reflecting the current settings (falls back
-    to the persisted config so it never shows a list of `None`).
-35. **`--reset` completely cleans the system** — deletes all built assets + virtual environments
-    (the whole build dir); the repo archive is NEVER touched (strict append-only policy).
-36. **No separate wizard — the Configuration tab is the setup.** First-run setup is the
-    Configuration tab itself (dashboard chrome, all fields editable, ▶ Start), and the same tab
-    in the live dashboard does live edits. One config interface, not two.
-37. **One Configuration tab, fully editable in place.** ←/→ move the text cursor / ±step /
-    cycle, type to edit — no reloading a separate screen to edit. Tab navigation is `Tab` /
-    `Shift-Tab` only (so ←/→ and number keys are free for editing).
-38. **A "built" tab** lists the successfully built families (successes), parallel to Failures.
-39. **Section navigation** — multi-section tabs (overview, stats) are navigable section by
-    section: ←/→ focus a section (the ▼-marked one), ↑/↓ navigate its items, ↵ acts on the
-    selected item. (Ctrl+Tab is intercepted by most terminals, so ←/→ is the binding.)
-40. **Always-visible status panel.** A panel just above the footer instantly shows the most
-    useful info about whatever item is focused, anywhere in the program — a single line in most
-    cases (status-bar style), growing to a few lines when there's more worth showing. The
-    motivating case: a red `✗` entry in *Overview → Archive — mirrored* now explains *why* that
-    repo could not be mirrored into the archive.
-41. **Header shows total build-system disk usage**, not a per-session delta. The old
-    `disk +0B`-on-reopen was useless; the header now reports the whole build dir's on-disk size.
-42. **Sections fill the available space + live resize.** Multi-section tabs no longer collapse
-    items while the screen is half-empty: the visible height is shared fairly across sections
-    (water-fill), and the layout re-flows the instant the terminal is resized. The focused
-    section's selected item is *always* kept on-screen (a `_layout_sections` planner that provably
-    fits the body — verified by a 330k-case sweep).
-43. **Never resurrect a broken dependency venv.** A venv whose `pip install` failed (e.g. an
-    unpublished pin) leaves `bin/python` with no packages; it must be rebuilt, not reused. Readiness
-    is gated on a `.gflib-installed` success marker, so a half-installed cohort venv is rebuilt on
-    the next run instead of failing every family with “No module named gftools”.
-44. **Auto-retry transient clone failures.** `fetch-pack: invalid index-pack output` and similar
-    network hiccups are retried a few times (abortable backoff); permanent errors (repo
-    missing/private) are not.
-45. **Failure-cause summary.** Failures are grouped by cause with an actionable hint (broken venv →
-    rebuilt next run; transient fetch → retried; stale mirror → `git remote update`; …) — shown in
-    the *failures* tab, the status panel, and the completion banner.
-46. **Completion / stopped banner.** When the build finishes or the daemon dies, a prominent banner
-    states the outcome (built/failed/skipped of N), the top failure cause, and next steps — so the
-    dashboard never just looks frozen mid-flight.
-47. **Coherent counts.** Families left `queued`/`building` by a prior run that aren't in the current
-    worklist (e.g. queued at a higher `--percent`, now outside the sample) are reconciled to
-    `skipped (not selected this run)`, so the counters reflect real pending work.
-48. **Proactive self-healing — re-attempt fixable failures.** Starting a build automatically
-    *retries* families that failed with a cause a fresh try can clear (broken venv, dependency
-    install, transient fetch, stale mirror, …), so pressing `[C]` → Start
-    actually moves things forward instead of instantly declaring the build complete. Genuine build
-    errors / unreachable repos are kept (they'd just re-fail) unless you tick **retry ALL failed**
-    in the config tab. A retried family rebuilds its broken venv from scratch. (A cause that needs
-    a human — a missing system `-dev` library — is *not* auto-retried; fix it then use retry-all.)
-49. **`[R]` — retry the selected family now.** Select a family (e.g. in the *failures* tab) and
-    press `R` to re-attempt just that one — a single, non-disruptive in-process action. The
-    detached daemon **lingers after the build completes** (status writer + control watcher stay
-    alive), so `[R]` re-queues the family live with the lists and the whole UI unchanged — no
-    program reload. The daemon idle-exits after 30 min of no new work.
-50. **Hermetic, self-correcting venvs.** A venv's readiness is keyed to a hash of its requirements,
-    so an empty/stale/wrong install is rebuilt (never reused). `base_requirements` is re-derived
-    from the bundled file each run (never persisted as an absolute path that breaks across
-    machines). setuptools+wheel are seeded (Py3.12+ omit them). Dependency *conflicts* (a cohort
-    needing a different version of a base pin) are auto-relaxed cohort-locally.
-51. **Meaningful failure causes.** No more bare `pip install rc=1`: failures are classified as
-    dependency conflict, pip-resolution-too-deep, build-needs-setuptools, missing-system-library
-    (with the `apt install` hint), misconfigured-requirements, transient fetch, stale mirror, etc.
-52. **Progress = processed / selected.** The bar counts built + failed + skipped (everything that
-    won't be retried this pass), so it reaches 100% when nothing is queued/building — labelled
-    `N/M processed (P%)`.
-53. **Cohort rows list family names** separated by ` | ` in a distinct colour from the count/key.
-54. **Stable selection.** As a list grows / shrinks / reorders (families moving failed → building
-    → built live), the cursor stays on the *same item*, not the same row index.
-55. **Per-family pre-build commands** (`build_rules.json`, version-controlled next to the script).
-    Map a family slug to ordered shell commands that run — with `cwd` = the extracted upstream
-    source and the build venv's bin first on `PATH` — *before* gftools-builder / fontc / fontmake,
-    for families whose sources must be generated/pre-compiled first. Auto-detected, or
-    `--build-rules PATH`. A non-zero exit fails the family with a clear `pre-build` error.
-56. **Pinned "Now building".** While families are compiling, the live list of what's building is
-    shown on *every* tab (not just overview), so you never lose sight of it.
-57. **Defaults & readability.** Lands on the **overview** tab; the **Failures** list shows *all*
-    currently-failed families (matching the count); config paths render relative to where you
-    launched; the progress bar is **colour-coded by outcome** (built/failed/skipped); tables use
-    distinct, subtle per-column colours; transient (network/IO) failures **auto-retry in-build**;
-    and each failure-cause bucket names *which* families it affected.
-58. **Output collection in any `outputDir`.** Built fonts are found by a recursive, freshly-built-only
-    scan of the work tree (not a fixed shallow list), so a build that writes to a custom `outputDir`
-    (e.g. `fonts/<Family>/variable/`) is no longer a false `produced no expected font files`; a real
-    name mismatch is reported as `output name mismatch` instead.
-59. **Re-trigger a set / priority queue.** `--only` takes a comma list **or `@file`** (one slug per
-    line) and restricts the whole run to those families — they become the entire queue (highest
-    priority). `--retry-category "output name mismatch"` re-attempts only failures of that cause
-    (like `--retry-failed`, but targeted — e.g. after fixing `collect_outputs`).
-62. **Persistent across restarts.** The cohort→venv cache is shown (● = venv on disk, reused next
-    run); the failure history is durable (`failure-history.jsonl`, append-only) + the failing log is
-    archived to `logs/failed/`, surfaced in a *Failure history* section that survives restarts and
-    re-attempts.
-63. **Archive tab.** Shows the **total repos in the whole archive on disk** (not a session count) and a
-    queue-oriented, colour-coded **multi-column** grid: *cloning now* (yellow), *recently archived,
-    last 30 min* (green), *queued next* (cyan), plus an *unreachable* list with the git reason.
-64. **Responsive monitor.** The dashboard re-parses `status.json` only when it changes (mtime-gated),
-    keeping the UI snappy even on networked filesystems.
-60. **Queue tab.** A `queue` tab lists the waiting families in priority order, each tagged **new**
-    (never built), **retry** (after a failure), or **rebuild** (of a prior success) — the only three
-    kinds a family can be queued under.
-61. **Web dashboard (`--ui web`).** A browser UI that mirrors the TUI: it serves the same `snapshot()`
-    at `/api/status` and routes live controls (jobs / percent / retry / pause) to `control.json` via
-    `/api/control` — the same channel the curses monitor uses. All tabs (overview, queue, cohorts,
-    built, failures, stats, config), the segmented progress bar, pinned "Now building", per-row detail
-    and the control log are rendered from the live snapshot, polled every 1.5 s. Pure stdlib
-    (`http.server`); `--web-port` sets the port (default 8765).
-
----
-
-## What it does
-
-For every family in a `google/fonts` clone that has buildable source metadata, the
-harness:
-
-1. Resolves the upstream repo + pinned commit from `METADATA.pb`.
-2. Streams the **pristine tree at that commit** out of the repo's bare mirror with
-   `git archive` (a read-only operation — see guarantees below) into a throwaway
-   extraction directory.
-3. **Pre-cleans** any committed build outputs (`fonts/`, `*_ufo/`, `variable/`, …)
-   from that throwaway tree so the build regenerates everything from sources.
-4. Resolves the build config (a google/fonts **override** `config.yaml`, copied into
-   the extracted repo root; else the in-repo `config_yaml`; else an auto-discovered
-   `sources/config.yaml`).
-5. Builds it — **Rust first** (`fontc`), falling back to Python (`fontmake`) — using
-   the right **dependency cohort** venv.
-6. Collects the built fonts + a full build log into the **separate build directory**,
-   optionally `sha256`-compares them to the shipped binaries, then deletes the
-   throwaway tree to reclaim space.
-
-### Archive-safety guarantees (strict)
-
-- **Sources are read only with `git archive <commit>` from the bare mirrors.** No
-  checkout, no fetch into a working tree, no write of any kind into a mirror.
-- **Archives are never deleted** and never modified. (Missing repos can be *added*
-  with `--mirror-missing`, which only ever clones new mirrors — append-only.)
-- **Every asset is written under `--build-dir`**, never inside a source repo.
-- **Every build is from scratch** — a fresh extraction, output dirs pre-cleaned, the
-  extraction discarded afterwards.
-
----
-
-## Where the worklist comes from (`--source`)
-
-Two data sources for the worklist/stats, both first-class:
-
-- **`--source metadata`** (default) — the worklist and each family's pinned `commit`,
-  config, and shipped binaries are read from a **google/fonts clone**'s `METADATA.pb`.
-  This builds *exactly what Google Fonts ships* and can compare against the shipped
-  binaries (`--compare`). Requires `--google-fonts`.
-- **`--source archive`** — the worklist is **every bare mirror in the archive**, each at
-  `--archive-rev` (default `HEAD` = the default-branch tip). The repo URL comes from the
-  mirror's origin; the config is auto-discovered in the repo; `--google-fonts` is
-  **optional** (no shipped binaries exist to diff against, so `--compare` is unavailable).
-  This inspects/builds the *upstream sources as they are*, independent of what GF pins.
-
-In **both** modes the **sources** always come from the archive (read-only `git archive`),
-and `requirements.txt` for cohorts is read from the archive. `--source` only changes where
-the *worklist* is enumerated.
-
-## Build backends — Rust first, Python cohorts as fallback
-
-The compiler backend is selectable with `--backend {auto,fontc,fontmake}`
-(default `auto`):
-
-- **`fontc` (Rust, preferred).** Runs `gftools.builder <config> --experimental-fontc
-  <fontc-bin>`: gftools-builder orchestrates the recipe, but the actual compile is
-  done by **fontc** (Rust) instead of fontmake. Provide the binary with `--fontc-bin`
-  (build it once with `cargo build --release -p fontc` in a `googlefonts/fontc`
-  checkout).
-- **`fontmake` (Python, fallback).** The classic `gftools.builder <config>` path,
-  used when fontc isn't available or a family fails under fontc.
-- **`auto`** tries **fontc first** and falls back to fontmake, recording **which
-  backend actually built each family**. That per-family record is the
-  **Rust-migration metric**: it tells us what fraction of the library already builds
-  with pure-Rust compilation, and which families still need Python.
-
-> Note: even the fontc path currently drives the build through `gftools.builder`
-> (Python orchestration). "Reduce reliance on Python" today means replacing the
-> *compiler* (fontmake → fontc); the long-term goal is an all-Rust build with no
-> Python in the loop. The harness is structured so the backend abstraction can later
-> point at a fully-native Rust builder.
-
----
-
-## Dependency cohorts (shared virtual environments)
-
-Installing a venv per family would be wasteful; one giant venv risks conflicts. So
-with `--manage-venvs` the harness groups families by their **build dependency set**:
-
-- A family's cohort key is the hash of its repo `requirements.txt` (normalized:
-  comments/whitespace stripped, sorted). Families with no/standard requirements share
-  the **`base`** cohort.
-- One venv is created per distinct cohort, under `--build-dir/venvs/<key>/`, with a
-  shared pip cache (`--build-dir/pip-cache`). The first family that needs a cohort
-  creates it (other workers wait on a per-cohort lock); everyone else reuses it.
-- The `base` cohort venv is created once up front (from `--base-requirements`, the
-  pinned GF toolchain) so workers don't stampede on startup.
-
-Without `--manage-venvs`, all builds use a single interpreter you point at with
-`--build-python`.
-
-**Preview the grouping first** with `--cohorts-report`: it scans every family's
-`requirements.txt` **read-only** (`git show` on the mirror — no extraction, no builds,
-archives untouched) and prints how many distinct cohorts exist and which families fall
-in each, plus a `cohorts.json`. Example (3% sample): 43 families → 17 cohorts, e.g. one
-shared by 6 Noto families (notobuilder deps), one by 4 Playwrite families (a 138-package
-pinned set), and 15 with no requirements in `base`.
-
----
-
-## Parallelism & scheduling
-
-- Builds run in a worker pool (`--jobs`, default = CPU count). Each build is an
-  isolated subprocess (gftools.builder `chdir`s globally, so isolation matters —
-  hence one process per build).
-- **Longest-first scheduling** shrinks the tail: on a resumed run the queue is ordered
-  by each family's previously-recorded build time (descending); on a first run a
-  heuristic (variable fonts and multi-file families first) is used.
-- A per-cohort lock means a given cohort venv is installed exactly once even under
-  full parallelism.
-
----
-
-## Modular, optional frontends
-
-The build **core** (`Orchestrator`) is UI-agnostic. It exposes a `snapshot()` and
-continuously writes two machine-readable files under `--build-dir`:
-
-- `state.json` — the full resumable state (every family's status, backend, duration).
-- `events.jsonl` — an append-only stream of `started` / `built` / `failed` / `venv`
-  events.
-
-A frontend just observes the core. Built-in frontends, chosen with `--ui`:
-
-| `--ui` | Frontend | For |
-|--------|----------|-----|
-| `curses` | ncurses dashboard | interactive terminal |
-| `plain`  | one line per completion + periodic summaries | logs, CI, non-TTY |
-| `json`   | newline-delimited JSON snapshots to stdout | piping to other tools |
-| `none`   | silent (state/events files only) | embedding |
-| `auto` (default) | curses on a TTY, else plain | — |
-
-**ncurses is never required.** Write your own frontend by subclassing `Frontend`, or —
-for a **web UI** — run with `--ui none` (or `json`) and have your server tail
-`events.jsonl` / poll `state.json` out-of-process. Nothing in the core imports curses
-unless the curses frontend is actually selected.
-
-## Partial runs (validation)
-
-`--percent P` builds only an **evenly-spaced sample** of `P`% of the library (spread
-across the alphabetical family list, so 5% still spans many foundries rather than one
-corner). Ideal for validating the tool end-to-end before committing to a full run.
-`--only ofl/a,ofl/b` picks an explicit subset.
-
-## Pipeline task-list & the live dashboard (TUI)
-
-The **entire interaction** is ncurses — not just the builds. A run drives a background
-pipeline rendered as a live **task-list** with emoji status (✅ done · 🔄 running · ⏳
-pending · ❌ failed · ➖ n/a) plus per-task progress and elapsed time:
-**`clone google/fonts`** → **`build fontc`** → **`discover worklist`** → then **`populate
-archive`** and **`build fonts`** running **concurrently** (mirroring, cohort assignment and
-compiling all stream together — no barriers) → **`done`**. The dashboard also shows a phase
-banner + progress bar and is **navigable** — four views switchable with the **←/→ arrows**
-(or `Tab`):
+The whole run is driven from a **live dashboard** — a terminal UI or a browser — that you can detach
+from and reattach to while builds keep running in the background.
 
 ```
  Google Fonts library build                                   elapsed 01:23:45
- build dir 142.8GiB  free 290.0GiB  jobs 8  cohorts 28  fontc 980/fontmake 240
- Phase: building   built 412/1503  failed 7  building 8  queued 1076
- [######################------------------------------------]  31%
-  config  overview  cohorts  built  failures  stats        [Tab]/[⇧Tab] switch tabs
- ▼ Pipeline (6) -------------------------------------------------------------
-  🔄 build fonts        612/1503  40% 03:12  (mirror + cohort + compile, streaming)
- ▷ Archive — mirrored (340) -------------------------------------------------
-  + google/fonts-sources    ✗ owner/dead-repo
- ▷ Now building (8) ---------------------------------------------------------
-  w 1 ofl/notosanstc                       02:10  checkout
- ▷ Recent failures (7) ------------------------------------------------------
-  ofl/foldit                       gftools.builder exit 1: KeyError 'instances'
- ───────────────────────────────────────────────────────────────────────────
-  ✗ owner/dead-repo — could NOT be mirrored into the archive
-    remote: Repository not found (HTTP 404)
- [Tab]tabs  [←→]section  [↑↓]item  [↵]details  [C]onfig  [q]uit
+ disk used 142.8GiB  free 290.0GiB                            412/1503 attempted (27%)
+ Phase: building
+ [#####████████──────────────────────────────────────────]  built 412 · failed 7 · 1084 left
+  config  overview  queue  cohorts  built  failures  stats        [Tab] switch tabs
+ ▶ Now building (8) ─────────────────────────────────────────────────────────
+  ofl/notosanstc          02:10  checkout        ofl/cairoplay     00:41  fontc
+ ▷ Recent failures (7) ──────────────────────────────────────────────────────
+  ofl/foldit              gftools.builder exit 1: KeyError 'instances'
 ```
 
-Tabs (switch with **`Tab` / `Shift-Tab` only**):
-- **config** (leftmost, default) — the ONE Configuration tab, used for both first-run setup
-  and live editing (no separate wizard). `↑`/`↓` pick a field; **`←`/`→` move the text cursor /
-  ±step a number / cycle a choice**; type to edit; `space` toggles. On a running build, the
-  live-editable fields (percent, jobs, backend, timeout, compare, populate) apply with **✓ apply
-  changes** — raising **percent** immediately fetches+cohorts+builds more families, raising
-  **jobs** spawns more workers; path/source fields show `(restart: C)`. First run shows the same
-  tab with **▶ Start build / Cancel**.
-- **overview** — the pipeline task-list + the live archive list + now-building + recent failures,
-  as navigable **sections** that **fill the available height** (see below).
-- **cohorts** — the dependency cohorts, live (largest first); each row lists the comma-separated
-  **family names** in that cohort (↵ shows the full family list + requirements).
-- **built** — the list of **successfully built** families (newest first; ↵ shows output path,
-  size, vs-shipped comparison + rebuild command).
-- **failures** — all failures, newest first.
-- **stats** — fontc-migration tally + per-phase / per-operation timing (sections).
+## Why
 
-Keys: **`Tab`/`Shift-Tab`** switch tabs; within a tab **`←`/`→` move focus between sections**
-(the `▼`-marked one), **`↑`/`↓` navigate items** in the focused section, **`↵` open a detail
-overlay** (a failure's error + log tail, a built family's output, a cohort's requirements, a
-task/op's detail; `Esc`/`↵` returns); **`R` retries the selected family now**; `C` opens/returns
-to the Configuration tab, `q` quits.
-(`Ctrl+Tab` for sections is intercepted by most terminals — e.g. gnome-terminal's own tab
-switching — so `←`/`→` is the reliable binding.) The **elapsed clock is cumulative** across
-reopen/resume. Full per-family logs are at `<build-dir>/logs/<slug>.log`. For non-interactive
-use pick `--ui plain`, `--ui json`, or `--ui none`.
+The north star is a **fully reproducible build of the whole Google Fonts library on the latest
+`fontc`, with zero Python in the pipeline.** We're not there yet — so the tool deliberately uses
+whatever compiler works *today* while recording the compiler and exact version for every family, and
+tracks progress along a milestone ladder:
 
-Multi-section tabs **fill the available vertical space**: instead of capping each section at a
-couple of rows, the visible height is shared fairly across sections (water-fill — a section that
-needs fewer rows releases the surplus to the others), so a small section is shown in full while a
-large one (e.g. hundreds of failures) expands to take the rest. The layout **re-flows live when
-you resize the terminal** — grow the window and more rows appear immediately, no restart.
+| | Milestone |
+|---|---|
+| **M0** | Measurement foundation — record compiler + exact version for every build attempt |
+| **M1** | Full buildability — 100% of buildable families produce the expected fonts (any backend) |
+| **M2** | fontc-gap map — every buildable family attempted with `fontc`, the result recorded |
+| **M3** | fontc equivalence — `fontc` output equivalent to `fontmake`/shipped, at scale |
+| **M4** | fontc majority — families that build correctly with `fontc` alone (no fontmake fallback) |
+| **M5** | Python-free pipeline — Rust-native `gftools-builder3`, no Python pre-build or deps |
+| **M6** | latest-fontc currency — the M4/M5 set re-validated on the newest `fontc` |
+| **M7** | 100% Rust — the whole library: latest `fontc`, equivalent output, zero Python |
 
-An **always-on status panel** sits just above the footer and explains the **currently focused
-item** wherever you are — a one-liner that grows to 2–3 lines only when there's more worth
-showing. Move focus with `←`/`→` (sections) and `↑`/`↓` (items), or `↑`/`↓` over the
-Configuration fields, and the panel updates instantly: what a config field does, what `▶ Start`
-will launch, why a build is failing, what a cohort needs — and, for a **red `✗` entry in
-Archive — mirrored**, *why* that repo could **not** be mirrored (e.g. `Repository not found
-(HTTP 404)`). The header's **`build dir <size>`** is the *total* on-disk footprint of the whole
-build system (`out/`, `venvs/`, `work/`, logs), recomputed periodically — not a per-session
-delta — so it's meaningful the moment you reopen the dashboard.
+See [`docs/migration-milestones.md`](docs/migration-milestones.md) for the full framing.
 
-### Quit anytime — the build keeps running, resume straight to live updates
+## Features
 
-A fresh interactive (curses) build runs **detached by default**: it builds in a background
-daemon while you watch a live monitor. Press **`q`** and you're back at the shell with the
-build still running — go do anything else. **Re-run the program** (from the same terminal or
-a different window) and it detects the running build and **reattaches the live monitor,
-skipping the setup wizard entirely** — straight back to live updates. `--stop` cancels the
-build gracefully. (`plain`/`json`/`none` UIs stay in the foreground for scripting/logging;
-`--detach` forces detach for any UI.)
+- **Live dashboard, two frontends** — a navigable terminal UI (`--ui curses`) and a browser
+  dashboard (`--ui web`), both rendered from the same live snapshot.
+- **Detach & resume** — builds run in a background daemon; quit the dashboard and the build keeps
+  going; re-run to reattach. State is resumable across restarts.
+- **fontc-first** — `--backend auto` tries the Rust compiler first and falls back to `fontmake`,
+  recording which backend built each family (the migration metric).
+- **Dependency cohorts** — families that share an identical pinned dependency set share one virtual
+  environment, instead of one venv per family or one giant venv.
+- **Multi-Python ladder** — `--pythons` falls back to an older interpreter (keeping the exact pins)
+  before relaxing anything, to satisfy era-specific wheels.
+- **Archive-safe** — sources are read **read-only** (`git archive` from bare mirrors); upstream
+  repos are never modified and never deleted; every byte of output lands in a separate build dir.
+- **Provenance (M0)** — records the compiler and exact version for every family, success or failure.
+- **Parallel & streaming** — a worker pool builds while the archive mirrors and cohorts are scanned,
+  with no barriers between phases.
+- **Optional extras** — `fontc_crater` comparison, `fontspector` QA, and `.deb` packaging of built
+  families (all works-in-progress).
+
+## Install
+
+Building the tool needs only a **Rust toolchain** ([rustup](https://rustup.rs)). The dependency
+footprint is intentionally tiny (`serde`, `serde_json`, `crossterm`).
+
+```sh
+git clone <this-repo> gflib-build
+cd gflib-build/rust
+cargo build --release            # binary at target/release/gflib-build
+```
+
+Optionally put a launcher on your `PATH`:
+
+```sh
+./install-cli.sh                 # installs ~/.local/bin/gflib-build
+```
+
+To actually **build fonts** you also need, at runtime:
+
+- `git` and `python3` on your `PATH` (the tool creates cohort virtualenvs and installs pinned
+  build deps into them automatically);
+- a **worklist source** — either a [`google/fonts`](https://github.com/google/fonts) clone
+  (`--source metadata`, the default) or a *repo archive* of bare mirrors (`--source archive`);
+- **optionally** a [`fontc`](https://github.com/googlefonts/fontc) binary (and `gftools-builder3`)
+  for the Rust backend — without them the tool uses `fontmake`.
+
+## Quick start
+
+```sh
+# 1. See what would be built (read-only), from a google/fonts clone:
+gflib-build --list --google-fonts /path/to/google/fonts
+
+# 2. Build a small evenly-spaced sample with the live terminal dashboard. It opens on an
+#    interactive Configuration tab — set things up, then ▶ Start (pass --setup to force it).
+gflib-build --google-fonts /path/to/google/fonts --percent 2
+
+# 3. Same, but watch it in your browser:
+gflib-build --google-fonts /path/to/google/fonts --percent 2 --ui web   # http://localhost:8765
+
+# 4. Kick the tires with no real builds — replay a recorded session live:
+gflib-build --demo --ui web
+```
+
+Useful flags: `--only ofl/abel,ofl/roboto` (explicit subset), `--backend fontc|fontmake|both`,
+`--jobs N`, `--attach` (monitor a running build), `--stop` (cancel it), `--reset --yes` (wipe the
+build dir — the archive is never touched). Run `gflib-build --help` for the full surface.
+
+## How it works
+
+A background **daemon** owns the build directory and writes an atomic `status.json` snapshot ~once a
+second; every UI is a thin **monitor** that reads it and sends live commands back through
+`control.json` — so the terminal UI, the web UI, and external tools all observe the same state, and
+only one daemon owns a build dir at a time.
+
+For each family the pipeline: resolves the upstream repo + pinned commit, streams the **pristine tree
+at that commit** out of a bare mirror, pre-cleans any committed build outputs, resolves the build
+config, builds it in the right cohort venv (fontc → fontmake fallback), then collects the fonts +
+full log into the build dir and records provenance.
+
+The internals are documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); adding a
+frontend or backend is covered in [`docs/EXTENDING.md`](docs/EXTENDING.md).
+
+## Repository layout
+
+```
+rust/                 the tool (Rust) — see rust/README.md to build & hack on it
+  src/                ~12.5k LOC across ~19 modules (build engine, TUI, web, daemon, venvs, …)
+docs/                 architecture, extending, milestones, specifications, design reports (+ PDFs)
+build_rules.json      per-family pre-compile steps (see the caveat below)
+requirements-build.txt the pinned base GF build toolchain installed into the base cohort venv
+gflib-data/           local data + build output (git-ignored; created on first run)
+```
+
+## Caveats & pitfalls
+
+- **It's an early prototype.** Expect rough edges, breaking changes, and half-finished features.
+  Treat outputs as provisional and verify anything important.
+- **Real builds are heavy.** A full library run is **tens of GB** of clones, virtualenvs, and font
+  output plus many CPU-hours. Always start small — `--percent 2` or `--only <family>` — and only
+  scale up once it's behaving.
+- **You must supply a worklist source.** Either a `google/fonts` clone (several GB) or a repo
+  archive of bare mirrors (tens of GB if you mirror everything). The tool can populate a missing
+  archive, but it won't conjure sources from nothing.
+- **One daemon per build dir.** Re-running while a daemon already owns the build dir attaches a
+  monitor instead of starting a new build; `--stop` first if you really want to restart. A daemon
+  that was killed uncleanly can leave a stale lock.
+- **"fontc-first" replaces the *compiler*, not the whole pipeline.** Even the fontc path is currently
+  orchestrated by Python `gftools.builder`. A truly Python-free build is a milestone (M5/M7), **not**
+  the current reality.
+- **Output is not guaranteed identical to shipped fonts.** The tool *measures* and records what
+  built each family; byte-for-byte equivalence to the shipped/fontmake binaries is a goal (M3),
+  not a promise.
+- **`build_rules.json` can change shipped output.** Some per-family pre-compile rules edit the
+  upstream source to make it build, and a number of those edits are **under active review** — see
+  [`docs/build-rules-review.pdf`](docs/build-rules-review.pdf). Don't assume a rule is a correct fix.
+- **Dependency self-healing relaxes pins.** When a pinned build dependency has no installable wheel,
+  the tool drops just that pin and lets pip resolve a compatible version (surfaced in the config
+  tab). Reproducibility holds for everything that resolves, but a relaxed pin is a deviation.
+- **The optional extras are WIP.** `.deb` packaging, `fontspector` QA, and the `fontc_crater`
+  comparison are incomplete and may produce incomplete or imperfect results.
+- **Linux/macOS only.** No Windows support. `git` and `python3` must be on `PATH` for real builds.
+
+## Documentation
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the pipeline, daemon, and schemas work
+- [`docs/EXTENDING.md`](docs/EXTENDING.md) — add a new frontend or build backend
+- [`docs/migration-milestones.md`](docs/migration-milestones.md) — the M0–M7 north-star ladder
+- [`docs/SPECIFICATIONS.md`](docs/SPECIFICATIONS.md) — the original verbatim requirements
+- [`rust/README.md`](rust/README.md) — build, test, and module map for contributors
+- [`docs/`](docs/) — design reports (build-fix provenance, dependency cohorts, `.deb` packaging,
+  the build-rules review) as Markdown + PDF
+
+## Contributing
+
+Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to build, run the
+tests, and find your way around the code.
+
+## License
+
+[Apache License 2.0](LICENSE).
 
 ---
 
-## Setup on your laptop
-
-Prerequisites (native, **outside** the VM):
-
-1. **Python 3.8+** (for the harness itself — pure standard library, no install).
-2. A **base build venv** with the GF toolchain (see `requirements-build.txt`):
-   ```sh
-   python3 -m venv ~/gflib-venv
-   ~/gflib-venv/bin/pip install -r requirements-build.txt
-   ```
-3. **fontc** (Rust compiler), for the Rust path:
-   ```sh
-   git clone https://github.com/googlefonts/fontc && cd fontc
-   cargo build --release -p fontc        # binary at target/release/fontc
-   ```
-4. A **google/fonts clone** (for METADATA + the shipped binaries to compare against).
-5. The **repo archive** of bare mirrors, laid out as `<archive>/<owner>/<repo>.git`.
-   Copy it from the shared storage, or let `--mirror-missing` clone what's absent.
-
-## Usage
-
-```sh
-# Preview the worklist:
-python3 gflib_build.py --list \
-  --google-fonts ~/google/fonts --archive ~/repo_archive --build-dir ~/gfbuild
-
-# Preview the dependency-cohort grouping (read-only, no builds):
-python3 gflib_build.py --cohorts-report \
-  --google-fonts ~/google/fonts --archive ~/repo_archive --build-dir ~/gfbuild
-
-# Full library build, Rust-first, with cohorts and the live TUI:
-python3 gflib_build.py \
-  --google-fonts ~/google/fonts \
-  --archive     ~/repo_archive \
-  --build-dir   ~/gfbuild \
-  --backend auto --fontc-bin ~/fontc/target/release/fontc \
-  --manage-venvs --base-python python3 --base-requirements requirements-build.txt \
-  --jobs 8 --compare --mirror-missing
-```
-
-```sh
-# Validate the tool on 5% of the library first, plain output:
-python3 gflib_build.py --google-fonts ~/google/fonts --archive ~/repo_archive \
-  --build-dir ~/gfbuild --percent 5 --ui plain --compare
-```
-
-Useful flags: `--percent 5` (sample), `--only ofl/dmsans,ofl/roboto` (subset),
-`--ui {curses,plain,json,none}`, `--retry-failed`, `--rebuild` (ignore prior state),
-`--discard-fonts` (keep only the comparison result, not the built binaries),
-`--keep-work` (debug: keep the extraction).
-
-```sh
-# Completely reset — delete ALL built assets + virtual environments (the whole build dir) to
-# start clean. The repo archive is NEVER touched (strict append-only policy); the google/fonts
-# clone is kept too. Refuses if a build is running (--stop first) or if the archive is inside
-# the build dir. Add --yes to skip the confirmation.
-python3 gflib_build.py --reset
-```
-
-```sh
-# Rebuild ONE family (e.g. after fixing a config) — --only restricts the WHOLE pipeline
-# (mirror/cohorts/build) to just that family, --rebuild ignores its prior state, --yes skips
-# the wizard. (The Failures tab's detail overlay shows this exact command for each failure.)
-python3 gflib_build.py --only ofl/dmsans --rebuild --yes
-```
-
-The **build-fonts task reports its outcome**, not just "processed": its detail shows
-`N built, M failed`, and it turns ❌ (not ✅) if every build failed — so the task-list never
-looks like a success when nothing built. (The archive task counts unreachable repos
-separately as `unreachable`, distinct from build failures.)
-
-## Detached builds, monitoring & persistence
-
-- **Run autonomously, watch later — by default.** A fresh interactive (curses) build
-  detaches automatically: it runs in a background daemon and opens a live monitor. **Quit the
-  monitor with `q` and the build keeps running.** **Just re-run the program** to reattach
-  (it detects the running daemon and skips the wizard), from this terminal or any other — or
-  use `--attach --build-dir <dir>` explicitly. Stop it with `--stop --build-dir <dir>`
-  (graceful). `--detach` forces this for non-curses UIs too. The daemon writes `status.json`
-  every ~1 s (atomic rename), which the monitor (and any external tool) reads.
-- **Persisted settings.** Your wizard/CLI choices are saved to
-  `<data-dir>/gflib-build.config` and pre-fill the next run (CLI flags still override;
-  `--no-save-config` to skip, `--config` for a custom path).
-- **Full logs for troubleshooting.** Every family gets a complete `logs/<slug>.log` — a
-  timestamped pipeline narrative (mirror → extract → venv → config → build) **plus the full
-  `gftools.builder` output** of every backend attempt — kept whether it succeeds or fails.
-- **Everything is timed.** Each operation (mirror/extract/venv/config/build/collect/compare)
-  and each phase is measured into `timings.json`, printed as a summary at the end, and shown
-  live in the **stats** view (`4`) — to find and shrink bottlenecks over time.
-
-## Outputs, state & resumability
-
-Under `--build-dir`:
-
-```
-state.json            resumable per-family status (built/failed/…) + durations
-status.json           live full snapshot (read by the monitor / external tools)
-timings.json          per-phase + per-operation timing (bottleneck analysis)
-out/<slug>/           built fonts (omit with --discard-fonts)
-logs/<slug>.log       complete per-family log: pipeline narrative + gftools output
-events.jsonl          append-only event stream (started/built/failed/venv)
-daemon.pid, daemon.log   present when run with --detach
-venvs/<cohort>/       shared cohort virtualenvs (with --manage-venvs)
-pip-cache/            shared pip download cache
-work/<slug>/          throwaway extraction (deleted after each build)
-```
-
-Re-running resumes: already-built families are skipped; `--retry-failed` re-attempts
-failures; `--rebuild` starts over.
-
-## Roadmap
-
-- [x] Archive-safe pristine extraction; separate build dir; never touch/delete archives.
-- [x] Live TUI (A–E) + headless mode; resumable state.
-- [x] Parallel worker pool + longest-first scheduling.
-- [x] Rust-first backend selection (`fontc`) with Python (`fontmake`) fallback + per-family backend record.
-- [x] Dependency cohorts sharing venvs.
-- [x] Modular, optional frontends (curses / plain / json / none) + state.json/events.jsonl for external/web UIs.
-- [x] Partial runs via `--percent` (evenly-spaced sample).
-- [x] Two worklist sources: `--source metadata` (google/fonts) and `--source archive` (the mirrors directly).
-- [x] Zero-to-built bootstrap: auto-clone google/fonts + populate the archive, behind a setup wizard (`--yes` to skip); default paths under `--data-dir`.
-- [x] End-to-end ncurses task-list (clone gf → build fontc → discover → archive → cohorts → build) with emoji status, per-task %/elapsed, a live archive-population list, and ←/→ tab navigation.
-- [x] Editable ncurses setup wizard (cursor, conditional fields, ±5 stepping, fontc/cargo/archive auto-detect); persisted to a config file.
-- [x] Detach-by-default + auto-attach: `q` frees the shell with the build still running; re-running reattaches live (any terminal) without the wizard; `--attach`/`--stop` explicit; `--detach` for non-curses UIs.
-- [x] Comprehensive per-family logs + per-operation/per-phase timing (`timings.json`, stats view).
-- [x] Migration tracking: per-family backend record + `--backend both` comparison; `migration.json` (fontc / fontmake-fallback blockers / both-identical-or-differ) + stats view + end summary.
-- [ ] Feed results back to the gfonts_agents dashboard (`reproducible_build` + provenance levels).
-- [ ] Track toward an **all-Rust** build with no Python orchestration in the loop.
-
----
-
-*This tool and README were assisted by an AI agent (Claude Opus 4.8) under the
-guidance of @felipesanches.*
+*This tool and its documentation were assisted by an AI agent (Claude Opus 4.8) under the guidance of
+[@felipesanches](https://github.com/felipesanches).*
