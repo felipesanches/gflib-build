@@ -1870,7 +1870,7 @@ impl Orchestrator {
         // the lock — it has its own cache mutex, no central-lock dependency.
         let deb_tools = crate::deb::deb_tools_cached();
         // per-package deb-build status from packaging/build-results.json (read once, before the lock)
-        let deb_results: std::collections::HashMap<String, String> = std::fs::read_to_string(
+        let deb_results: std::collections::HashMap<String, (String, String)> = std::fs::read_to_string(
             self.cfg.build_dir.join("packaging").join("build-results.json"),
         )
         .ok()
@@ -1881,8 +1881,12 @@ impl Orchestrator {
                 .map(|(slug, res)| {
                     let built = res.get("built").and_then(|b| b.as_bool()).unwrap_or(false);
                     let validated = res.get("validated").and_then(|b| b.as_bool()).unwrap_or(false);
-                    let st = if validated { "validated" } else if built { "built" } else { "failed" };
-                    (slug.clone(), st.to_string())
+                    let lint = res.get("lint").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    // "lint-clean" = validated AND lintian ran with no errors/warnings (a strict step above plain "validated")
+                    let st = if validated {
+                        if lint == "clean" { "lint-clean" } else { "validated" }
+                    } else if built { "built" } else { "failed" };
+                    (slug.clone(), (st.to_string(), lint))
                 })
                 .collect()
         })
@@ -1935,7 +1939,8 @@ impl Orchestrator {
                     builder_version: r.builder_version.clone(),
                     python_version: r.python_version.clone(),
                     packaged: drafted.contains(&r.slug.replace('/', "__")),
-                    deb_status: deb_results.get(&r.slug).cloned().unwrap_or_default(),
+                    deb_status: deb_results.get(&r.slug).map(|p| p.0.clone()).unwrap_or_default(),
+                    deb_lint: deb_results.get(&r.slug).map(|p| p.1.clone()).unwrap_or_default(),
                     crater: self.crater_by_slug.get(&r.slug).map(|s| s.token()).unwrap_or_default(),
                 });
             }

@@ -131,7 +131,8 @@ pub struct BuiltItem {
     #[serde(default)] pub builder_version: String,
     #[serde(default)] pub python_version: String, // M0: the Python that built it (multi-Python ladder)
     #[serde(default)] pub packaged: bool, // a debian/ packaging tree has been drafted on disk
-    #[serde(default)] pub deb_status: String, // "" | built | validated | failed (from build-results.json)
+    #[serde(default)] pub deb_status: String, // "" | built | validated | lint-clean | failed (from build-results.json)
+    #[serde(default)] pub deb_lint: String, // lintian outcome: "clean" | "N warnings" | "N errors, M warnings" | "not run (lintian absent)" | ""
     #[serde(default)] pub crater: String, // fontc_crater's verdict token (see crater::CraterStatus::token)
 }
 

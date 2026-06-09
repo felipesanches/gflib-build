@@ -375,9 +375,17 @@ function builtRow(b){const comp=b.compiler_version||b.backend||'';
  const segs=[[L(b.slug,32)+' ','g'],[L(comp,24)+' ','c'],[Rp(human(b.bytes),9)+'  '+L(b.compare||'',8),'gr']];
  if(b.crater)segs.push([' '+craterLabel(b.crater),craterCol(b.crater),CRATER_TIP]); // magenta here = we built what fontc can't
  return {segs,rt:b.slug,det:['built',b.slug]}}
-function packagingRow(b){const comp=b.compiler_version||b.backend||'';const ds=b.deb_status||'';
- let st,sc; if(ds=='validated'){st='validated';sc='g'}else if(ds=='built'){st='built';sc='c'}else if(ds=='failed'){st='deb-failed';sc='r'}else if(b.packaged){st='drafted';sc='y'}else{st='draftable';sc='gr'}
- return {segs:[[L(st,10)+' ',sc],[L(b.slug,32)+' ','gr'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9),'gr']],rt:b.slug,det:['package',b.slug]}}
+// dpkg-deb validation: the control metadata parses (--info) AND the archive really contains a .ttf/.otf (--contents)
+const DEB_VTIP='dpkg-deb checks: --info parses the control metadata and --contents lists a .ttf/.otf — the .deb is well-formed and actually contains fonts.';
+function debStatus(b){const ds=b.deb_status||'',lint=b.deb_lint||'';
+ if(ds=='lint-clean')return ['lint-clean','g b','Validated AND lintian clean. '+DEB_VTIP+' On top of that, lintian found no errors or warnings.'];
+ if(ds=='validated')return ['validated','g',DEB_VTIP+(lint?' lintian: '+lint+'.':' (lintian did not run)')];
+ if(ds=='built')return ['built','c','The .deb was produced, but it did NOT pass validation: the control failed to parse or the archive has no .ttf/.otf.'];
+ if(ds=='failed')return ['deb-failed','r','dpkg-deb failed to build the .deb for this family.'];
+ if(b.packaged)return ['drafted','y','A debian/ packaging tree is drafted on disk; the .deb has not been built yet.'];
+ return ['draftable','gr','Built family, ready to draft a debian/ tree (no debian/ on disk yet).'];}
+function packagingRow(b){const comp=b.compiler_version||b.backend||'';const s=debStatus(b);
+ return {segs:[[L(s[0],10)+' ',s[1],s[2]],[L(b.slug,32)+' ','gr'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9),'gr']],rt:b.slug,det:['package',b.slug]}}
 function toolRow(t){const rust=t.lang=='rust';
  return {segs:[[L(t.lang,7)+' ',rust?'g':'y'],[L(t.name,24)+' ','w'],[L(t.kind,12)+' ','c'],[Rp(t.families,4)+' families  ','gr'],[(t.packaged?'packaged':'unpackaged'),'gr']],det:['tool',t.name]}}
 function debToolRow(t){const ok=!!t.present;

@@ -885,7 +885,8 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
             // dview "built" so ENTER opens the existing built detail overlay unchanged).
             let rows = snap.packages.iter().map(|b| {
                 let (status, scol) = match b.deb_status.as_str() {
-                    "validated" => ("validated", Color::Green),
+                    "lint-clean" => ("✓ lint-clean", Color::Green), // validated + lintian clean (strict step above validated)
+                    "validated" => ("validated", Color::DarkGreen),
                     "built" => ("built", Color::Cyan),
                     "failed" => ("deb-failed", Color::Red),
                     _ if b.packaged => ("drafted", Color::Yellow),
@@ -893,7 +894,7 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                 };
                 let comp = if !b.compiler_version.is_empty() { b.compiler_version.clone() } else { b.backend.clone() };
                 vec![
-                    (format!("{:<10} ", status), scol),
+                    (format!("{:<12} ", status), scol),
                     (format!("{:<32} ", head(&b.slug, 32)), Color::Grey),
                     (format!("{:<26} ", head(&comp, 26)), Color::Cyan),
                     (format!("{:>9}", human(b.bytes)), Color::Grey),
@@ -905,7 +906,7 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                     dview: "", rows: dt_rows, keys: snap.deb_tools.iter().map(|t| t.name.clone()).collect(),
                 },
                 SectionR {
-                    title: "Packaging — per-family status  (draftable → drafted → built → validated · ENTER = debian/ metadata)".into(),
+                    title: "Packaging — per-family status  (draftable → drafted → built → validated → lint-clean · ENTER = debian/ metadata)".into(),
                     dview: "package", rows, keys: snap.packages.iter().map(|b| b.slug.clone()).collect(),
                 },
             ]
