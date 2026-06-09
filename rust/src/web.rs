@@ -247,6 +247,9 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(26ch,1fr));gap:0 8px;padding:2px 8px}
  .pin{background:var(--pinbg);border:1px solid var(--line);border-radius:6px;padding:4px 0;margin:6px 0}
  .pin .sec{background:none;border:none;color:var(--y);margin:2px 0}
+ /* flow the now-building rows into as many columns as fit, so every in-flight family is shown without a cap */
+ .bgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(64ch,1fr));gap:0 18px;align-items:start}
+ .bgrid .ln{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
  .cfg td{padding:1px 10px 1px 8px;white-space:pre}
  /* charts (hand-rolled, dependency-free: CSS-div bars + inline-SVG donuts/rings) */
  .chartrow{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0}
@@ -581,14 +584,14 @@ function render(){
  }
  // ---- pinned now-building (every tab) ----
  const bl=snap.building||[];let pin='';
- if(bl.length&&!pre){const cap=Math.min(bl.length,5);
+ if(bl.length&&!pre){
   // Break down by STAGE: only the compile stage can be paused/frozen; venv-install ("installing deps")
   // + checkout can't — which is why pausing/lowering jobs doesn't visibly freeze families still installing.
   const tot=bl.length,comp=Math.min(snap.running_builds||0,tot),fz=Math.min(snap.frozen_builds||0,comp),oth=Math.max(0,tot-comp);
   const ps=[];if(comp>fz)ps.push((comp-fz)+' compiling');if(fz>0)ps.push(fz+' frozen');if(oth>0)ps.push(oth+' installing/setup');
   const lbl=ps.length>1?(tot+' — '+ps.join(', ')):(''+tot);
-  pin='<div class="pin"><div class="sec">▶ Now building ('+lbl+')</div>'+bl.slice(0,cap).map(b=>R(buildingRow(b))).join('')+
-   (bl.length>cap?'<div class="ln muted">  … (+'+(bl.length-cap)+' more)</div>':'')+'</div>';}
+  // show ALL in-flight families (no '+N more' cap) — flow them into columns so the pinned block stays compact
+  pin='<div class="pin"><div class="sec">▶ Now building ('+lbl+')</div><div class="bgrid">'+bl.map(b=>R(buildingRow(b))).join('')+'</div></div>';}
  document.getElementById('pin').innerHTML=pin;
  // ---- body per tab: charts (web-only) first, then the same content as the TUI ----
  let body=charts(tab);

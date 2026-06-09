@@ -1282,7 +1282,6 @@ fn render_tabbar_body(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16
     let body_top = 6u16;
     let mut row = body_top;
     if !snap.building.is_empty() && !ui.detail && sep_row.saturating_sub(row) >= 3 {
-        let cap = snap.building.len().min(5).min((sep_row - row) as usize - 2).max(1);
         // Break the count down by STAGE: only the compile stage (run_builder) can be paused/frozen; the
         // venv-install ("installing deps") + checkout stages can't, which is why pausing/lowering jobs
         // doesn't visibly freeze families still installing dependencies.
@@ -1304,25 +1303,33 @@ fn render_tabbar_body(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16
         }
         put(scr, row, 0, &hdr, Color::Yellow, w);
         row += 1;
-        for b in snap.building.iter().take(cap) {
-            let note = if !b.note.is_empty() { &b.note } else { &b.backend };
-            // An install (pip) over the lowered job limit / a pause can't be SIGSTOP-frozen mid-stream — it
-            // WILL start frozen the moment it reaches the compile step, so flag it as draining toward that.
-            let over_limit = snap.paused || snap.building.len().saturating_sub(snap.frozen_builds) > snap.jobs;
+        // Show ALL in-flight families in COLUMNS (no '+N more' cap) so the pinned block stays compact.
+        // State is by COLOUR + a short tag: blue FRZ = SIGSTOP-frozen compile; magenta INS→ = an install
+        // over the limit, draining toward a freeze; yellow = actively building. (Per-row detail in the web UI.)
+        let over_limit = snap.paused || total.saturating_sub(snap.frozen_builds) > snap.jobs;
+        let colw: usize = 34;
+        let cols = ((w as usize) / colw).max(1);
+        let avail = sep_row.saturating_sub(row) as usize; // rows before the status panel
+        let rows_needed = total.div_ceil(cols);
+        let rows_used = rows_needed.min(avail.saturating_sub(1).max(1)); // keep a trailing blank
+        let shown = (rows_used * cols).min(total);
+        for (i, b) in snap.building.iter().take(shown).enumerate() {
+            let cr = row + (i / cols) as u16;
+            let cx = ((i % cols) * colw) as u16;
             let pending = !b.frozen && b.note == "installing deps" && over_limit;
-            // frozen (SIGSTOP'd compile) = blue [FROZEN]; install-about-to-freeze = magenta; active = yellow.
-            let (color, slugcell, tail) = if b.frozen {
-                (Color::Blue, format!("[FROZEN] {:<25}", head(&b.slug, 25)), note.to_string())
+            let (color, tag) = if b.frozen {
+                (Color::Blue, "FRZ ")
             } else if pending {
-                (Color::Magenta, format!("{:<26}", head(&b.slug, 26)), "[finishing install before freezing]".to_string())
+                (Color::Magenta, "INS\u{2192}") // installing — will freeze on reaching compile
             } else {
-                (Color::Yellow, format!("{:<34}", head(&b.slug, 34)), note.to_string())
+                (Color::Yellow, "    ")
             };
-            put(scr, row, 1, &format!("w{:>2} {} {:>8}  {}", b.worker, slugcell, hms(b.dur), tail), color, w);
-            row += 1;
+            let slugw = colw.saturating_sub(12); // tag(4) + slug + ' ' + dur(6) + gap
+            put(scr, cr, cx + 1, &format!("{}{:<sw$} {:>6}", tag, head(&b.slug, slugw), hms(b.dur), sw = slugw), color, w);
         }
-        if snap.building.len() > cap {
-            put(scr, row, 1, &format!("  … (+{} more)", snap.building.len() - cap), Color::DarkGrey, w);
+        row += rows_used as u16;
+        if shown < total {
+            put(scr, row, 1, &format!("  … (+{} more — enlarge the terminal to see all)", total - shown), Color::DarkGrey, w);
             row += 1;
         }
         row += 1;
