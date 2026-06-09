@@ -630,7 +630,8 @@ function barHTML(){const c=snap.counts||{},ph=snap.phase;
  const hint=(c.skipped||0)?'<span class="skip">'+(c.skipped||0)+' skipped (not selected — raise % to 100 to build them)</span>':'';
  // each segment carries its own count + share-of-total label (hidden by overflow when the segment is too narrow)
  const seg=(w,cl,n,lbl)=>'<div class="seg '+cl+'" style="width:'+w+'%">'+(n>0?'<span class="sl">'+n+' '+lbl+' ('+Math.round(w)+'%)</span>':'')+'</div>';
- return '<div class="phase"> Phase: '+E(phaseLabel(ph))+'   built '+(c.built||0)+'  failed '+(c.failed||0)+'  building '+(c.building||0)+'  queued '+(c.queued||0)+err+hint+'</div>'+
+ // the built/failed/building/queued counts now live in the per-segment bar labels + the top-right 'attempted'
+ return '<div class="phase"> Phase: '+E(phaseLabel(ph))+err+hint+'</div>'+
   '<div class="barwrap">'+seg(gw,'bg',c.built||0,'built')+seg(rw,'rg',c.failed||0,'failed')+seg(dw,'dg',rem,'left')+'</div>';
 }
 function phaseLabel(ph){return {init:'starting…',clone_gf:'cloning google/fonts',build_fontc:'building fontc from source',discover:'discovering worklist',archive:'populating archive (mirroring repos)',cohorts:'scanning dependency cohorts',build:'building',done:'done'}[ph]||ph||''}
