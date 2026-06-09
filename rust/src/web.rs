@@ -225,7 +225,8 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  .right{float:right}
  /* segmented progress bar */
  .barwrap{position:relative;height:18px;background:var(--line);border-radius:4px;overflow:hidden;margin:6px 0;display:flex}
- .seg{height:100%}.seg.bg{background:#22c55e}.seg.rg{background:#ef4444}.seg.dg{background:#334155}.seg.cg{background:#06b6d4}
+ .seg{height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden}.seg.bg{background:#22c55e}.seg.rg{background:#ef4444}.seg.dg{background:#334155}.seg.cg{background:#06b6d4}
+ .sl{font-size:10px;font-weight:600;color:#fff;text-shadow:0 0 3px #000;white-space:nowrap;padding:0 4px}.seg.dg .sl{color:#cbd5e1}
  .barlbl{position:absolute;left:0;right:0;top:0;line-height:18px;text-align:center;color:#fff;font-weight:600;font-size:11px;text-shadow:0 0 3px #000}
  .phase{margin:4px 0 0}
  .skip{color:var(--y);float:right}
@@ -297,6 +298,9 @@ let snap={}, tab='overview';
 const TABS=['config','overview','queue','cohorts','archive','built','packaging','tools','failures','stats','fontspector','crater'];
 // colour a fontc_crater verdict token (magenta = fontc can't build it — the gold pairing on our built rows)
 function craterCol(tok){if(!tok)return 'muted';if(tok=='fontc-fail'||tok=='both-fail'||tok=='src-miss')return 'm';if(tok=='fmake-fail')return 'muted';if(tok[0]=='~')return 'y';return 'c'}
+// readable label for the fontc_crater verdict (was the cryptic "cr:<token>")
+function craterLabel(t){return {'fontc-fail':'fontc fails','fmake-fail':'fontmake fails','both-fail':'both fail','src-miss':'no source','match':'fontc ok'}[t]||('fontc '+t)}
+const CRATER_TIP='fontc_crater: how the Rust compiler (fontc) builds this family vs fontmake';
 // Migration-milestone glossary (keep in sync with tui.rs MILESTONES + docs/migration-milestones.md)
 const MILESTONES=[['M0','Measurement foundation — record compiler + exact version for every build attempt'],['M1','Full buildability — 100% of buildable families produce the expected fonts (any backend)'],['M2','fontc-gap map — every buildable family attempted with fontc, the result recorded'],['M3','fontc equivalence — fontc output equivalent to fontmake/shipped, at scale'],['M4','fontc majority — families that build correctly with fontc alone (no fontmake fallback)'],['M5','Python-free pipeline — Rust-native gftools-builder3, no Python pre-build or deps'],['M6','latest-fontc currency — the M4/M5 set re-validated on the latest fontc'],['M7','100% Rust — the whole library: latest fontc, equivalent output, zero Python']];
 // fontspector status → colour class (FAIL/FATAL/ERROR red · WARN yellow · PASS green · SKIP/INFO grey)
@@ -341,8 +345,11 @@ function R(row){
  let cls='ln',oc='';
  if(row.fc!=null){cls='ln clk';oc=' onclick="setFsCause(\''+E(row.fc)+'\')"';}
  else if(row.det){DET.push(row.det);cls='ln clk';oc=' onclick="openDetailIdx('+(DET.length-1)+')"';}
- let h='<div class="'+cls+'"'+oc+'>'+row.segs.map(s=>'<span class="'+s[1]+'">'+E(s[0])+'</span>').join('');
+ const sp=s=>'<span class="'+s[1]+'"'+(s[2]?' title="'+E(s[2])+'"':'')+'>'+E(s[0])+'</span>';
+ // the retry button sits right after the FIRST seg (the family slug), not at the end of the row
+ let h='<div class="'+cls+'"'+oc+'>'+(row.segs[0]?sp(row.segs[0]):'');
  if(row.rt) h+='<button class="rb" onclick="event.stopPropagation();ctl({retry:[\''+E(row.rt)+'\']})" title="retry this family">↻ retry</button>';
+ h+=row.segs.slice(1).map(sp).join('');
  return h+'</div>';
 }
 function secHdr(title,n){return '<div class="sec">'+E(title)+' ('+n+')</div>'}
@@ -352,8 +359,8 @@ function renderSec(s){return secHdr(s.title,s.rows.length)+(s.rows.length?s.rows
 function taskRow(t){const m=TASK_MARK[t.status]||'?',cl=TASK_CLS[t.status]||'gr';
  const prog=t.total?(t.done+'/'+t.total):'',el=t.elapsed?hms(t.elapsed):'';
  return {segs:[[m+' '+L(t.name,26)+' '+L(prog,11)+Rp(el,8)+'  '+(t.detail||''),cl]],det:['task',t.key]}}
-function failRow(f){const segs=[[L(f.slug,34)+' ','r']];if(f.rebuild_note)segs.push(['⟳ ','y']);if(f.crater)segs.push(['[cr:'+L(f.crater,10)+'] ',craterCol(f.crater)]);segs.push([f.error||'','dr']);return {segs,rt:f.slug,det:['failed',f.slug]}}
-function qRow(q){const kc={retry:'y',rebuild:'c'}[q.kind]||'g';const segs=[['  '+L(q.kind,8)+' ',kc],[L(q.slug||'',38)+' ','gr']];if(q.crater)segs.push(['cr:'+q.crater,craterCol(q.crater)]);return {segs,rt:q.slug,det:['queue',q.slug]}}
+function failRow(f){const segs=[[L(f.slug,34)+' ','r']];if(f.rebuild_note)segs.push(['⟳ ','y']);if(f.crater)segs.push(['['+craterLabel(f.crater)+'] ',craterCol(f.crater),CRATER_TIP]);segs.push([f.error||'','dr']);return {segs,rt:f.slug,det:['failed',f.slug]}}
+function qRow(q){const kc={retry:'y',rebuild:'c'}[q.kind]||'g';const segs=[['  '+L(q.kind,8)+' ',kc],[L(q.slug||'',38)+' ','gr']];if(q.crater)segs.push([craterLabel(q.crater),craterCol(q.crater),CRATER_TIP]);return {segs,rt:q.slug,det:['queue',q.slug]}}
 // cohort member colour by build status: built=green, failed=red, building=yellow, else grey
 function famCls(st){return {built:'g',failed:'r',building:'y'}[st]||'muted'}
 function cohortRow(c){const segs=[[c.cached?'● ':'○ ',c.cached?'g':'muted'],[Rp(c.count,4)+'  '+L(c.key,14)+' ',!c.cached?'muted':(c.key=='base'?'w':'c')]];
@@ -361,7 +368,7 @@ function cohortRow(c){const segs=[[c.cached?'● ':'○ ',c.cached?'g':'muted'],
  return {segs,det:['cohort',c.key]}}
 function builtRow(b){const comp=b.compiler_version||b.backend||'';
  const segs=[[L(b.slug,32)+' ','g'],[L(comp,24)+' ','c'],[Rp(human(b.bytes),9)+'  '+L(b.compare||'',8),'gr']];
- if(b.crater)segs.push([' cr:'+b.crater,craterCol(b.crater)]); // magenta here = we built what fontc can't
+ if(b.crater)segs.push([' '+craterLabel(b.crater),craterCol(b.crater),CRATER_TIP]); // magenta here = we built what fontc can't
  return {segs,rt:b.slug,det:['built',b.slug]}}
 function packagingRow(b){const comp=b.compiler_version||b.backend||'';const ds=b.deb_status||'';
  let st,sc; if(ds=='validated'){st='validated';sc='g'}else if(ds=='built'){st='built';sc='c'}else if(ds=='failed'){st='deb-failed';sc='r'}else if(b.packaged){st='drafted';sc='y'}else{st='draftable';sc='gr'}
@@ -388,7 +395,7 @@ function buildingRow(b){const note=b.note||b.backend||'';
 
 function sections(t){
  if(t=='overview')return [{title:'Pipeline',rows:(snap.tasks||[]).map(taskRow)},{title:'Recent failures',rows:filterList(snap.failures_recent,['slug','error']).map(failRow)}];
- if(t=='queue')return [{title:'Queued — priority order (variable + larger families first)',rows:filterList(snap.queued_list,['slug','kind']).map(qRow)}];
+ if(t=='queue')return [{title:'Queued — priority order (re-queued families first, then longest previous build first)',rows:filterList(snap.queued_list,['slug','kind']).map(qRow)}];
  if(t=='cohorts')return [{title:'Dependency cohorts  (● = venv cached on disk, reused next run)',rows:filterList(snap.cohorts,['key']).map(cohortRow)}];
  if(t=='built')return [{title:'Built — successes  (slug · compiler+version · size · vs-shipped)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(builtRow)}];
  if(t=='packaging')return [{title:'Deb toolchain  (install any ✗ to enable deb building/validation — auto-detected, recovers in ~5s)',rows:(snap.deb_tools||[]).map(debToolRow)},{title:'Packaging — per-family status  (drafted = debian/ on disk · draftable = built, ready to draft)',rows:filterList(snap.packages,['slug','compiler_version','backend']).map(packagingRow)}];
@@ -546,7 +553,7 @@ function render(){
  const pre=snap.pre_build;
  DET=[]; // reset the click-to-detail index map for this frame
  // ---- header (rows 0/1) ----
- let hdr='<div class="t"> Google Fonts library build'+(snap.paused?(snap.running_builds>0?' [PAUSED · '+snap.running_builds+' build(s) frozen]':' [PAUSED]'):'')+
+ let hdr='<div class="t"> Google Fonts library build'+(snap.paused?(snap.running_builds>0?' [PAUSED · '+snap.running_builds+(snap.running_builds==1?' build':' builds')+' frozen]':' [PAUSED]'):'')+
    (pre?'<span class="right muted">first-time setup</span>':'<span class="right w">elapsed '+hms(snap.elapsed)+'</span>')+'</div>';
  if(pre){hdr+='<div class="sub"> configure your build below, then navigate to ▶ Start build</div>';}
  else{
@@ -555,15 +562,17 @@ function render(){
     :('disk used '+human(bld+arc)+' (build '+human(bld)+' + archive '+human(arc)+')');
   // when builds are frozen by a lowered job limit (not a global pause), call it out next to jobs
   const jobFrozen=(!snap.paused&&(snap.frozen_builds||0)>0)?' <span class="m">('+snap.frozen_builds+' frozen → draining to limit)</span>':'';
+  // overall worklist progress, parked at the top-right under the elapsed clock (per-segment bars carry the breakdown)
+  const att=(c.built||0)+(c.failed||0),insc=Math.max(1,att+(c.queued||0)+(c.building||0));
+  const attLbl=(att>0||(c.queued||0)>0||(c.building||0)>0)?'<span class="right w">'+att+'/'+insc+' attempted ('+Math.floor(100*att/insc)+'%)</span>':'';
   hdr+='<div class="sub"> '+disk+'  free '+human(snap.disk_free)+'  jobs '+(snap.jobs||0)+jobFrozen+'  cohorts '+((snap.cohorts||[]).length)+
-    '  fontc '+((snap.backends||{}).fontc||0)+'/fontmake '+((snap.backends||{}).fontmake||0)+'</div>';
+    '  fontc '+((snap.backends||{}).fontc||0)+'/fontmake '+((snap.backends||{}).fontmake||0)+attLbl+'</div>';
  }
  document.getElementById('hdr').innerHTML=hdr;
  // ---- progress bar (rows 2/3) ----
  document.getElementById('bar').innerHTML=pre?'':barHTML();
  // ---- tabs (row 4) ----
- document.getElementById('tabs').innerHTML=TABS.map(t=>'<span class="tab'+(t==tab?' on':'')+'" onclick="setTab(\''+t+'\')">'+t+'</span>').join('')+
-   '<span class="tabhint">click a tab to switch · polling every 1.5s</span>';
+ document.getElementById('tabs').innerHTML=TABS.map(t=>'<span class="tab'+(t==tab?' on':'')+'" onclick="setTab(\''+t+'\')">'+t+'</span>').join('');
  // ---- controls + W4 toolbar (filter on list tabs, export everywhere). Don't rebuild the bar while
  //      the user is typing in the filter (the 1.5s poll would otherwise steal focus) ----
  const fEl=document.getElementById('filter');
@@ -572,15 +581,15 @@ function render(){
   const opt=(ms,lbl)=>'<option value="'+ms+'"'+(POLL_MS==ms?' selected':'')+'>'+lbl+'</option>';
   const notifyBtn=(window.Notification&&Notification.permission!='granted')?' <button class="tbtn" onclick="askNotify()" title="notify when the build completes">🔔 notify</button>':'';
   document.getElementById('ctl').innerHTML=
-    '<button title="pause scheduling AND freeze (SIGSTOP) running builds to free CPU/RAM" onclick="ctl({paused:true})"'+(snap.paused?' disabled':'')+'>pause (freeze)</button> '+
-    '<button title="thaw (SIGCONT) frozen builds and resume scheduling" onclick="ctl({paused:false})"'+(snap.paused?'':' disabled')+'>resume (thaw)</button>'+
+    '<button title="pause scheduling AND freeze (SIGSTOP) running builds to free CPU/RAM" onclick="ctl({paused:true})"'+(snap.paused?' disabled':'')+'>pause</button> '+
+    '<button title="thaw (SIGCONT) frozen builds and resume scheduling" onclick="ctl({paused:false})"'+(snap.paused?'':' disabled')+'>resume</button>'+
     ' <button class="tbtn" title="force-rebuild ALL config-fixed families now (failed families with a gflib-build override). Editing an override already auto-rebuilds it within seconds; this button forces the whole set immediately, even unchanged ones." onclick="if(confirm(\'Force-rebuild all failed families that have a gflib-build config override (the config-fixed set)?\'))ctl({retry_overrides:true})">↻ rebuild config-fixed</button>'+
     (listTab?' <input id="filter" placeholder="filter… (slug / cause)" oninput="setFilter(this.value)" value="'+E(FILTER)+'">':'')+
     ' <button class="tbtn" onclick="exportJSON()">⬇ JSON</button> <button class="tbtn" onclick="exportCSV()">⬇ CSV (built+failed)</button>'+
     ' <button class="tbtn" onclick="poll()" title="refresh now">↻</button>'+
     ' <select class="w5" onchange="setPoll(this.value)" title="auto-refresh interval">'+opt(1000,'1s')+opt(1500,'1.5s')+opt(3000,'3s')+opt(5000,'5s')+opt(0,'paused')+'</select>'+
     ' <button class="tbtn" onclick="toggleTheme()" title="light / dark">◐</button>'+notifyBtn+
-    '<span class="muted"> &nbsp; hover a row for ↻ retry · click a row for details</span>';
+    '<span class="muted"> &nbsp; click a row for details</span>';
  }
  // ---- pinned now-building (every tab) ----
  const bl=snap.building||[];let pin='';
@@ -616,13 +625,13 @@ function barHTML(){const c=snap.counts||{},ph=snap.phase;
  }
  // building: segmented bar over the IN-SCOPE worklist (excludes skipped)
  const inscope=Math.max(1,(c.built||0)+(c.failed||0)+(c.queued||0)+(c.building||0)),done=(c.built||0)+(c.failed||0);
- const pct=Math.floor(100*done/inscope);
  const gw=100*(c.built||0)/inscope,rw=100*(c.failed||0)/inscope,dw=Math.max(0,100-gw-rw);
- const skip=(c.skipped||0)?(' · '+(c.skipped||0)+' skipped'):'';
+ const rem=Math.max(0,inscope-done); // queued + building (the dark remainder)
  const hint=(c.skipped||0)?'<span class="skip">'+(c.skipped||0)+' skipped (not selected — raise % to 100 to build them)</span>':'';
+ // each segment carries its own count + share-of-total label (hidden by overflow when the segment is too narrow)
+ const seg=(w,cl,n,lbl)=>'<div class="seg '+cl+'" style="width:'+w+'%">'+(n>0?'<span class="sl">'+n+' '+lbl+' ('+Math.round(w)+'%)</span>':'')+'</div>';
  return '<div class="phase"> Phase: '+E(phaseLabel(ph))+'   built '+(c.built||0)+'  failed '+(c.failed||0)+'  building '+(c.building||0)+'  queued '+(c.queued||0)+err+hint+'</div>'+
-  '<div class="barwrap"><div class="seg bg" style="width:'+gw+'%"></div><div class="seg rg" style="width:'+rw+'%"></div><div class="seg dg" style="width:'+dw+'%"></div>'+
-  '<div class="barlbl">'+done+'/'+inscope+' attempted ('+pct+'%)'+skip+'</div></div>';
+  '<div class="barwrap">'+seg(gw,'bg',c.built||0,'built')+seg(rw,'rg',c.failed||0,'failed')+seg(dw,'dg',rem,'left')+'</div>';
 }
 function phaseLabel(ph){return {init:'starting…',clone_gf:'cloning google/fonts',build_fontc:'building fontc from source',discover:'discovering worklist',archive:'populating archive (mirroring repos)',cohorts:'scanning dependency cohorts',build:'building',done:'done'}[ph]||ph||''}
 

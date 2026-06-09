@@ -834,7 +834,7 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                 segs
             }).collect();
             vec![SectionR {
-                title: "Queued — priority order (variable + larger families first)".into(),
+                title: "Queued — priority order (re-queued families first, then longest previous build first)".into(),
                 dview: "queue", rows, keys: snap.queued_list.iter().map(|q| q.slug.clone()).collect(),
             }]
         }
@@ -1155,7 +1155,7 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
     let pause_tag = if !snap.paused {
         String::new()
     } else if snap.running_builds > 0 {
-        format!(" [PAUSED · {} build(s) frozen]", snap.running_builds)
+        format!(" [PAUSED · {} {} frozen]", snap.running_builds, if snap.running_builds == 1 { "build" } else { "builds" })
     } else {
         " [PAUSED]".to_string()
     };
