@@ -1306,14 +1306,19 @@ fn render_tabbar_body(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16
         row += 1;
         for b in snap.building.iter().take(cap) {
             let note = if !b.note.is_empty() { &b.note } else { &b.backend };
-            // frozen builds (job limit lowered) are SIGSTOP-paused — dim them + mark [FROZEN] so it's clear
-            // they aren't actively compiling, just waiting their turn.
-            let (color, slugcell) = if b.frozen {
-                (Color::Blue, format!("[FROZEN] {:<25}", head(&b.slug, 25)))
+            // An install (pip) over the lowered job limit / a pause can't be SIGSTOP-frozen mid-stream — it
+            // WILL start frozen the moment it reaches the compile step, so flag it as draining toward that.
+            let over_limit = snap.paused || snap.building.len().saturating_sub(snap.frozen_builds) > snap.jobs;
+            let pending = !b.frozen && b.note == "installing deps" && over_limit;
+            // frozen (SIGSTOP'd compile) = blue [FROZEN]; install-about-to-freeze = magenta; active = yellow.
+            let (color, slugcell, tail) = if b.frozen {
+                (Color::Blue, format!("[FROZEN] {:<25}", head(&b.slug, 25)), note.to_string())
+            } else if pending {
+                (Color::Magenta, format!("{:<26}", head(&b.slug, 26)), "[finishing install before freezing]".to_string())
             } else {
-                (Color::Yellow, format!("{:<34}", head(&b.slug, 34)))
+                (Color::Yellow, format!("{:<34}", head(&b.slug, 34)), note.to_string())
             };
-            put(scr, row, 1, &format!("w{:>2} {} {:>8}  {}", b.worker, slugcell, hms(b.dur), note), color, w);
+            put(scr, row, 1, &format!("w{:>2} {} {:>8}  {}", b.worker, slugcell, hms(b.dur), tail), color, w);
             row += 1;
         }
         if snap.building.len() > cap {

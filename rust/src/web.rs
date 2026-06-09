@@ -374,8 +374,13 @@ function histRow(h){return {segs:[[L(h.cause,20)+' ','y'],[h.slug||'','gr']],rt:
 function phaseRow(kv){return {segs:[[L(kv[0],12)+' '+hms(kv[1]),'gr']]}}
 function opRow(kv){const s=kv[1];return {segs:[[L(kv[0],10)+' total '+Rp((s.total||0).toFixed(1),9)+'  n '+Rp(s.count||0,5)+'  mean '+Rp((s.mean||0).toFixed(2),7)+'  max '+Rp((s.max||0).toFixed(1),7),'c']]}}
 function buildingRow(b){const note=b.note||b.backend||'';
- // frozen builds (job limit lowered) are SIGSTOP-paused → mark [FROZEN] and dim/recolor (cyan) so it's clear they aren't actively compiling
+ // frozen builds (job limit lowered) are SIGSTOP-paused → [FROZEN] in cyan so it's clear they aren't actively compiling
  if(b.frozen)return {segs:[['w'+Rp(b.worker,2)+' [FROZEN] '+L(b.slug,26)+' '+Rp(hms(b.dur),8)+'  '+note,'c']],det:['building',b.slug]};
+ // an install (pip) over the lowered job limit / pause can't be frozen mid-stream — it WILL start frozen the
+ // moment it reaches the compile step, so flag it (magenta) as draining toward that.
+ const overLimit=snap.paused||(((snap.building||[]).length-(snap.frozen_builds||0))>(snap.jobs||1));
+ if(note==='installing deps'&&overLimit)
+  return {segs:[['w'+Rp(b.worker,2)+' '+L(b.slug,30)+' '+Rp(hms(b.dur),8)+'  [finishing install before freezing]','m']],det:['building',b.slug]};
  return {segs:[['w'+Rp(b.worker,2)+' '+L(b.slug,34)+' '+Rp(hms(b.dur),8)+'  '+note,'y']],det:['building',b.slug]}}
 
 function sections(t){
