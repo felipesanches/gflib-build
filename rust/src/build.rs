@@ -1922,9 +1922,16 @@ impl Orchestrator {
                     let built = res.get("built").and_then(|b| b.as_bool()).unwrap_or(false);
                     let validated = res.get("validated").and_then(|b| b.as_bool()).unwrap_or(false);
                     let lint = res.get("lint").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    // "lint-clean" = validated AND lintian ran with no errors/warnings (a strict step above plain "validated")
+                    // once lintian has run, the lintian verdict supersedes "validated":
+                    //   errors   -> lintian-fail    (a regression — dpkg-deb ok, but lintian found errors)
+                    //   warnings -> lint-warn        (passed lintian, no errors, but with warnings)
+                    //   clean    -> lint-clean       (passed lintian with nothing at all)
+                    //   not run  -> validated        (dpkg-deb ok; lintian hasn't run yet)
                     let st = if validated {
-                        if lint == "clean" { "lint-clean" } else { "validated" }
+                        if lint.contains("error") { "lintian-fail" }
+                        else if lint == "clean" { "lint-clean" }
+                        else if lint.contains("warning") { "lint-warn" }
+                        else { "validated" }
                     } else if built { "built" } else { "failed" };
                     (slug.clone(), (st.to_string(), lint))
                 })

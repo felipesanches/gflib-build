@@ -885,11 +885,13 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
             // dview "built" so ENTER opens the existing built detail overlay unchanged).
             let rows = snap.packages.iter().map(|b| {
                 let (status, scol) = match b.deb_status.as_str() {
-                    "lint-clean" => ("✓ lint-clean", Color::Green), // validated + lintian clean (strict step above validated)
-                    "validated" => ("validated", Color::DarkGreen),
+                    "lint-clean" => ("✓ lint-clean", Color::Green), // validated + lintian clean (strictest)
+                    "lint-warn" => ("lint-warn", Color::Yellow),    // validated + lintian warnings, no errors
+                    "lintian-fail" => ("lintian-fail", Color::Red), // validated by dpkg-deb but lintian errors
+                    "validated" => ("validated", Color::DarkGreen), // dpkg-deb ok; lintian not run yet
                     "built" => ("built", Color::Cyan),
-                    "failed" => ("deb-failed", Color::Red),
-                    _ if b.packaged => ("drafted", Color::Yellow),
+                    "failed" => ("deb-failed", Color::DarkRed),
+                    _ if b.packaged => ("drafted", Color::DarkYellow),
                     _ => ("draftable", Color::Grey),
                 };
                 let comp = if !b.compiler_version.is_empty() { b.compiler_version.clone() } else { b.backend.clone() };
@@ -906,7 +908,7 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                     dview: "", rows: dt_rows, keys: snap.deb_tools.iter().map(|t| t.name.clone()).collect(),
                 },
                 SectionR {
-                    title: "Packaging — per-family status  (draftable → drafted → built → validated → lint-clean · ENTER = debian/ metadata)".into(),
+                    title: "Packaging — per-family status  (draftable → drafted → built → validated → lintian: clean / warn / fail · ENTER = debian/ metadata)".into(),
                     dview: "package", rows, keys: snap.packages.iter().map(|b| b.slug.clone()).collect(),
                 },
             ]
