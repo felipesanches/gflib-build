@@ -403,6 +403,7 @@ pub struct ControlSet {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_all: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_overrides: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub repackage_all: Option<bool>, // rebuild every .deb from existing fonts (apply packaging fixes + re-lint)
     #[serde(default, skip_serializing_if = "Option::is_none")] pub build_debs: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub restart: Option<bool>, // re-exec the daemon (apply startup-only settings)
 }

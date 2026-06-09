@@ -1543,6 +1543,18 @@ impl Orchestrator {
                 }
                 log.push(format!("retry {} override-fixed families", n));
             }
+            if set.repackage_all == Some(true) {
+                // Clear the de-dup set so the package worker rebuilds every .deb from the existing fonts
+                // (no font rebuild) — applying packaging fixes (copyright/changelog) and re-linting each.
+                // Ensure build_debs is on, else the worker would idle instead of packaging.
+                let n = sh.packaged.len();
+                sh.packaged.clear();
+                if !sh.build_debs {
+                    sh.build_debs = true;
+                    persist_build_debs = Some(true);
+                }
+                log.push(format!("repackage all — cleared {} packaged markers; the worker will rebuild every .deb", n));
+            }
             for l in &log {
                 sh.control_log.push(l.clone());
             }

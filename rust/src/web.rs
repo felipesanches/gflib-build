@@ -264,7 +264,6 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  .sl{font-size:10px;font-weight:600;color:#fff;text-shadow:0 0 3px #000;white-space:nowrap;padding:0 4px}.seg.dg .sl{color:#cbd5e1}
  .barlbl{position:absolute;left:0;right:0;top:0;line-height:18px;text-align:center;color:#fff;font-weight:600;font-size:11px;text-shadow:0 0 3px #000}
  .pkgbar{height:12px;margin:0 0 6px}.pkgbar .sl{font-size:9px}
- .pkgcap{font-size:10px;margin:1px 0}
  .phase{margin:4px 0 0}
  .skip{color:var(--y);float:right}
  /* tabs */
@@ -897,11 +896,13 @@ function packagingQueue(){
  const pct=lt?Math.floor(100*ld/lt):0,gw=lt?100*ld/lt:0;
  const lintAvail=(snap.deb_tools||[]).some(t=>t.name=='lintian'&&t.present);
  const act=now?('▶ '+E(now)):(snap.paused?'paused (the global pause also halts packaging/linting)':'idle — nothing to package or lint');
+ const repkg='<button class="tbtn" title="rebuild EVERY .deb from the existing built fonts (no font rebuild) — applies packaging fixes (copyright/changelog) and re-lints each" onclick="if(confirm(\'Rebuild all .deb packages from the existing built fonts? This applies packaging fixes and re-lints every package — it can take a while.\'))ctl({repackage_all:true})">↻ repackage all</button>';
  return '<div class="chart"><div class="ctitle">packaging queue</div>'+
   '<div class="'+(now?'y':'muted')+'" style="margin:2px 0 5px">'+act+'</div>'+
   '<div class="barwrap" style="height:14px"><div class="seg" style="width:'+gw+'%;background:#22c55e"></div><div class="seg" style="width:'+(100-gw)+'%;background:#334155"></div><div class="barlbl">lintian '+ld+' / '+lt+' ('+pct+'%)</div></div>'+
   '<div class="legend"><span title="built families whose .deb is not built yet">to package: '+pp+'</span><span title="packages with a .deb that lintian has not run on yet">to lint: '+lp+'</span>'+
-   (lintAvail?'':'<span class="r" title="install lintian via the deb toolchain panel to drain the lint queue">⚠ lintian not installed — lint queue stalled</span>')+'</div></div>';
+   (lintAvail?'':'<span class="r" title="install lintian via the deb toolchain panel to drain the lint queue">⚠ lintian not installed — lint queue stalled</span>')+'</div>'+
+  '<div style="margin-top:6px">'+repkg+'</div></div>';
 }
 // lintian findings grouped by tag (the packaging analogue of the build "Failures by cause" view)
 function lintcatRow(c){const isE=c.severity=='E';
@@ -933,9 +934,9 @@ function packagingBar(gw){
  const pk=snap.packages||[];if(!pk.length||gw<=0)return '';
  const cnt=pkgCounts(),total=pk.length;
  const inner=PKG_STATES.filter(s=>cnt[s[0]]).map(s=>{const n=cnt[s[0]],w=100*n/total,pct=Math.round(w);
-  return '<div class="seg" style="width:'+w+'%;background:'+s[1]+'" title="'+E(s[0]+': '+n+' ('+pct+'% of built) — '+s[2])+'">'+(n>0?'<span class="sl">'+n+'</span>':'')+'</div>';}).join('');
- return '<div class="pkgcap muted">deb packaging — '+total+' built families (each stage distinguished; aligned under ‘built’)</div>'+
-  '<div class="barwrap pkgbar" style="width:'+gw+'%" title="packaging status of the '+total+' built families">'+inner+'</div>';
+  // each portion is labelled with its stage name + count (clipped by overflow when the segment is too narrow)
+  return '<div class="seg" style="width:'+w+'%;background:'+s[1]+'" title="'+E(s[0]+': '+n+' ('+pct+'% of built) — '+s[2])+'"><span class="sl">'+E(s[0])+' '+n+'</span></div>';}).join('');
+ return '<div class="barwrap pkgbar" style="width:'+gw+'%" title="packaging status of the '+total+' built families">'+inner+'</div>';
 }
 
 function charts(t){
