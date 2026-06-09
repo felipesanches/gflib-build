@@ -243,6 +243,7 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  .ln:hover .rb{visibility:visible}
  /* sections + rows */
  .sec{background:var(--secbg);border-left:3px solid var(--line);color:var(--w);font-weight:600;padding:3px 8px;margin:10px 0 2px;border-radius:0 4px 4px 0}
+ .sec small{font-weight:400;color:var(--c);font-size:11px}
  .ln{white-space:pre;padding:1px 8px;border-radius:3px}
  .ln:hover{background:var(--hover)}
  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(26ch,1fr));gap:0 8px;padding:2px 8px}
@@ -352,7 +353,11 @@ function R(row){
  h+=row.segs.slice(1).map(sp).join('');
  return h+'</div>';
 }
-function secHdr(title,n){return '<div class="sec">'+E(title)+' ('+n+')</div>'}
+// header format: "[n] Title <small>(trailing hint)</small>" — count up front, any trailing
+// parenthetical rendered small/muted (titles whose paren isn't trailing stay inline)
+function secHdr(title,n){const i=title.lastIndexOf(' (');
+ const body=(i>=0&&title.endsWith(')'))?E(title.slice(0,i).trimEnd())+' <small>'+E(title.slice(i+1))+'</small>':E(title);
+ return '<div class="sec">['+n+'] '+body+'</div>'}
 function renderSec(s){return secHdr(s.title,s.rows.length)+(s.rows.length?s.rows.map(R).join(''):'<div class="ln muted">(none)</div>')}
 
 // --- per-row builders (formats + colours match the TUI exactly; det = click-to-detail) ---
@@ -396,7 +401,7 @@ function buildingRow(b){const note=b.note||b.backend||'';
 function sections(t){
  if(t=='overview')return [{title:'Pipeline',rows:(snap.tasks||[]).map(taskRow)},{title:'Recent failures',rows:filterList(snap.failures_recent,['slug','error']).map(failRow)}];
  if(t=='queue')return [{title:'Queued — priority order (re-queued families first, then longest previous build first)',rows:filterList(snap.queued_list,['slug','kind']).map(qRow)}];
- if(t=='cohorts')return [{title:'Dependency cohorts  (● = venv cached on disk, reused next run)',rows:filterList(snap.cohorts,['key']).map(cohortRow)}];
+ if(t=='cohorts')return [{title:'Dependency cohorts  (● = venv cached on disk)',rows:filterList(snap.cohorts,['key']).map(cohortRow)}];
  if(t=='built')return [{title:'Built — successes  (slug · compiler+version · size · vs-shipped)',rows:filterList(snap.built_recent,['slug','compiler_version','backend']).map(builtRow)}];
  if(t=='packaging')return [{title:'Deb toolchain  (install any ✗ to enable deb building/validation — auto-detected, recovers in ~5s)',rows:(snap.deb_tools||[]).map(debToolRow)},{title:'Packaging — per-family status  (drafted = debian/ on disk · draftable = built, ready to draft)',rows:filterList(snap.packages,['slug','compiler_version','backend']).map(packagingRow)}];
  if(t=='tools')return [{title:'Build-tool packages  (python = M5 blocker · rust = native · click = which families need it)',rows:filterList(snap.tool_packages,['name','lang','kind']).map(toolRow)},{title:'Migration milestones (M0–M7) — what the rungs mean',rows:MILESTONES.map(m=>({segs:[[L(m[0],4),'c'],[m[1],'gr']]}))}];

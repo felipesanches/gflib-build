@@ -841,7 +841,7 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
         "cohorts" => {
             let rows = snap.cohorts.iter().map(cohort_segments).collect();
             vec![SectionR {
-                title: "Dependency cohorts  (● = venv cached on disk, reused next run)".into(),
+                title: "Dependency cohorts  (● = venv cached on disk)".into(),
                 dview: "cohorts", rows, keys: snap.cohorts.iter().map(|c| c.key.clone()).collect(),
             }]
         }
@@ -1119,7 +1119,7 @@ fn draw_sections(scr: &mut Screen, secs: &[SectionR], top: u16, avail: u16, w: u
             break;
         }
         let foc = si == focus;
-        let mut hdr = format!(" {}{} ({}) ", if foc { "▼ " } else { "▷ " }, sec.title, sec.rows.len());
+        let mut hdr = format!(" {}[{}] {} ", if foc { "▼ " } else { "▷ " }, sec.rows.len(), sec.title);
         while hdr.chars().count() < (w as usize).saturating_sub(1) {
             hdr.push('-');
         }
