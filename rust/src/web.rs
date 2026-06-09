@@ -525,7 +525,7 @@ function cfgCell(f,cf){
 }
 function cfgView(){const cf=snap.config||{};
  let h='<div class="sec">Configuration</div>';
- h+='<div class="ln muted">Editable controls apply live. Greyed settings are fixed at startup — change them via CLI flags (or the terminal config tab), then restart to apply.</div>';
+ h+='<div class="ln muted">Editable controls apply live; greyed ones are set by CLI flags at launch.</div>';
  h+='<div class="ln"><button class="tbtn" onclick="if(confirm(\'Restart the daemon now? In-flight builds are interrupted and resume from saved state.\'))ctl({restart:true})">↻ Restart daemon</button></div>';
  GROUPS.forEach(g=>{
   const fs=SCHEMA.filter(f=>g.k.includes(f.k)&&showIf(f.k,cf));
