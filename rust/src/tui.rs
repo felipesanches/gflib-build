@@ -911,15 +911,21 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
             } else {
                 ("idle — nothing to package or lint".into(), Color::Grey)
             };
-            let pct = if snap.lint_total > 0 { 100 * snap.lint_done / snap.lint_total } else { 0 };
-            let prog = format!(
-                "lintian {}/{} ({}%)   ·   to package: {}   ·   to lint: {}{}",
-                snap.lint_done, snap.lint_total, pct, snap.pkg_pending, snap.lint_pending,
+            // stage 1: packaging (build the .deb); stage 2: lintian — one line each, packaging above lint
+            let built = snap.counts.built;
+            let packaged = built.saturating_sub(snap.pkg_pending);
+            let ppct = if built > 0 { 100 * packaged / built } else { 0 };
+            let lpct = if snap.lint_total > 0 { 100 * snap.lint_done / snap.lint_total } else { 0 };
+            let pkg_row = format!("packaging  {}/{} ({}%)   ·   to package: {}", packaged, built, ppct, snap.pkg_pending);
+            let lint_row = format!(
+                "lintian    {}/{} ({}%)   ·   to lint: {}{}",
+                snap.lint_done, snap.lint_total, lpct, snap.lint_pending,
                 if lint_avail { "" } else { "   ·   lintian NOT installed — lint queue stalled" }
             );
             let q_rows: Vec<Vec<(String, Color)>> = vec![
                 vec![(format!("  {}", act), acol)],
-                vec![(format!("  {}", prog), if lint_avail { Color::Cyan } else { Color::Red })],
+                vec![(format!("  {}", pkg_row), Color::Cyan)],
+                vec![(format!("  {}", lint_row), if lint_avail { Color::Green } else { Color::Red })],
             ];
             let mut secs = vec![
                 SectionR { title: "Packaging queue".into(), dview: "", rows: q_rows, keys: vec![] },

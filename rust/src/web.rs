@@ -894,12 +894,16 @@ function packagingView(){
 function packagingQueue(){
  const now=snap.pkg_now||'',lt=snap.lint_total||0,ld=snap.lint_done||0,lp=snap.lint_pending||0,pp=snap.pkg_pending||0;
  const pct=lt?Math.floor(100*ld/lt):0,gw=lt?100*ld/lt:0;
+ // packaging stage: every built family is a .deb candidate; packaged = built families minus the backlog
+ const bt=(snap.counts&&snap.counts.built)||0,pd=Math.max(0,bt-pp),ppct=bt?Math.floor(100*pd/bt):0,pgw=bt?100*pd/bt:0;
  const lintAvail=(snap.deb_tools||[]).some(t=>t.name=='lintian'&&t.present);
  const act=now?('▶ '+E(now)):(snap.paused?'paused (the global pause also halts packaging/linting)':'idle — nothing to package or lint');
  const repkg='<button class="tbtn" title="rebuild EVERY .deb from the existing built fonts (no font rebuild) — applies packaging fixes (copyright/changelog) and re-lints each" onclick="if(confirm(\'Rebuild all .deb packages from the existing built fonts? This applies packaging fixes and re-lints every package — it can take a while.\'))ctl({repackage_all:true})">↻ repackage all</button>';
+ const bar=(w,col,lbl)=>'<div class="barwrap" style="height:14px"><div class="seg" style="width:'+w+'%;background:'+col+'"></div><div class="seg" style="width:'+(100-w)+'%;background:#334155"></div><div class="barlbl">'+lbl+'</div></div>';
  return '<div class="chart"><div class="ctitle">packaging queue</div>'+
   '<div class="'+(now?'y':'muted')+'" style="margin:2px 0 5px">'+act+'</div>'+
-  '<div class="barwrap" style="height:14px"><div class="seg" style="width:'+gw+'%;background:#22c55e"></div><div class="seg" style="width:'+(100-gw)+'%;background:#334155"></div><div class="barlbl">lintian '+ld+' / '+lt+' ('+pct+'%)</div></div>'+
+  bar(pgw,'#06b6d4','packaged '+pd+' / '+bt+' ('+ppct+'%)')+   // stage 1: build the .deb
+  bar(gw,'#22c55e','lintian '+ld+' / '+lt+' ('+pct+'%)')+      // stage 2: lint the .deb
   '<div class="legend"><span title="built families whose .deb is not built yet">to package: '+pp+'</span><span title="packages with a .deb that lintian has not run on yet">to lint: '+lp+'</span>'+
    (lintAvail?'':'<span class="r" title="install lintian via the deb toolchain panel to drain the lint queue">⚠ lintian not installed — lint queue stalled</span>')+'</div>'+
   '<div style="margin-top:6px">'+repkg+'</div></div>';
