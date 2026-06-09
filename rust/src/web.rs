@@ -373,7 +373,10 @@ function failcatRow(c){const sel=fsCause==c.cat;
 function histRow(h){return {segs:[[L(h.cause,20)+' ','y'],[h.slug||'','gr']],rt:h.slug,det:['history',h.slug]}}
 function phaseRow(kv){return {segs:[[L(kv[0],12)+' '+hms(kv[1]),'gr']]}}
 function opRow(kv){const s=kv[1];return {segs:[[L(kv[0],10)+' total '+Rp((s.total||0).toFixed(1),9)+'  n '+Rp(s.count||0,5)+'  mean '+Rp((s.mean||0).toFixed(2),7)+'  max '+Rp((s.max||0).toFixed(1),7),'c']]}}
-function buildingRow(b){const note=b.note||b.backend||'';return {segs:[['w'+Rp(b.worker,2)+' '+L(b.slug,34)+' '+Rp(hms(b.dur),8)+'  '+note,'y']],det:['building',b.slug]}}
+function buildingRow(b){const note=b.note||b.backend||'';
+ // frozen builds (job limit lowered) are SIGSTOP-paused → mark [FROZEN] and dim/recolor (cyan) so it's clear they aren't actively compiling
+ if(b.frozen)return {segs:[['w'+Rp(b.worker,2)+' [FROZEN] '+L(b.slug,26)+' '+Rp(hms(b.dur),8)+'  '+note,'c']],det:['building',b.slug]};
+ return {segs:[['w'+Rp(b.worker,2)+' '+L(b.slug,34)+' '+Rp(hms(b.dur),8)+'  '+note,'y']],det:['building',b.slug]}}
 
 function sections(t){
  if(t=='overview')return [{title:'Pipeline',rows:(snap.tasks||[]).map(taskRow)},{title:'Recent failures',rows:filterList(snap.failures_recent,['slug','error']).map(failRow)}];

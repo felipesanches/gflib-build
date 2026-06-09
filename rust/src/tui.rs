@@ -1297,7 +1297,14 @@ fn render_tabbar_body(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16
         row += 1;
         for b in snap.building.iter().take(cap) {
             let note = if !b.note.is_empty() { &b.note } else { &b.backend };
-            put(scr, row, 1, &format!("w{:>2} {:<34} {:>8}  {}", b.worker, head(&b.slug, 34), hms(b.dur), note), Color::Yellow, w);
+            // frozen builds (job limit lowered) are SIGSTOP-paused — dim them + mark [FROZEN] so it's clear
+            // they aren't actively compiling, just waiting their turn.
+            let (color, slugcell) = if b.frozen {
+                (Color::Blue, format!("[FROZEN] {:<25}", head(&b.slug, 25)))
+            } else {
+                (Color::Yellow, format!("{:<34}", head(&b.slug, 34)))
+            };
+            put(scr, row, 1, &format!("w{:>2} {} {:>8}  {}", b.worker, slugcell, hms(b.dur), note), color, w);
             row += 1;
         }
         if snap.building.len() > cap {

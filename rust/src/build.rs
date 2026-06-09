@@ -99,6 +99,7 @@ pub struct Shared {
 struct RunEntry {
     pgid: i32,
     frozen: bool,
+    slug: String, // so the UI can mark WHICH in-flight builds are frozen
 }
 
 /// The registry of in-flight builder children, with per-build freeze state. Replaces the old
@@ -110,8 +111,12 @@ pub struct RunReg {
 }
 
 impl RunReg {
-    fn insert(&mut self, pgid: i32, frozen: bool) {
-        self.entries.push(RunEntry { pgid, frozen });
+    fn insert(&mut self, pgid: i32, frozen: bool, slug: String) {
+        self.entries.push(RunEntry { pgid, frozen, slug });
+    }
+    /// Slugs of the currently SIGSTOP-frozen in-flight builds (job limit lowered / paused).
+    fn frozen_slugs(&self) -> std::collections::HashSet<String> {
+        self.entries.iter().filter(|e| e.frozen).map(|e| e.slug.clone()).collect()
     }
     fn remove(&mut self, pgid: i32) {
         self.entries.retain(|e| e.pgid != pgid);
@@ -886,7 +891,7 @@ impl Orchestrator {
         let t0 = now();
         if let Err(e) = run_builder(python, &cfg_path, work, log_path, self.cfg.timeout, backend,
                                     self.cfg.fontc_bin.as_deref(), self.cfg.builder3_bin.as_deref(),
-                                    &self.running, &self.frozen, &self.job_limit) {
+                                    &fam.slug, &self.running, &self.frozen, &self.job_limit) {
             return (false, format!("{}: {}", backend, e), BTreeMap::new(), 0);
         }
         let (bytes, found, extras) = collect_outputs(work, dest, &fam.shipped_fonts, t0);
@@ -1179,6 +1184,7 @@ impl Orchestrator {
                 backend,
                 self.cfg.fontc_bin.as_deref(),
                 self.cfg.builder3_bin.as_deref(),
+                slug,
                 &self.running,
                 &self.frozen,
                 &self.job_limit,
@@ -1886,6 +1892,7 @@ impl Orchestrator {
         let mut backends = Backends::default();
         let mut migration: BTreeMap<String, usize> = BTreeMap::new();
         let mut python_versions: BTreeMap<String, usize> = BTreeMap::new(); // built families by interpreter
+        let frozen_slugs = self.running.lock().unwrap().frozen_slugs(); // which in-flight builds are SIGSTOP-frozen
         let mut building = Vec::new();
         let mut queued_list = Vec::new();
         let mut fails = Vec::new();
@@ -1939,6 +1946,7 @@ impl Orchestrator {
                     dur: now() - r.started,
                     backend: r.backend.clone(),
                     note: r.note.clone(),
+                    frozen: frozen_slugs.contains(&r.slug),
                 });
             }
             if r.status == "queued" {
@@ -2491,6 +2499,7 @@ fn run_builder(
     backend: &str,
     fontc_bin: Option<&str>,
     builder3_bin: Option<&str>,
+    slug: &str,
     running: &Mutex<RunReg>,
     frozen: &AtomicBool,
     job_limit: &AtomicUsize,
@@ -2584,7 +2593,7 @@ fn run_builder(
         // landed). The regulator thaws it later when a slot frees.
         let start_frozen = frozen.load(Ordering::Relaxed)
             || g.unfrozen() >= job_limit.load(Ordering::Relaxed);
-        g.insert(pgid, start_frozen);
+        g.insert(pgid, start_frozen, slug.to_string());
         if start_frozen {
             signal_group(pgid, SIGSTOP);
         }
@@ -2884,7 +2893,7 @@ mod jobs_freeze_tests {
     fn reg(items: &[(i32, bool)]) -> RunReg {
         let mut r = RunReg::default();
         for &(p, f) in items {
-            r.insert(p, f);
+            r.insert(p, f, format!("ofl/t{}", p));
         }
         r
     }

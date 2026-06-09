@@ -94,6 +94,7 @@ pub struct BuildingItem {
     #[serde(default)] pub dur: f64,
     #[serde(default)] pub backend: String,
     #[serde(default)] pub note: String,
+    #[serde(default)] pub frozen: bool, // SIGSTOP-frozen by a lowered job limit / pause (UI marks it)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
