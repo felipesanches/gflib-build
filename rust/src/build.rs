@@ -1692,7 +1692,12 @@ impl Orchestrator {
             let slug = match pick {
                 Some(s) => s,
                 None => {
-                    thread::sleep(Duration::from_millis(500));
+                    // No fresh family to package. Retroactively lint one already-built .deb whose lintian
+                    // step never ran — so installing lintian after the fact still covers the whole backlog
+                    // of already-"validated" packages. Sleep only when there's nothing left to lint.
+                    if !self.relint_one(&pkg_root, &mut results) {
+                        thread::sleep(Duration::from_millis(500));
+                    }
                     continue;
                 }
             };
@@ -1763,6 +1768,41 @@ impl Orchestrator {
                 write_deb_results(&pkg_root, &results);
             }
         }
+    }
+
+    /// Retroactively lint ONE already-built .deb whose lintian step never ran (lint missing or
+    /// "not run (lintian absent)"). No rebuild — runs lintian on the existing .deb and records the
+    /// result, so a backlog of "validated" packages becomes "lint-clean"/warnings once lintian is
+    /// installed. Returns true if it processed one (so the worker keeps going without sleeping).
+    fn relint_one(&self, pkg_root: &Path, results: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+        if !crate::deb::on_path("lintian") {
+            return false; // lintian not installed yet — nothing to do (the toolchain panel flags it)
+        }
+        // a result needs linting if it built a .deb but has no real lintian verdict yet
+        let pick = results.iter().find_map(|(slug, r)| {
+            if !r.get("built").and_then(|b| b.as_bool()).unwrap_or(false) {
+                return None;
+            }
+            let lint = r.get("lint").and_then(|v| v.as_str()).unwrap_or("");
+            if !(lint.is_empty() || lint == "not run (lintian absent)") {
+                return None; // already has a clean/warnings/errors verdict (or a terminal failure)
+            }
+            let pkg = r.get("package").and_then(|v| v.as_str())?;
+            let ver = r.get("version").and_then(|v| v.as_str())?;
+            Some((slug.clone(), pkg.to_string(), ver.to_string()))
+        });
+        let (slug, pkg, ver) = match pick {
+            Some(x) => x,
+            None => return false,
+        };
+        let pool = pkg_root.join("pool");
+        // None => the .deb is gone (or lintian wouldn't spawn); mark terminal so we don't spin on it forever
+        let verdict = crate::deb::relint_deb(&pool, &pkg, &ver).unwrap_or_else(|| "no .deb on disk".into());
+        if let Some(obj) = results.get_mut(&slug).and_then(|v| v.as_object_mut()) {
+            obj.insert("lint".into(), serde_json::json!(verdict));
+        }
+        write_deb_results(pkg_root, results);
+        true
     }
 
     pub fn request_stop(&self) {

@@ -704,26 +704,9 @@ fn build_one_deb(
     // the full lintian output is saved next to the .deb so the UI can show the report on demand
     let report_path = pool.join(format!("{}_{}.lintian.txt", pkg, version));
     res.lint = if lint {
-        match std::process::Command::new("lintian").arg(&deb_path).output() {
-            Ok(o) => {
-                let txt = String::from_utf8_lossy(&o.stdout);
-                let body = if txt.trim().is_empty() {
-                    "# lintian: no findings — clean.\n".to_string()
-                } else {
-                    txt.to_string()
-                };
-                let _ = std::fs::write(&report_path, body.as_bytes());
-                let e = txt.lines().filter(|l| l.starts_with("E:")).count();
-                let w = txt.lines().filter(|l| l.starts_with("W:")).count();
-                if e > 0 {
-                    format!("{} errors, {} warnings", e, w)
-                } else if w > 0 {
-                    format!("{} warnings", w)
-                } else {
-                    "clean".into()
-                }
-            }
-            Err(_) => {
+        match run_lintian(&deb_path, &report_path) {
+            Some(s) => s,
+            None => {
                 let _ = std::fs::remove_file(&report_path);
                 "lintian failed to run".into()
             }
@@ -797,6 +780,40 @@ pub fn package_metadata(build_dir: &Path, slug: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Run lintian on `deb`, save the full report to `report_path`, and return the summary string
+/// ("clean" | "N warnings" | "N errors, M warnings"). None if lintian could not be spawned.
+fn run_lintian(deb: &Path, report_path: &Path) -> Option<String> {
+    let o = std::process::Command::new("lintian").arg(deb).output().ok()?;
+    let txt = String::from_utf8_lossy(&o.stdout);
+    let body = if txt.trim().is_empty() {
+        "# lintian: no findings — clean.\n".to_string()
+    } else {
+        txt.to_string()
+    };
+    let _ = std::fs::write(report_path, body.as_bytes());
+    let e = txt.lines().filter(|l| l.starts_with("E:")).count();
+    let w = txt.lines().filter(|l| l.starts_with("W:")).count();
+    Some(if e > 0 {
+        format!("{} errors, {} warnings", e, w)
+    } else if w > 0 {
+        format!("{} warnings", w)
+    } else {
+        "clean".into()
+    })
+}
+
+/// Retroactively lint an already-built .deb (no rebuild): runs lintian on `pool/<pkg>_<ver>_all.deb`,
+/// saves the report, and returns the summary. None if the .deb is missing or lintian can't be spawned.
+/// Lets a freshly-installed lintian cover the whole backlog of already-validated packages.
+pub fn relint_deb(pool: &Path, pkg: &str, version: &str) -> Option<String> {
+    let deb = pool.join(format!("{}_{}_all.deb", pkg, version));
+    if !deb.is_file() {
+        return None;
+    }
+    let report_path = pool.join(format!("{}_{}.lintian.txt", pkg, version));
+    run_lintian(&deb, &report_path)
 }
 
 /// Public: the built .deb path for a slug (for download), or None if not built.
