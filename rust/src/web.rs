@@ -565,13 +565,10 @@ function render(){
   const bld=snap.disk_build_total||0,arc=snap.disk_archive_total||0;
   const disk=snap.disk_archive_nested?('disk used '+human(bld)+' (build + nested archive, all included)')
     :('disk used '+human(bld+arc)+' (build '+human(bld)+' + archive '+human(arc)+')');
-  // when builds are frozen by a lowered job limit (not a global pause), call it out next to jobs
-  const jobFrozen=(!snap.paused&&(snap.frozen_builds||0)>0)?' <span class="m">('+snap.frozen_builds+' frozen → draining to limit)</span>':'';
   // overall worklist progress, parked at the top-right under the elapsed clock (per-segment bars carry the breakdown)
   const att=(c.built||0)+(c.failed||0),insc=Math.max(1,att+(c.queued||0)+(c.building||0));
   const attLbl=(att>0||(c.queued||0)>0||(c.building||0)>0)?'<span class="right w">'+att+'/'+insc+' attempted ('+Math.floor(100*att/insc)+'%)</span>':'';
-  hdr+='<div class="sub"> '+disk+'  free '+human(snap.disk_free)+'  jobs '+(snap.jobs||0)+jobFrozen+'  cohorts '+((snap.cohorts||[]).length)+
-    '  fontc '+((snap.backends||{}).fontc||0)+'/fontmake '+((snap.backends||{}).fontmake||0)+attLbl+'</div>';
+  hdr+='<div class="sub"> '+disk+'  free '+human(snap.disk_free)+attLbl+'</div>';
  }
  document.getElementById('hdr').innerHTML=hdr;
  // ---- progress bar (rows 2/3) ----
