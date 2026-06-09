@@ -701,10 +701,18 @@ fn build_one_deb(
         .unwrap_or(false);
     res.validated = info_ok && has_font;
 
+    // the full lintian output is saved next to the .deb so the UI can show the report on demand
+    let report_path = pool.join(format!("{}_{}.lintian.txt", pkg, version));
     res.lint = if lint {
         match std::process::Command::new("lintian").arg(&deb_path).output() {
             Ok(o) => {
                 let txt = String::from_utf8_lossy(&o.stdout);
+                let body = if txt.trim().is_empty() {
+                    "# lintian: no findings — clean.\n".to_string()
+                } else {
+                    txt.to_string()
+                };
+                let _ = std::fs::write(&report_path, body.as_bytes());
                 let e = txt.lines().filter(|l| l.starts_with("E:")).count();
                 let w = txt.lines().filter(|l| l.starts_with("W:")).count();
                 if e > 0 {
@@ -715,9 +723,13 @@ fn build_one_deb(
                     "clean".into()
                 }
             }
-            Err(_) => "lintian failed to run".into(),
+            Err(_) => {
+                let _ = std::fs::remove_file(&report_path);
+                "lintian failed to run".into()
+            }
         }
     } else {
+        let _ = std::fs::remove_file(&report_path); // stale report from a prior run where lintian was present
         "not run (lintian absent)".into()
     };
 
@@ -767,6 +779,9 @@ pub fn package_metadata(build_dir: &Path, slug: &str) -> String {
              the daemon then auto-packages built families)\n\n",
         ),
     }
+    out.push_str("══ lintian report ══\n");
+    out.push_str(&lintian_report(build_dir, slug));
+    out.push('\n');
     let dpath = pkg_root.join(slug.replace('/', "__")).join("debian");
     for f in ["control", "gflib-provenance", "changelog", "copyright", "rules", "watch"] {
         out.push_str(&format!("══ source debian/{} ══\n", f));
@@ -782,6 +797,29 @@ pub fn package_metadata(build_dir: &Path, slug: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Public: the built .deb path for a slug (for download), or None if not built.
+pub fn deb_file(build_dir: &Path, slug: &str) -> Option<PathBuf> {
+    find_built_deb(&build_dir.join("packaging"), slug)
+}
+
+/// Public: the saved lintian report for a slug, or a friendly placeholder if none is on file.
+pub fn lintian_report(build_dir: &Path, slug: &str) -> String {
+    let pkg_root = build_dir.join("packaging");
+    let found = (|| {
+        let txt = std::fs::read_to_string(pkg_root.join("build-results.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+        let r = v.get("results")?.get(slug)?;
+        let pkg = r.get("package")?.as_str()?;
+        let ver = r.get("version")?.as_str()?;
+        std::fs::read_to_string(pkg_root.join("pool").join(format!("{}_{}.lintian.txt", pkg, ver))).ok()
+    })();
+    found.unwrap_or_else(|| {
+        "(no lintian report on file — lintian may not have run for this package, or it predates report \
+         capture. Enable 'lintian' in the toolchain and rebuild the .deb to generate one.)\n"
+            .into()
+    })
 }
 
 /// Locate the built .deb in pool/ for a slug, via packaging/build-results.json (package + version).

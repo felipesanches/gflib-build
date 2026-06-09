@@ -86,6 +86,26 @@ fn handle(mut stream: TcpStream, source: Arc<dyn Source>) -> std::io::Result<()>
             let body = read_debian_files(&source.build_dir(), &slug);
             respond(&mut stream, 200, "text/plain; charset=utf-8", body.as_bytes())
         }
+        ("GET", p) if p.starts_with("/api/lintian") => {
+            // the saved lintian report for a package: /api/lintian?slug=ofl/foo
+            let slug = query_param(p, "slug").unwrap_or_default();
+            let body = crate::deb::lintian_report(&source.build_dir(), &slug);
+            respond(&mut stream, 200, "text/plain; charset=utf-8", body.as_bytes())
+        }
+        // "/api/deb?" (the trailing '?' disambiguates from "/api/debian"): download the built .deb
+        ("GET", p) if p.starts_with("/api/deb?") => {
+            let slug = query_param(p, "slug").unwrap_or_default();
+            match crate::deb::deb_file(&source.build_dir(), &slug) {
+                Some(path) => {
+                    let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "package.deb".into());
+                    match std::fs::read(&path) {
+                        Ok(bytes) => respond_download(&mut stream, "application/vnd.debian.binary-package", &fname, &bytes),
+                        Err(_) => respond(&mut stream, 404, "text/plain", b"deb not readable"),
+                    }
+                }
+                None => respond(&mut stream, 404, "text/plain", b"deb not built for this family"),
+            }
+        }
         ("POST", "/api/control") => {
             // body may be partially read already; gather the rest up to content_len
             let body = read_body(&req, &mut stream, content_len);
@@ -190,6 +210,21 @@ fn read_log_tail(build_dir: &std::path::Path, slug: &str, n: usize) -> String {
     }
 }
 
+/// Like `respond`, but with a Content-Disposition so the browser downloads the body as a file.
+fn respond_download(stream: &mut TcpStream, ctype: &str, filename: &str, body: &[u8]) -> std::io::Result<()> {
+    // strip any quote/CR/LF from the filename so it can't break out of the header
+    let safe: String = filename.chars().filter(|c| !matches!(c, '"' | '\r' | '\n')).collect();
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        ctype,
+        body.len(),
+        safe
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
 fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> std::io::Result<()> {
     let status = match code {
         200 => "200 OK",
@@ -239,8 +274,10 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  .ctl{margin:4px 0 8px;color:var(--muted)}
  button{background:var(--line);color:var(--gr);border:1px solid #334155;border-radius:4px;padding:2px 9px;cursor:pointer;font:inherit}
  button:disabled{opacity:.4;cursor:default}
- .rb{visibility:hidden;margin-left:8px;padding:0 6px;font-size:11px}
+ .rb{visibility:hidden;margin-left:8px;padding:0 6px;font-size:11px;cursor:pointer;text-decoration:none;border:1px solid var(--line);border-radius:3px;background:var(--panel);color:var(--c);white-space:nowrap}
  .ln:hover .rb{visibility:visible}
+ .dhead .rb{visibility:visible}
+ .rb.r{color:var(--r);border-color:var(--r)}
  /* sections + rows */
  .sec{background:var(--secbg);border-left:3px solid var(--line);color:var(--w);font-weight:600;padding:3px 8px;margin:10px 0 2px;border-radius:0 4px 4px 0}
  .sec small{font-weight:400;color:var(--c);font-size:11px}
@@ -350,6 +387,9 @@ function R(row){
  // the retry button sits right after the FIRST seg (the family slug), not at the end of the row
  let h='<div class="'+cls+'"'+oc+'>'+(row.segs[0]?sp(row.segs[0]):'');
  if(row.rt) h+='<button class="rb" onclick="event.stopPropagation();ctl({retry:[\''+E(row.rt)+'\']})" title="retry this family">↻ retry</button>';
+ // packaging actions: download the built .deb, and read the saved lintian report (lr=[slug,title,errClass])
+ if(row.dl) h+='<a class="rb" href="'+E(row.dl)+'" download onclick="event.stopPropagation()" title="download the built .deb">⬇ .deb</a>';
+ if(row.lr) h+='<button class="rb '+(row.lr[2]||'')+'" onclick="event.stopPropagation();openLintian(\''+E(row.lr[0])+'\')" title="'+E(row.lr[1])+'">▤ lintian</button>';
  h+=row.segs.slice(1).map(sp).join('');
  return h+'</div>';
 }
@@ -384,8 +424,13 @@ function debStatus(b){const ds=b.deb_status||'',lint=b.deb_lint||'';
  if(ds=='failed')return ['deb-failed','r','dpkg-deb failed to build the .deb for this family.'];
  if(b.packaged)return ['drafted','y','A debian/ packaging tree is drafted on disk; the .deb has not been built yet.'];
  return ['draftable','gr','Built family, ready to draft a debian/ tree (no debian/ on disk yet).'];}
-function packagingRow(b){const comp=b.compiler_version||b.backend||'';const s=debStatus(b);
- return {segs:[[L(s[0],10)+' ',s[1],s[2]],[L(b.slug,32)+' ','gr'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9),'gr']],rt:b.slug,det:['package',b.slug]}}
+function packagingRow(b){const comp=b.compiler_version||b.backend||'';const s=debStatus(b);const ds=b.deb_status||'',lint=b.deb_lint||'';
+ const built=(ds=='built'||ds=='validated'||ds=='lint-clean');
+ const dl=built?('/api/deb?slug='+encodeURIComponent(b.slug)):null; // download icon only when a .deb exists
+ // a saved lintian report exists whenever lintian actually ran (clean / warnings / errors); flag errors red
+ const hasReport=lint&&lint!='not run (lintian absent)'&&lint!='lintian failed to run';
+ const lr=hasReport?[b.slug,'read the lintian report ('+lint+')',/error/.test(lint)?'r':'']:null;
+ return {segs:[[L(s[0],10)+' ',s[1],s[2]],[L(b.slug,32)+' ','gr'],[L(comp,26)+' ','c'],[Rp(human(b.bytes),9),'gr']],rt:b.slug,dl:dl,lr:lr,det:['package',b.slug]}}
 function toolRow(t){const rust=t.lang=='rust';
  return {segs:[[L(t.lang,7)+' ',rust?'g':'y'],[L(t.name,24)+' ','w'],[L(t.kind,12)+' ','c'],[Rp(t.families,4)+' families  ','gr'],[(t.packaged?'packaged':'unpackaged'),'gr']],det:['tool',t.name]}}
 function debToolRow(t){const ok=!!t.present;
@@ -747,11 +792,24 @@ function openFsFamily(slug){
 function openPackage(slug){
  const b=findBy(snap.packages,'slug',slug)||{};
  const ds=b.deb_status||''; const st=ds||(b.packaged?'drafted':'draftable (built, not yet drafted)');
+ const lint=b.deb_lint||''; const built=(ds=='built'||ds=='validated'||ds=='lint-clean');
+ const hasReport=lint&&lint!='not run (lintian absent)'&&lint!='lintian failed to run';
+ const acts=(built?'<a class="rb" href="/api/deb?slug='+encodeURIComponent(slug)+'" download title="download the built .deb">⬇ .deb</a>':'')+
+   (hasReport?'<button class="rb '+(/error/.test(lint)?'r':'')+'" onclick="openLintian(\''+E(slug)+'\')" title="read the lintian report">▤ lintian report</button>':'');
+ const lintTag=lint?' &nbsp;<span class="muted">lintian: '+E(lint)+'</span>':'';
  const el=document.getElementById('detail');
- el.innerHTML='<div class="dhead">Package: '+E(slug)+' &nbsp;<span class="muted">deb status: '+E(st)+'</span><span class="dclose" onclick="closeDetail()">✕ close</span></div><pre class="dbody" id="pkgmeta">loading…</pre>';
+ el.innerHTML='<div class="dhead">Package: '+E(slug)+' &nbsp;<span class="muted">deb status: '+E(st)+'</span>'+lintTag+' &nbsp;'+acts+'<span class="dclose" onclick="closeDetail()">✕ close</span></div><pre class="dbody" id="pkgmeta">loading…</pre>';
  el.style.display='block';
  fetch('/api/debian?slug='+encodeURIComponent(slug)).then(r=>r.text()).then(t=>{const m=document.getElementById('pkgmeta');if(m)m.textContent=t}).catch(()=>{const m=document.getElementById('pkgmeta');if(m)m.textContent='(failed to load)'});
 }
+// lintian report overlay: fetch the saved report and colour E:/W:/I: lines
+function openLintian(slug){
+ const el=document.getElementById('detail');
+ el.innerHTML='<div class="dhead">lintian — '+E(slug)+' &nbsp;<a class="rb" href="/api/deb?slug='+encodeURIComponent(slug)+'" download title="download the built .deb">⬇ .deb</a><span class="dclose" onclick="closeDetail()">✕ close</span></div><pre class="dbody" id="lintbody">loading…</pre>';
+ el.style.display='block';
+ fetch('/api/lintian?slug='+encodeURIComponent(slug)).then(r=>r.text()).then(t=>{const m=document.getElementById('lintbody');if(m)m.innerHTML=hlLint(t)}).catch(()=>{const m=document.getElementById('lintbody');if(m)m.textContent='(failed to load)'});
+}
+function hlLint(t){return t.split('\n').map(l=>{const c=l[0]=='E'?'r':l[0]=='W'?'y':(l[0]=='I'||l[0]=='P')?'c':'gr';return '<span class="'+c+'">'+E(l)+'</span>'}).join('\n')}
 function showDetail(title,lines,slug){
  let h='<div class="dhead">'+E(title)+'<span class="dclose" onclick="closeDetail()">✕ close</span></div><pre class="dbody">'+lines.map(E).join('\n')+'</pre>';
  if(slug)h+='<div class="dlog"><div class="muted">log tail (last 200 lines):</div><pre id="dlogbody" class="dbody">loading…</pre></div>';
