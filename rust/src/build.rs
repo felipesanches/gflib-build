@@ -2318,7 +2318,10 @@ impl Orchestrator {
             v
         });
 
-        let pkg_pending = counts.built.saturating_sub(lint_total); // built families not yet packaged (read before `counts` moves)
+        // built families still awaiting (re)packaging = not in the live `packaged` de-dup set. (NOT
+        // counts.built - lint_total: the build-results entries persist, so that stays 0 after a repackage
+        // is requested even while the worker is rebuilding every .deb.)
+        let pkg_pending = sh.results.values().filter(|r| r.status == "built" && !sh.packaged.contains(&r.slug)).count();
         Snapshot {
             elapsed: self.elapsed(),
             disk_used_delta: 0,
