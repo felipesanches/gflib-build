@@ -263,6 +263,8 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  .seg{height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden}.seg.bg{background:#22c55e}.seg.rg{background:#ef4444}.seg.dg{background:#334155}.seg.cg{background:#06b6d4}
  .sl{font-size:10px;font-weight:600;color:#fff;text-shadow:0 0 3px #000;white-space:nowrap;padding:0 4px}.seg.dg .sl{color:#cbd5e1}
  .barlbl{position:absolute;left:0;right:0;top:0;line-height:18px;text-align:center;color:#fff;font-weight:600;font-size:11px;text-shadow:0 0 3px #000}
+ .pkgbar{height:12px;margin:0 0 6px}.pkgbar .sl{font-size:9px}
+ .pkgcap{font-size:10px;margin:1px 0}
  .phase{margin:4px 0 0}
  .skip{color:var(--y);float:right}
  /* tabs */
@@ -688,7 +690,8 @@ function barHTML(){const c=snap.counts||{},ph=snap.phase;
  const seg=(w,cl,n,lbl)=>'<div class="seg '+cl+'" style="width:'+w+'%">'+(n>0?'<span class="sl">'+n+' '+lbl+' ('+Math.round(w)+'%)</span>':'')+'</div>';
  // the built/failed/building/queued counts now live in the per-segment bar labels + the top-right 'attempted'
  return '<div class="phase"> Phase: '+E(phaseLabel(ph))+err+hint+'</div>'+
-  '<div class="barwrap">'+seg(gw,'bg',c.built||0,'built')+seg(rw,'rg',c.failed||0,'failed')+seg(dw,'dg',rem,'left')+'</div>';
+  '<div class="barwrap">'+seg(gw,'bg',c.built||0,'built')+seg(rw,'rg',c.failed||0,'failed')+seg(dw,'dg',rem,'left')+'</div>'+
+  packagingBar(gw);
 }
 function phaseLabel(ph){return {init:'starting…',clone_gf:'cloning google/fonts',build_fontc:'building fontc from source',discover:'discovering worklist',archive:'populating archive (mirroring repos)',cohorts:'scanning dependency cohorts',build:'building',done:'done'}[ph]||ph||''}
 
@@ -896,6 +899,16 @@ function donutT(slices,cx){
 }
 function pieLegend(slices,total){return '<div class="legend">'+slices.map(s=>{const pct=Math.round(100*s.value/total);
  return '<span title="'+E(s.tip||'')+'"><i style="background:'+s.color+'"></i>'+E(s.label)+' '+s.value+' ('+pct+'%)</span>';}).join('')+'</div>'}
+// secondary bar under the main one: deb-packaging status of the built families, scaled to the WIDTH of
+// the green "built" segment (gw% of the container) so each stage lines up beneath the built portion.
+function packagingBar(gw){
+ const pk=snap.packages||[];if(!pk.length||gw<=0)return '';
+ const cnt=pkgCounts(),total=pk.length;
+ const inner=PKG_STATES.filter(s=>cnt[s[0]]).map(s=>{const n=cnt[s[0]],w=100*n/total,pct=Math.round(w);
+  return '<div class="seg" style="width:'+w+'%;background:'+s[1]+'" title="'+E(s[0]+': '+n+' ('+pct+'% of built) — '+s[2])+'">'+(n>0?'<span class="sl">'+n+'</span>':'')+'</div>';}).join('');
+ return '<div class="pkgcap muted">deb packaging — '+total+' built families (each stage distinguished; aligned under ‘built’)</div>'+
+  '<div class="barwrap pkgbar" style="width:'+gw+'%" title="packaging status of the '+total+' built families">'+inner+'</div>';
+}
 
 function charts(t){
  const c=snap.counts||{};
