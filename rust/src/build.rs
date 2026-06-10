@@ -2670,6 +2670,15 @@ fn run_builder(
 
     let mut cmd;
     let orch;
+
+    // We're going to change into the work directory and the config path is under
+    // that, so we should relativize it.
+    let config_path = if let Ok(rel) = config_path.strip_prefix(work) {
+        rel
+    } else {
+        config_path
+    };
+
     if let Some(b3) = builder3_bin {
         cmd = Command::new(b3);
         cmd.arg(config_path);
