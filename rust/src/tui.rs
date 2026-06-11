@@ -56,6 +56,7 @@ fn sev_rank(s: &str) -> u8 {
 
 const SOURCE_CHOICES: [&str; 2] = ["metadata", "archive"];
 const BACKEND_CHOICES: [&str; 4] = ["auto", "fontc", "fontmake", "both"];
+const ORCHESTRATOR_CHOICES: [&str; 3] = ["auto", "builder3", "builder2"];
 
 // ---- the unified Configuration tab: a full schema editor used for BOTH live editing and first-run
 // setup — a faithful port of CONFIG_SCHEMA + the _cfg_* helpers from the original Python tool. ----
@@ -89,8 +90,9 @@ fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
         ("build_dir", "build output dir", CfgKind::Path, false),
         // Build engine
         ("backend", "build backend", CfgKind::Choice(&BACKEND_CHOICES), true),
-        ("fontc_bin", "fontc binary", CfgKind::Path, false),
-        ("build_fontc", "build fontc from source (if none)", CfgKind::Bool, false),
+        ("orchestrator", "orchestrator", CfgKind::Choice(&ORCHESTRATOR_CHOICES), false),
+        ("fontc_bin", "fontc binary (override)", CfgKind::Path, false),
+        ("auto_provision", "auto-provision pinned toolchain", CfgKind::Bool, false),
         ("manage_venvs", "cohort venvs", CfgKind::Bool, false),
         ("jobs", "parallel jobs", CfgKind::Step { step: 1.0, min: 1.0, max: 256.0 }, true),
         ("timeout", "per-build timeout (0=off)", CfgKind::Step { step: 30.0, min: 0.0, max: 100000.0 }, true),
@@ -109,7 +111,7 @@ fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
 fn cfg_group(key: &str) -> &'static str {
     match key {
         "source" | "google_fonts" | "archive" | "build_dir" => "Sources & paths",
-        "backend" | "fontc_bin" | "build_fontc" | "manage_venvs" | "jobs" | "timeout" => "Build engine",
+        "backend" | "orchestrator" | "fontc_bin" | "auto_provision" | "manage_venvs" | "jobs" | "timeout" => "Build engine",
         "percent" | "retry_failed" | "populate_archive" => "Scope",
         "compare" | "fontspector_qa" | "build_debs" => "QA & packaging",
         _ => "Other",
@@ -197,7 +199,7 @@ fn cfg_show(key: &str, vals: &BTreeMap<String, Value>) -> bool {
     match key {
         "google_fonts" => s("source") == "metadata",
         "fontc_bin" => s("backend") != "fontmake",
-        "build_fontc" => s("backend") != "fontmake" && s("fontc_bin").is_empty(),
+        "auto_provision" => s("fontc_bin").is_empty(), // an explicit override bypasses provisioning
         "compare" => s("source") == "metadata",
         _ => true,
     }
@@ -733,6 +735,7 @@ fn phase_label(ph: &str) -> &str {
         "init" => "starting…",
         "clone_gf" => "cloning google/fonts",
         "build_fontc" => "building fontc from source",
+        "toolchain" => "provisioning the pinned toolchain (fontc + builder3)",
         "discover" => "discovering worklist",
         "archive" => "populating archive (mirroring repos)",
         "cohorts" => "scanning dependency cohorts",
@@ -1508,8 +1511,8 @@ fn render_stats_prefix(scr: &mut Screen, snap: &Snapshot, top: u16, w: u16) -> u
     row += 1;
     let g = |k: &str| snap.migration.get(k).copied().unwrap_or(0);
     let mut line = format!(
-        "fontc {}   fontmake-fallback(blockers) {}   fontmake-only {}",
-        g("fontc"), g("fontmake_fallback"), g("fontmake_only")
+        "builder3(M5: Python-free) {}   fontc {}   fontmake-fallback(blockers) {}   fontmake-only {}",
+        g("builder3"), g("fontc"), g("fontmake_fallback"), g("fontmake_only")
     );
     if g("both_identical") > 0 || g("both_differ") > 0 {
         line += &format!("   both id {}/diff {}", g("both_identical"), g("both_differ"));
@@ -1704,8 +1707,9 @@ fn field_help(key: &str) -> &str {
         "archive" => "the bare-mirror repo archive (append-only; never deleted)",
         "build_dir" => "where all build assets go (out/ venvs/ logs/) — never inside a repo",
         "backend" => "auto = fontc first then fall back to fontmake · fontc/fontmake = that one · both = build & compare",
-        "fontc_bin" => "path to the fontc (Rust) binary",
-        "build_fontc" => "no fontc binary? build it from source with cargo",
+        "orchestrator" => "auto = prefer builder3 (Rust), fall back to builder2 · builder3/builder2 = that one only",
+        "fontc_bin" => "explicit fontc binary — empty = auto (provisioned pin / detected)",
+        "auto_provision" => "cargo-install the pinned fontc + builder3 when absent (zero-setup toolchain)",
         "jobs" => "how many families build in parallel",
         "percent" => "build only this % of the library (evenly-spaced sample); raise it live to build more",
         "timeout" => "per-build timeout in seconds (0 = never time out)",

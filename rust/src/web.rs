@@ -354,8 +354,9 @@ const SCHEMA=[
  {k:'archive',l:'repo archive',t:'path',live:false},
  {k:'build_dir',l:'build output dir',t:'path',live:false},
  {k:'backend',l:'build backend',t:'choice',live:true},
- {k:'fontc_bin',l:'fontc binary',t:'path',live:false},
- {k:'build_fontc',l:'build fontc from source (if none)',t:'bool',live:false},
+ {k:'orchestrator',l:'orchestrator',t:'choice',live:false},
+ {k:'fontc_bin',l:'fontc binary (override)',t:'path',live:false},
+ {k:'auto_provision',l:'auto-provision pinned toolchain',t:'bool',live:false},
  {k:'jobs',l:'parallel jobs',t:'step',live:true},
  {k:'percent',l:'percent of library',t:'step',live:true},
  {k:'timeout',l:'per-build timeout (0=off)',t:'step',live:true},
@@ -483,7 +484,7 @@ function sections(t){
 }
 
 function statsPrefix(){const m=snap.migration||{};
- let line='fontc '+(m.fontc||0)+'   fontmake-fallback(blockers) '+(m.fontmake_fallback||0)+'   fontmake-only '+(m.fontmake_only||0);
+ let line='builder3(M5: Python-free) '+(m.builder3||0)+'   fontc '+(m.fontc||0)+'   fontmake-fallback(blockers) '+(m.fontmake_fallback||0)+'   fontmake-only '+(m.fontmake_only||0);
  if((m.both_identical||0)||(m.both_differ||0))line+='   both id '+(m.both_identical||0)+'/diff '+(m.both_differ||0);
  let h='<div class="sec">fontc migration</div><div class="ln g">'+E(line)+'</div>';
  const tl=snap.tooling||{},bl=snap.builders||{};
@@ -568,7 +569,7 @@ function showIf(k,cf){const s=x=>(cf[x]==null?'':''+cf[x]);
  if(k=='build_fontc')return s('backend')!='fontmake'&&!s('fontc_bin');
  if(k=='compare')return s('source')=='metadata';
  return true}
-const CHOICES={source:['metadata','archive'],backend:['auto','fontc','fontmake','both']};
+const CHOICES={source:['metadata','archive'],backend:['auto','fontc','fontmake','both'],orchestrator:['auto','builder3','builder2']};
 // the keys the daemon actually honours live (same set as the TUI's cfg_apply_live) → editable form controls
 const LIVE_APPLY={backend:1,jobs:1,percent:1,compare:1,build_debs:1};
 // logical groupings for the config panel (related settings under one sub-header)

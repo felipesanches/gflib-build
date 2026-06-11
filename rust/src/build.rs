@@ -2164,6 +2164,10 @@ impl Orchestrator {
                     }
                     _ => {}
                 }
+                // the M5 (Python-free) count: families whose ORCHESTRATOR was builder3
+                if r.builder == "builder3" {
+                    *migration.entry("builder3".into()).or_default() += 1;
+                }
                 built.push(BuiltItem {
                     slug: r.slug.clone(),
                     backend: r.backend.clone(),

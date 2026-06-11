@@ -85,14 +85,6 @@ impl Toolchain {
         self.cv.notify_all();
     }
 
-    /// Resolved fontc path (None while pending/unavailable) — for version probes after wait().
-    pub fn fontc_path(&self) -> Option<String> {
-        path_of(&self.state.lock().unwrap().0)
-    }
-
-    pub fn builder3_path(&self) -> Option<String> {
-        path_of(&self.state.lock().unwrap().1)
-    }
 }
 
 fn path_of(s: &ToolStatus) -> Option<String> {
@@ -251,8 +243,10 @@ fn is_executable(p: &Path) -> bool {
 }
 
 /// Detection fallback for builder3 (the analogue of discover::detect_fontc): sibling checkouts
-/// first, then PATH — but a PATH hit must IDENTIFY as builder3 (major version 3), because the
-/// Python gftools also ships a `gftools-builder` console script that would otherwise shadow it.
+/// first, then PATH. A checkout path (…/gftools-builder3/target/release/…) is unambiguous, so
+/// it's accepted on existence — builder3 builds that predate `--version` support still detect.
+/// A bare PATH hit must IDENTIFY as builder3 (major version 3), because the Python gftools also
+/// ships a `gftools-builder` console script that would otherwise shadow it.
 pub fn detect_builder3() -> Option<String> {
     let home = std::env::var("HOME").unwrap_or_default();
     let cands = [
@@ -262,7 +256,7 @@ pub fn detect_builder3() -> Option<String> {
     ];
     for c in &cands {
         let p = Path::new(c);
-        if p.is_file() && is_builder3_binary(p) {
+        if p.is_file() {
             return std::fs::canonicalize(p).ok().map(|p| p.to_string_lossy().into_owned());
         }
     }

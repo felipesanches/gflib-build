@@ -495,8 +495,13 @@ WORKLIST:
 
 BUILD:
   --backend <auto|fontc|fontmake|both>   compiler (default auto = fontc-first)
-  --fontc-bin <PATH>            fontc (Rust) binary (auto-detected)
-  --builder3-bin <PATH>         gftools-builder3 (Rust orchestrator)
+  --orchestrator <auto|builder3|builder2>  default auto: prefer gftools-builder3 (Rust), fall back
+                                per family to builder2+fontc, then builder2+fontmake. builder3/
+                                builder2 force that orchestrator only (builder3 = no Python fallback).
+  --fontc-bin <PATH>            explicit fontc binary (default: auto — the provisioned pin, else detected)
+  --builder3-bin <PATH>         explicit gftools-builder3 binary (default: auto, like fontc)
+  --no-toolchain-provision      don't cargo-install missing pinned tools (fontc/builder3); detection only.
+                                Zero-setup default: the pins auto-install once into <data-dir>/tools/.
   --build-python <PATH>         interpreter for builds (default python3)
   --pythons <a,b,c|auto>        cohort-venv Python ladder, newest→oldest (e.g. python3.13,python3.11), or
                                 'auto' to discover installed python3.N. A cohort whose exact pinned reqs

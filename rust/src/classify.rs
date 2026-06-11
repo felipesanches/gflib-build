@@ -20,6 +20,14 @@ pub fn is_transient_clone_error(err: &str) -> bool {
 /// Map a failure message to a short CAUSE + an actionable HINT (verbatim from Python).
 pub fn categorize_failure(error: &str) -> (&'static str, &'static str) {
     let low = error.to_lowercase();
+    // the attempt chain exhausted with builder3 as the last word (e.g. a forced
+    // --orchestrator builder3 run) — an orchestrator-level error, not a venv/compiler one
+    if low.starts_with("builder3:") {
+        return (
+            "builder3 error",
+            "gftools-builder3 (Rust) could not build this family — under --orchestrator auto it falls back to builder2 automatically; see the log for the builder3 output",
+        );
+    }
     if low.contains("could not launch builder") || low.contains("no such file or directory: 'fontmake'") {
         return (
             "build launcher error",
