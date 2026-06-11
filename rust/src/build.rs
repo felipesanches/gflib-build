@@ -202,6 +202,7 @@ pub struct Orchestrator {
     pub job_limit: AtomicUsize,             // live jobs target; lock-free mirror of sh.jobs for the regulator
     pub crater: Option<crate::crater::CraterData>, // fontc_crater latest verdict (None = unavailable/disabled)
     pub crater_by_slug: BTreeMap<String, crate::crater::CraterStatus>, // family slug -> crater verdict
+    pub toolchain: Arc<crate::toolchain::Toolchain>, // fontc + builder3 ready-gate (resolved at start())
 }
 
 impl Orchestrator {
@@ -419,6 +420,7 @@ impl Orchestrator {
             job_limit: AtomicUsize::new(jobs),
             crater,
             crater_by_slug,
+            toolchain: Arc::new(crate::toolchain::Toolchain::default()),
         })
     }
 
@@ -454,6 +456,7 @@ impl Orchestrator {
                 }
             });
         }
+        self.spawn_toolchain_resolver();
         let jobs = self.shared.lock().unwrap().jobs;
         self.ensure_workers(jobs);
         self.spawn_archive_prewarmer();
@@ -463,6 +466,63 @@ impl Orchestrator {
         self.spawn_size_thread();
         self.spawn_control_watcher();
         self.spawn_config_watcher();
+    }
+
+    /// Resolve fontc + builder3 off-thread (explicit flag → provisioned pin → auto-provision →
+    /// detected) and publish the verdicts to the toolchain ready-gate. Workers entering build_one
+    /// wait on the gate; a tool that can't be resolved is Unavailable and the per-family attempt
+    /// chain simply degrades past it (builder2 / fontmake) — provisioning failure never blocks the
+    /// run. First-run provisioning compiles builder3 (~700 crates) / fontc, which takes minutes; the
+    /// progress is visible as pipeline tasks and in the control log; later runs hit the cached pins.
+    fn spawn_toolchain_resolver(self: &Arc<Self>) {
+        use crate::toolchain as tc;
+        let me = Arc::clone(self);
+        thread::spawn(move || {
+            // a persisted-but-stale explicit path must not hard-fail the tool: soften it to None so
+            // the pin engages (the control log explains). A LIVE explicit path is honored verbatim.
+            let soften = |bin: &Option<String>, name: &str, me: &Arc<Orchestrator>| -> Option<String> {
+                match bin {
+                    Some(b) if Path::new(b).is_file() => Some(b.clone()),
+                    Some(b) => {
+                        me.shared.lock().unwrap().control_log.push(format!(
+                            "{}: configured binary missing ({}) — resolving automatically", name, b));
+                        None
+                    }
+                    None => None,
+                }
+            };
+            let tools_root = me.cfg.data_dir.join("tools");
+            let explicit_fc = soften(&me.cfg.fontc_bin, "fontc", &me);
+            let fc = tc::ensure_tool(
+                &tc::fontc_spec(), explicit_fc.as_deref(), &tools_root, me.cfg.auto_provision,
+                crate::discover::detect_fontc,
+            );
+            me.log_tool_verdict("fontc", &fc);
+            me.toolchain.set_fontc(fc);
+
+            // orchestrator=builder2 → skip builder3 entirely (no provisioning, gate = Unavailable)
+            let b3 = if me.cfg.orchestrator == "builder2" {
+                tc::ToolStatus::Unavailable("disabled (--orchestrator builder2)".into())
+            } else {
+                let explicit_b3 = soften(&me.cfg.builder3_bin, "builder3", &me);
+                tc::ensure_tool(
+                    &tc::builder3_spec(), explicit_b3.as_deref(), &tools_root, me.cfg.auto_provision,
+                    tc::detect_builder3,
+                )
+            };
+            me.log_tool_verdict("builder3", &b3);
+            me.toolchain.set_builder3(b3);
+        });
+    }
+
+    fn log_tool_verdict(&self, name: &str, st: &crate::toolchain::ToolStatus) {
+        use crate::toolchain::ToolStatus;
+        let line = match st {
+            ToolStatus::Ready { path, source } => format!("{}: {} ({})", name, path, source),
+            ToolStatus::Unavailable(e) => format!("{}: UNAVAILABLE — {}", name, e),
+            ToolStatus::Pending => return,
+        };
+        self.shared.lock().unwrap().control_log.push(line);
     }
 
     /// --dry-run: when the replayed build finishes, pause a few seconds (so the 'complete' state shows)
@@ -782,8 +842,9 @@ impl Orchestrator {
     }
 
     /// Cached exact compiler version (run once per backend/venv — the cohort python matters because
-    /// different cohorts can carry different fontmake/gftools versions).
-    fn compiler_version(&self, backend: &str, python: &str) -> String {
+    /// different cohorts can carry different fontmake/gftools versions). `fontc_bin` is the
+    /// toolchain-resolved binary (explicit / provisioned pin / detected).
+    fn compiler_version(&self, backend: &str, python: &str, fontc_bin: Option<&str>) -> String {
         let key = (backend.to_string(), python.to_string());
         {
             let sh = self.shared.lock().unwrap();
@@ -791,22 +852,15 @@ impl Orchestrator {
                 return v.clone();
             }
         }
-        let v = compiler_version_str(backend, python, self.cfg.fontc_bin.as_deref());
+        let v = compiler_version_str(backend, python, fontc_bin.or(self.cfg.fontc_bin.as_deref()));
         let mut sh = self.shared.lock().unwrap();
         sh.cver_cache.entry(key).or_insert_with(|| v.clone());
         v
     }
 
-    fn builder_name(&self) -> String {
-        if self.cfg.builder3_bin.is_some() {
-            "builder3".into()
-        } else {
-            "builder2".into()
-        }
-    }
-
-    /// Cached exact orchestrator version (run once per builder/venv).
-    fn builder_version(&self, builder: &str, python: &str) -> String {
+    /// Cached exact orchestrator version (run once per builder/venv). `builder3_bin` is the
+    /// toolchain-resolved binary for builder3 probes (None is fine for builder2).
+    fn builder_version(&self, builder: &str, python: &str, builder3_bin: Option<&str>) -> String {
         let key = (builder.to_string(), python.to_string());
         {
             let sh = self.shared.lock().unwrap();
@@ -814,7 +868,7 @@ impl Orchestrator {
                 return v.clone();
             }
         }
-        let v = builder_version_str(builder, python, self.cfg.builder3_bin.as_deref());
+        let v = builder_version_str(builder, python, builder3_bin.or(self.cfg.builder3_bin.as_deref()));
         let mut sh = self.shared.lock().unwrap();
         sh.bver_cache.entry(key).or_insert_with(|| v.clone());
         v
@@ -858,16 +912,54 @@ impl Orchestrator {
         let fontc: Vec<&str> = built.iter().filter(|r| r.backend == "fontc").map(|r| r.slug.as_str()).collect();
         let fm_only: Vec<&str> = built.iter().filter(|r| r.backend == "fontmake").map(|r| r.slug.as_str()).collect();
         let failed: Vec<&str> = sh.results.values().filter(|r| r.status == "failed").map(|r| r.slug.as_str()).collect();
+        // the M5 (Python-free) axis: which ORCHESTRATOR built each family. builder3 = zero Python
+        // in the loop; builder2+fontc = Rust compiler under Python orchestration; fontmake = all-Python.
+        let b3: Vec<&str> = built.iter().filter(|r| r.builder == "builder3").map(|r| r.slug.as_str()).collect();
+        let b2_fontc = built.iter().filter(|r| r.builder != "builder3" && r.backend == "fontc").count();
         serde_json::json!({
             "summary": {
                 "fontc": fontc.len(),
                 "fontmake_only": fm_only.len(),
                 "failed": failed.len(),
+                "builder3": b3.len(),
+                "builder2_fontc": b2_fontc,
             },
             "fontc_built": fontc,
             "fontmake_only": fm_only,
+            "builder3_built": b3,
             "failed": failed,
         })
+    }
+
+    /// Pipeline task rows for the toolchain resolver — "provision fontc/builder3" with live
+    /// status, so a first run's multi-minute cargo install is visible, not a frozen dashboard.
+    fn toolchain_tasks(&self) -> Vec<crate::model::TaskItem> {
+        use crate::toolchain::ToolStatus;
+        if self.cfg.dry_run {
+            return Vec::new();
+        }
+        let (fc, b3) = self.toolchain.peek();
+        let row = |key: &str, name: &str, st: &ToolStatus| crate::model::TaskItem {
+            key: key.into(),
+            name: name.into(),
+            status: match st {
+                ToolStatus::Pending => "running".into(),
+                ToolStatus::Ready { .. } => "done".into(),
+                ToolStatus::Unavailable(_) => "failed".into(),
+            },
+            elapsed: 0.0,
+            done: matches!(st, ToolStatus::Ready { .. }) as usize,
+            total: 1,
+            detail: match st {
+                ToolStatus::Pending => "resolving / provisioning…".into(),
+                ToolStatus::Ready { path, source } => format!("{} ({})", path, source),
+                ToolStatus::Unavailable(e) => e.clone(),
+            },
+        };
+        vec![
+            row("toolchain-fontc", &format!("provision fontc {}", crate::toolchain::FONTC_VERSION), &fc),
+            row("toolchain-builder3", &format!("provision builder3 {}", &crate::toolchain::BUILDER3_REV[..10]), &b3),
+        ]
     }
 
     /// Run ONE backend end-to-end into `dest` (extract → pre-build → preclean → config → build →
@@ -875,7 +967,7 @@ impl Orchestrator {
     #[allow(clippy::too_many_arguments)]
     fn run_backend_into(
         &self, slug: &str, fam: &Family, backend: &str, dest: &Path, work: &Path, mirror: &Path,
-        python: &str, log_path: &Path,
+        python: &str, log_path: &Path, fontc_bin: Option<&str>,
     ) -> (bool, String, BTreeMap<String, PathBuf>, u64) {
         if let Err(e) = extract_tree(mirror, &fam.commit, work, EXTRACT_TIMEOUT, log_path) {
             return (false, e, BTreeMap::new(), 0);
@@ -891,8 +983,9 @@ impl Orchestrator {
             Err(e) => return (false, e, BTreeMap::new(), 0),
         };
         let t0 = now();
-        if let Err(e) = run_builder(python, &cfg_path, work, log_path, self.cfg.timeout, backend,
-                                    self.cfg.fontc_bin.as_deref(), self.cfg.builder3_bin.as_deref(),
+        // the 'both' comparison runs each compiler under builder2 (the compiler axis, isolated)
+        if let Err(e) = run_builder(python, &cfg_path, work, log_path, self.cfg.timeout, "builder2",
+                                    backend, fontc_bin, None,
                                     &fam.slug, &self.running, &self.frozen, &self.job_limit) {
             return (false, format!("{}: {}", backend, e), BTreeMap::new(), 0);
         }
@@ -912,10 +1005,10 @@ impl Orchestrator {
     #[allow(clippy::too_many_arguments)]
     fn build_both(
         &self, slug: &str, fam: &Family, work: &Path, out_dir: &Path, mirror: &Path, python: &str,
-        builder: &str, bver: &str, log_path: &Path,
+        builder: &str, bver: &str, log_path: &Path, fontc_bin: Option<&str>,
     ) {
-        let fcver = self.compiler_version("fontc", python);
-        let mcver = self.compiler_version("fontmake", python);
+        let fcver = self.compiler_version("fontc", python, fontc_bin);
+        let mcver = self.compiler_version("fontmake", python, None);
         self.set_result(slug, |r| {
             r.backend = "both".into();
             r.compiler_version = format!("{}  +  {}", fcver, mcver);
@@ -923,9 +1016,9 @@ impl Orchestrator {
             r.builder_version = bver.into();
         });
         let (fok, ferr, fbuilt, fbytes) =
-            self.run_backend_into(slug, fam, "fontc", &out_dir.join("fontc"), work, mirror, python, log_path);
+            self.run_backend_into(slug, fam, "fontc", &out_dir.join("fontc"), work, mirror, python, log_path, fontc_bin);
         let (mok, merr, mbuilt, mbytes) =
-            self.run_backend_into(slug, fam, "fontmake", &out_dir.join("fontmake"), work, mirror, python, log_path);
+            self.run_backend_into(slug, fam, "fontmake", &out_dir.join("fontmake"), work, mirror, python, log_path, None);
         if !fok && !mok {
             let msg = format!("both backends failed — fontc: {} || fontmake: {}",
                 &ferr[..ferr.len().min(120)], &merr[..merr.len().min(120)]);
@@ -980,21 +1073,12 @@ impl Orchestrator {
         sh.cohort_reqs.entry(cohort.to_string()).or_insert_with(|| req_text.to_string());
     }
 
-    fn backend_order(&self) -> Vec<String> {
+    /// The per-family (orchestrator, compiler) attempt chain, from the live backend setting and
+    /// the resolved toolchain. builder3 is ALWAYS preferred when available (it runs fontc
+    /// in-process); each later pair is the graceful fallback for the one before it.
+    fn attempt_pairs(&self, have_fontc: bool, have_builder3: bool) -> Vec<(&'static str, &'static str)> {
         let backend = self.shared.lock().unwrap().backend.clone(); // live (editable via config tab)
-        match backend.as_str() {
-            "fontc" => vec!["fontc".into()],
-            "fontmake" => vec!["fontmake".into()],
-            "both" => vec!["fontc".into(), "fontmake".into()],
-            _ => {
-                // auto: fontc-first, fontmake fallback (only if a fontc binary is present)
-                if self.cfg.fontc_bin.is_some() {
-                    vec!["fontc".into(), "fontmake".into()]
-                } else {
-                    vec!["fontmake".into()]
-                }
-            }
-        }
+        attempt_chain(&backend, &self.cfg.orchestrator, have_fontc, have_builder3)
     }
 
     /// MOCKUP build: no clone/venv/compile — a brief fake "compile", then replay the family's recorded
@@ -1121,14 +1205,32 @@ impl Orchestrator {
             self.cfg.build_python.clone()
         };
 
-        let order = self.backend_order();
-        let builder = self.builder_name();
-        let bver = self.builder_version(&builder, &python);
+        // Wait for the toolchain verdicts (fontc + builder3). On a first run this may be the
+        // auto-provisioner cargo-installing the pins — minutes, visible in the pipeline tasks —
+        // so tell the UI what this family is blocked on. Subsequent runs return instantly.
+        self.set_result(slug, |r| r.note = "waiting for toolchain".into());
+        let (fontc_bin, builder3_bin) = self.toolchain.wait();
+        self.set_result(slug, |r| r.note = String::new());
 
         // --backend both (fontc_crater-style): build with BOTH compilers into separate dirs and
-        // compare their outputs. Branches away from the single-backend loop below.
+        // compare their outputs — under builder2 on both sides, so the comparison isolates the
+        // COMPILER axis (builder3-vs-builder2 equivalence is a separate, future comparison).
         if self.shared.lock().unwrap().backend == "both" {
-            self.build_both(slug, &fam, &work, &out_dir, &mirror, &python, &builder, &bver, &log_path);
+            let bver = self.builder_version("builder2", &python, None);
+            self.build_both(slug, &fam, &work, &out_dir, &mirror, &python, "builder2", &bver, &log_path, fontc_bin.as_deref());
+            cleanup(&work, self.cfg.keep_work);
+            return;
+        }
+
+        let pairs = self.attempt_pairs(fontc_bin.is_some(), builder3_bin.is_some());
+        if pairs.is_empty() {
+            let backend = self.shared.lock().unwrap().backend.clone();
+            self.fail(slug, "no usable backend", &format!(
+                "no orchestrator/compiler can run --backend {} (orchestrator={}, fontc {}, builder3 {})",
+                backend, self.cfg.orchestrator,
+                if fontc_bin.is_some() { "ok" } else { "unavailable" },
+                if builder3_bin.is_some() { "ok" } else { "unavailable" },
+            ));
             cleanup(&work, self.cfg.keep_work);
             return;
         }
@@ -1137,7 +1239,9 @@ impl Orchestrator {
         let mut fontc_err = String::new();
         let mut built_any = false;
 
-        for (i, backend) in order.iter().enumerate() {
+        for (i, (builder, backend)) in pairs.iter().enumerate() {
+            let builder: &str = builder;
+            let backend: &str = backend;
             // fresh extraction for each backend attempt (a previous attempt may have dirtied work/)
             self.set_result(slug, |r| r.note = "checkout".into());
             if let Err(e) = self.timed(slug, "extract", || extract_tree(&mirror, &fam.commit, &work, EXTRACT_TIMEOUT, &log_path)) {
@@ -1164,17 +1268,18 @@ impl Orchestrator {
                     break; // no config -> trying another backend won't help
                 }
             };
-            let cver = self.compiler_version(backend, &python);
+            let cver = self.compiler_version(backend, &python, fontc_bin.as_deref());
+            let bver = self.builder_version(builder, &python, builder3_bin.as_deref());
             self.set_result(slug, |r| {
-                r.backend = backend.clone();
+                r.backend = backend.to_string();
                 r.compiler_version = cver.clone();
-                r.builder = builder.clone();
+                r.builder = builder.to_string();
                 r.builder_version = bver.clone();
                 r.note = String::new();
             });
             log_line(&log_path, &format!(
-                "build[{}]: {} {} via {} · config={} — running {}…",
-                backend, backend, cver, bver, label, builder
+                "build[{}/{}]: {} {} via {} · config={} — running {}…",
+                builder, backend, backend, cver, bver, label, builder
             ));
             let t0 = now();
             let run = self.timed(slug, "build", || run_builder(
@@ -1183,16 +1288,24 @@ impl Orchestrator {
                 &work,
                 &log_path,
                 self.cfg.timeout,
+                builder,
                 backend,
-                self.cfg.fontc_bin.as_deref(),
-                self.cfg.builder3_bin.as_deref(),
+                fontc_bin.as_deref(),
+                builder3_bin.as_deref(),
                 slug,
                 &self.running,
                 &self.frozen,
                 &self.job_limit,
             ));
             if let Err(e) = run {
-                last_err = format!("{}: {}", backend, e);
+                // prefix failures by the attempt that produced them: "builder3: …" identifies an
+                // orchestrator-level failure; builder2 attempts keep the compiler-name prefix the
+                // failure classifier already understands.
+                last_err = if builder == "builder3" {
+                    format!("builder3: {}", e)
+                } else {
+                    format!("{}: {}", backend, e)
+                };
                 if backend == "fontc" {
                     fontc_err = last_err.clone();
                 }
@@ -1201,10 +1314,11 @@ impl Orchestrator {
             // collect only fonts written during THIS build (mtime gate), recursively
             let (bytes, found, extras) = self.timed(slug, "collect", || collect_outputs(&work, &out_dir, &fam.shipped_fonts, t0));
             if !fam.shipped_fonts.is_empty() && found.is_empty() {
+                let who = if builder == "builder3" { "builder3" } else { backend };
                 last_err = if extras.is_empty() {
-                    format!("{}: produced no expected font files", backend)
+                    format!("{}: produced no expected font files", who)
                 } else {
-                    format!("{}: output name mismatch — got {:?}", backend, &extras[..extras.len().min(3)])
+                    format!("{}: output name mismatch — got {:?}", who, &extras[..extras.len().min(3)])
                 };
                 if backend == "fontc" {
                     fontc_err = last_err.clone();
@@ -1229,7 +1343,7 @@ impl Orchestrator {
             } else {
                 String::new()
             };
-            let used = backend.clone();
+            let used = backend.to_string();
             self.set_result(slug, |r| {
                 r.status = "built".into();
                 r.ended = now();
@@ -1240,9 +1354,9 @@ impl Orchestrator {
                 r.note = String::new();
             });
             log_line(&log_path, &format!(
-                "DONE: backend={} bytes={} missing={}", backend, bytes, missing
+                "DONE: builder={} backend={} bytes={} missing={}", builder, backend, bytes, missing
             ));
-            self.emit("built", slug, serde_json::json!({"backend": used, "bytes": bytes, "compare": cmp}));
+            self.emit("built", slug, serde_json::json!({"backend": used, "builder": builder, "bytes": bytes, "compare": cmp}));
             self.enqueue_qa(slug);
             // keep the built fonts when deb-packaging is on: the live package worker needs them on
             // disk (otherwise --discard-fonts would prune them before it can assemble the .deb).
@@ -2370,7 +2484,7 @@ impl Orchestrator {
             phase_durations: [("build".to_string(), (self.elapsed() * 10.0).round() / 10.0)]
                 .into_iter()
                 .collect(),
-            tasks: Vec::new(),
+            tasks: self.toolchain_tasks(),
             archive_recent: Vec::new(),
             archive,
             config: {
@@ -2626,14 +2740,91 @@ fn signal_group(pgid: i32, sig: i32) {
     }
 }
 
-/// Run the build orchestrator. builder3_bin set -> invoke the Rust-native builder3 binary directly
-/// (no Python); else `python -m gftools.builder <config>` (with --experimental-fontc for fontc).
+/// The (orchestrator, compiler) attempt chain for one family. Pure — fully determined by the
+/// backend setting, the orchestrator preference, and which tool binaries resolved — so every
+/// combination is unit-tested. builder3 embeds fontc as a library: a builder3 attempt needs no
+/// fontc binary and can never run fontmake.
+///
+///   auto/auto      → builder3+fontc → builder2+fontc → builder2+fontmake
+///   fontc          → builder3+fontc → builder2+fontc            (no fontmake rescue)
+///   fontmake       → builder2+fontmake                          (builder3 can't run fontmake)
+///   orchestrator=builder3 → builder3-only (an explicit "no Python fallback" run)
+///   orchestrator=builder2 → the pre-builder3 behavior
+///
+/// An empty chain means "nothing can run this backend" — the caller fails the family with a
+/// clear message instead of guessing.
+pub fn attempt_chain(
+    backend: &str,
+    orchestrator: &str,
+    have_fontc: bool,
+    have_builder3: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let b3 = have_builder3 && orchestrator != "builder2";
+    let mut chain: Vec<(&'static str, &'static str)> = Vec::new();
+    match backend {
+        "fontmake" => {
+            if orchestrator != "builder3" {
+                chain.push(("builder2", "fontmake"));
+            }
+        }
+        "fontc" => {
+            if b3 {
+                chain.push(("builder3", "fontc"));
+            }
+            if orchestrator != "builder3" && have_fontc {
+                chain.push(("builder2", "fontc"));
+            }
+        }
+        // auto (and anything unrecognized): the full graceful ladder
+        _ => {
+            if b3 {
+                chain.push(("builder3", "fontc"));
+            }
+            if orchestrator != "builder3" {
+                if have_fontc {
+                    chain.push(("builder2", "fontc"));
+                }
+                chain.push(("builder2", "fontmake"));
+            }
+        }
+    }
+    chain
+}
+
+/// The argv for one builder attempt — factored out of run_builder so the exact command shapes
+/// are unit-testable. Returns (program, args).
+fn builder_command(
+    builder: &str,
+    backend: &str,
+    python: &str,
+    config_path: &Path,
+    fontc_bin: Option<&str>,
+    builder3_bin: Option<&str>,
+) -> (String, Vec<String>) {
+    if builder == "builder3" {
+        let b3 = builder3_bin.unwrap_or("gftools-builder");
+        return (b3.to_string(), vec![config_path.to_string_lossy().into_owned()]);
+    }
+    let mut args = vec!["-m".to_string(), "gftools.builder".to_string(), config_path.to_string_lossy().into_owned()];
+    if backend == "fontc" {
+        if let Some(fc) = fontc_bin {
+            args.push("--experimental-fontc".into());
+            args.push(fc.to_string());
+        }
+    }
+    (python.to_string(), args)
+}
+
+/// Run one (orchestrator, compiler) build attempt. builder=="builder3" invokes the Rust-native
+/// builder3 binary directly (no Python in the loop); else `python -m gftools.builder <config>`
+/// (with --experimental-fontc for the fontc backend).
 fn run_builder(
     python: &str,
     config_path: &Path,
     work: &Path,
     log_path: &Path,
     timeout: Option<u64>,
+    builder: &str,
     backend: &str,
     fontc_bin: Option<&str>,
     builder3_bin: Option<&str>,
@@ -2668,9 +2859,6 @@ fn run_builder(
     };
     let python: &str = python_owned.as_deref().unwrap_or(python);
 
-    let mut cmd;
-    let orch;
-
     // We're going to change into the work directory and the config path is under
     // that, so we should relativize it.
     let config_path = if let Ok(rel) = config_path.strip_prefix(work) {
@@ -2679,20 +2867,10 @@ fn run_builder(
         config_path
     };
 
-    if let Some(b3) = builder3_bin {
-        cmd = Command::new(b3);
-        cmd.arg(config_path);
-        orch = "gftools-builder3";
-    } else {
-        cmd = Command::new(python);
-        cmd.args(["-m", "gftools.builder"]).arg(config_path);
-        if backend == "fontc" {
-            if let Some(fc) = fontc_bin {
-                cmd.args(["--experimental-fontc", fc]);
-            }
-        }
-        orch = "gftools.builder";
-    }
+    let (program, args) = builder_command(builder, backend, python, config_path, fontc_bin, builder3_bin);
+    let mut cmd = Command::new(&program);
+    cmd.args(&args);
+    let orch = if builder == "builder3" { "gftools-builder3" } else { "gftools.builder" };
     log_line(log_path, &format!("===== {} (backend={}) =====", orch, backend));
     // gftools.builder shells out to fontmake / ninja / gftools / ttfautohint BY NAME, so the chosen
     // interpreter's bin/ MUST be on PATH (running venv/bin/python does not by itself activate the
@@ -3106,6 +3284,76 @@ mod jobs_freeze_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every (backend × fontc × builder3 × orchestrator) combination of the attempt chain —
+    /// the "always prefer builder3, degrade gracefully" contract.
+    #[test]
+    fn attempt_chain_prefers_builder3_and_degrades() {
+        // auto/auto, everything available: the full ladder
+        assert_eq!(
+            attempt_chain("auto", "auto", true, true),
+            vec![("builder3", "fontc"), ("builder2", "fontc"), ("builder2", "fontmake")]
+        );
+        // builder3 unavailable → the pre-builder3 behavior
+        assert_eq!(
+            attempt_chain("auto", "auto", true, false),
+            vec![("builder2", "fontc"), ("builder2", "fontmake")]
+        );
+        // no fontc binary, builder3 available: builder3 needs NO fontc binary (in-process)
+        assert_eq!(
+            attempt_chain("auto", "auto", false, true),
+            vec![("builder3", "fontc"), ("builder2", "fontmake")]
+        );
+        // nothing available: fontmake-only (the guaranteed floor)
+        assert_eq!(attempt_chain("auto", "auto", false, false), vec![("builder2", "fontmake")]);
+    }
+
+    #[test]
+    fn attempt_chain_respects_explicit_backend() {
+        // --backend fontc: never rescued by fontmake
+        assert_eq!(
+            attempt_chain("fontc", "auto", true, true),
+            vec![("builder3", "fontc"), ("builder2", "fontc")]
+        );
+        assert_eq!(attempt_chain("fontc", "auto", true, false), vec![("builder2", "fontc")]);
+        assert_eq!(attempt_chain("fontc", "auto", false, true), vec![("builder3", "fontc")]);
+        // --backend fontc with no fontc anywhere: empty chain = a clear failure upstream
+        assert!(attempt_chain("fontc", "auto", false, false).is_empty());
+        // --backend fontmake: builder2 only — builder3 cannot run fontmake
+        assert_eq!(attempt_chain("fontmake", "auto", true, true), vec![("builder2", "fontmake")]);
+    }
+
+    #[test]
+    fn attempt_chain_respects_orchestrator_override() {
+        // --orchestrator builder2: builder3 fully out, even when available
+        assert_eq!(
+            attempt_chain("auto", "builder2", true, true),
+            vec![("builder2", "fontc"), ("builder2", "fontmake")]
+        );
+        // --orchestrator builder3: an explicit no-Python-fallback run
+        assert_eq!(attempt_chain("auto", "builder3", true, true), vec![("builder3", "fontc")]);
+        assert_eq!(attempt_chain("fontmake", "builder3", true, true), Vec::<(&str, &str)>::new());
+        // builder3 forced but unavailable: empty (fail loudly, don't silently use Python)
+        assert!(attempt_chain("auto", "builder3", true, false).is_empty());
+    }
+
+    #[test]
+    fn builder_command_shapes() {
+        let cfgp = Path::new("sources/config.yaml");
+        // builder3: the binary, the config, nothing else (no Python anywhere)
+        let (prog, args) = builder_command("builder3", "fontc", "/v/bin/python", cfgp, Some("/t/fontc"), Some("/t/gftools-builder"));
+        assert_eq!(prog, "/t/gftools-builder");
+        assert_eq!(args, vec!["sources/config.yaml"]);
+        // builder2 + fontc: gftools.builder with --experimental-fontc
+        let (prog, args) = builder_command("builder2", "fontc", "/v/bin/python", cfgp, Some("/t/fontc"), None);
+        assert_eq!(prog, "/v/bin/python");
+        assert_eq!(args, vec!["-m", "gftools.builder", "sources/config.yaml", "--experimental-fontc", "/t/fontc"]);
+        // builder2 + fontmake: plain gftools.builder
+        let (prog, args) = builder_command("builder2", "fontmake", "/v/bin/python", cfgp, Some("/t/fontc"), None);
+        assert_eq!(prog, "/v/bin/python");
+        assert_eq!(args, vec!["-m", "gftools.builder", "sources/config.yaml"]);
+    }
+
     #[test]
     fn mirror_path_maps_urls() {
         let ar = Path::new("/arch");

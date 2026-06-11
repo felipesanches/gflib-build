@@ -19,6 +19,7 @@ mod monitor;
 mod persist;
 mod provenance;
 mod rules;
+mod toolchain;
 mod tui;
 mod util;
 mod venv;
@@ -92,10 +93,8 @@ fn run_dry_run(cfg: config::Config) {
 }
 
 fn run_build(mut cfg: config::Config) {
-    // auto-detect fontc + a pre-existing repo archive if not present
-    if cfg.fontc_bin.is_none() {
-        cfg.fontc_bin = discover::detect_fontc();
-    }
+    // fontc/builder3 resolution happens inside the Orchestrator (toolchain.rs): explicit flag →
+    // provisioned pin → auto-provision → detected. cfg.fontc_bin stays the USER's override only.
     if !cfg.archive.is_dir() {
         if let Some(a) = discover::detect_archive(&cfg.data_dir) {
             cfg.archive = std::path::PathBuf::from(a);
@@ -151,9 +150,6 @@ fn run_build(mut cfg: config::Config) {
                 eprintln!("aborted.");
                 return;
             }
-        }
-        if cfg.fontc_bin.is_none() {
-            cfg.fontc_bin = discover::detect_fontc(); // the wizard may have cleared a stale path
         }
     }
 
