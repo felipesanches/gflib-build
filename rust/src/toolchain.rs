@@ -19,7 +19,17 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+/// Hard ceiling on one `cargo install` (a full builder3 build is minutes; a wedged network
+/// fetch must not hang the resolver forever).
+const PROVISION_DEADLINE: Duration = Duration::from_secs(30 * 60);
+/// Ceiling on a `--version` identification probe (an unknown PATH binary must not hang us).
+const PROBE_DEADLINE: Duration = Duration::from_secs(10);
+/// A provision lock older than this is presumed left by a dead process and is broken.
+const LOCK_STALE: Duration = Duration::from_secs(45 * 60);
 
 /// Pinned fontc release, installed from crates.io (`cargo install fontc --version …`); falls back
 /// to the matching git tag if the registry fetch fails. Matches the fontc embedded in the pinned
@@ -85,6 +95,18 @@ impl Toolchain {
         self.cv.notify_all();
     }
 
+    /// Force a verdict on anything still Pending — the resolver's drop-guard calls this so a
+    /// panicking resolver thread can never strand workers on the gate.
+    pub fn resolve_pending(&self, msg: &str) {
+        let mut g = self.state.lock().unwrap();
+        if matches!(g.0, ToolStatus::Pending) {
+            g.0 = ToolStatus::Unavailable(format!("fontc: {}", msg));
+        }
+        if matches!(g.1, ToolStatus::Pending) {
+            g.1 = ToolStatus::Unavailable(format!("builder3: {}", msg));
+        }
+        self.cv.notify_all();
+    }
 }
 
 fn path_of(s: &ToolStatus) -> Option<String> {
@@ -137,14 +159,45 @@ pub fn provisioned_bin(tools_root: &Path, spec: &ToolSpec) -> PathBuf {
     tools_root.join(format!("{}-{}", spec.name, spec.pin)).join("bin").join(spec.bin_name)
 }
 
+/// Run a started child to completion with a hard deadline and an optional external stop flag.
+/// Polls (no extra threads); on deadline/stop the child is killed and an Err returned. The child
+/// is plain `kill()` (SIGKILL): provisioning children are ours and disposable.
+fn wait_with_deadline(
+    child: &mut std::process::Child,
+    deadline: Duration,
+    stop: Option<&AtomicBool>,
+) -> Result<std::process::ExitStatus, String> {
+    let t0 = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Ok(st),
+            Ok(None) => {}
+            Err(e) => return Err(format!("wait: {}", e)),
+        }
+        if stop.map(|s| s.load(Ordering::Relaxed)).unwrap_or(false) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("interrupted by shutdown".into());
+        }
+        if t0.elapsed() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("timed out after {}s", deadline.as_secs()));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Resolve one tool: explicit override → cached pin → provision → detect. Pure with respect to
 /// its inputs (tools_root injectable) so tests drive it end-to-end with a fixture crate.
 /// `detect` supplies the step-4 fallback (PATH/sibling probes), run only when earlier steps miss.
+/// `stop` aborts an in-flight provision on daemon shutdown (verdict: Unavailable).
 pub fn ensure_tool(
     spec: &ToolSpec,
     explicit: Option<&str>,
     tools_root: &Path,
     auto_provision: bool,
+    stop: Option<&AtomicBool>,
     detect: impl Fn() -> Option<String>,
 ) -> ToolStatus {
     // 1. explicit flag/config — trusted as-is (the user's word beats our pin)
@@ -161,7 +214,7 @@ pub fn ensure_tool(
     }
     // 3. provision the pin
     if auto_provision {
-        match provision(spec, tools_root) {
+        match provision(spec, tools_root, stop) {
             Ok(p) => return ToolStatus::Ready { path: p.to_string_lossy().into_owned(), source: "provisioned" },
             Err(e) => {
                 // fall through to detection — a local binary is better than nothing
@@ -183,11 +236,51 @@ pub fn ensure_tool(
 }
 
 /// `cargo install` the pinned tool into its version-keyed root. Output is captured to
-/// <tools_root>/provision-<name>.log so a failure is debuggable.
-fn provision(spec: &ToolSpec, tools_root: &Path) -> Result<PathBuf, String> {
+/// <tools_root>/provision-<name>.log (truncated per session) so a failure is debuggable.
+/// A per-tool lock file serializes concurrent daemons sharing one data dir; a hard deadline +
+/// the stop flag bound the cargo child (killed on shutdown, never orphaned past the wait).
+fn provision(spec: &ToolSpec, tools_root: &Path, stop: Option<&AtomicBool>) -> Result<PathBuf, String> {
     let root = tools_root.join(format!("{}-{}", spec.name, spec.pin));
     let _ = std::fs::create_dir_all(tools_root);
     let log = tools_root.join(format!("provision-{}.log", spec.name));
+
+    // ---- per-tool lock: two daemons sharing a data dir must not cargo-install into the same
+    // root concurrently. Created O_EXCL; a stale lock (dead process) is broken by age. ----
+    let lock = tools_root.join(format!(".provision-{}.lock", spec.name));
+    let t0 = Instant::now();
+    let _lockguard = loop {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(f) => break LockGuard { path: lock.clone(), _f: f },
+            Err(_) => {
+                // someone else is provisioning: maybe they finish the job for us
+                let bin = provisioned_bin(tools_root, spec);
+                if bin.is_file() {
+                    return Ok(bin);
+                }
+                let stale = std::fs::metadata(&lock)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|a| a > LOCK_STALE)
+                    .unwrap_or(true);
+                if stale {
+                    let _ = std::fs::remove_file(&lock);
+                    continue;
+                }
+                if stop.map(|s| s.load(Ordering::Relaxed)).unwrap_or(false) {
+                    return Err(format!("{}: provisioning interrupted by shutdown", spec.name));
+                }
+                if t0.elapsed() > PROVISION_DEADLINE {
+                    return Err(format!("{}: waited too long for another provisioner (lock {})", spec.name, lock.display()));
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        }
+    };
+
+    // a truncated/partial binary from an interrupted earlier install must never be mistaken
+    // for a good one after a failed re-attempt
+    let _ = std::fs::remove_file(provisioned_bin(tools_root, spec));
 
     let attempts: Vec<Vec<String>> = match &spec.install {
         InstallSource::Registry { krate, version, git_fallback } => {
@@ -217,17 +310,23 @@ fn provision(spec: &ToolSpec, tools_root: &Path) -> Result<PathBuf, String> {
     };
 
     let mut last = String::new();
-    for args in &attempts {
-        let logf = std::fs::OpenOptions::new().create(true).append(true).open(&log)
+    for (n, args) in attempts.iter().enumerate() {
+        // fresh log per session (first attempt truncates), append across this session's fallbacks
+        let logf = std::fs::OpenOptions::new().create(true).write(true)
+            .truncate(n == 0).append(n != 0).open(&log)
             .map_err(|e| format!("{}: open provision log: {}", spec.name, e))?;
         let logf2 = logf.try_clone().map_err(|e| format!("{}: log fd: {}", spec.name, e))?;
-        let status = Command::new("cargo")
+        let mut child = Command::new("cargo")
             .args(args)
             .arg("--root").arg(&root)
             .stdout(std::process::Stdio::from(logf))
             .stderr(std::process::Stdio::from(logf2))
-            .status()
+            .spawn()
             .map_err(|e| format!("{}: could not run cargo (is cargo on PATH?): {}", spec.name, e))?;
+        let status = match wait_with_deadline(&mut child, PROVISION_DEADLINE, stop) {
+            Ok(st) => st,
+            Err(e) => return Err(format!("{}: cargo install {}", spec.name, e)),
+        };
         let bin = provisioned_bin(tools_root, spec);
         if status.success() && bin.is_file() {
             return Ok(bin);
@@ -235,6 +334,17 @@ fn provision(spec: &ToolSpec, tools_root: &Path) -> Result<PathBuf, String> {
         last = format!("{}: cargo install failed (rc={}) — see {}", spec.name, status, log.display());
     }
     Err(last)
+}
+
+/// Removes the provision lock file on every exit path (incl. panic unwind).
+struct LockGuard {
+    path: PathBuf,
+    _f: std::fs::File,
+}
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -270,14 +380,32 @@ pub fn detect_builder3() -> Option<String> {
 }
 
 /// True when `--version` output looks like builder3 (3.x), not the Python builder2 shim.
+/// Bounded by PROBE_DEADLINE — an arbitrary PATH binary must not be able to hang the resolver.
 fn is_builder3_binary(p: &Path) -> bool {
-    if let Ok(o) = Command::new(p).arg("--version").output() {
-        let txt = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-        let line = txt.lines().next().unwrap_or("");
-        // e.g. "gftools-builder 3.0.0" — accept any 3.x; reject gftools(-builder2) 0.x
-        return line.contains("gftools-builder") && line.split_whitespace().any(|w| w.starts_with('3'));
+    use std::io::Read;
+    let child = Command::new(p)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if wait_with_deadline(&mut child, PROBE_DEADLINE, None).is_err() {
+        return false; // hung or unkillable — not a usable builder3 either way
     }
-    false
+    let mut txt = String::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_string(&mut txt);
+    }
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut txt);
+    }
+    let line = txt.lines().next().unwrap_or("");
+    // e.g. "gftools-builder 3.0.0" — accept any 3.x; reject gftools(-builder2) 0.x
+    line.contains("gftools-builder") && line.split_whitespace().any(|w| w.starts_with('3'))
 }
 
 #[cfg(test)]
@@ -292,20 +420,29 @@ mod tests {
     }
 
     #[test]
+    fn builder3_bin_name_contract() {
+        // cargo install --root <root> lands the binary at <root>/bin/<[[bin]] name>; upstream's
+        // Cargo.toml declares [[bin]] name = "gftools-builder" — BUILDER3_PKG must match it.
+        let p = provisioned_bin(Path::new("/t"), &builder3_spec());
+        assert_eq!(p.file_name().and_then(|n| n.to_str()), Some("gftools-builder"));
+        assert!(p.to_string_lossy().contains(&format!("builder3-{}", &BUILDER3_REV[..10])));
+    }
+
+    #[test]
     fn explicit_flag_wins_and_must_be_executable() {
         let d = tmpdir("flag");
         let spec = fontc_spec();
         // a non-executable explicit path is an error, not a silent fallback
         let f = d.join("notabin");
         std::fs::write(&f, "x").unwrap();
-        let st = ensure_tool(&spec, Some(f.to_str().unwrap()), &d, false, || None);
+        let st = ensure_tool(&spec, Some(f.to_str().unwrap()), &d, false, None, || None);
         assert!(matches!(st, ToolStatus::Unavailable(_)));
         // an executable explicit path is taken verbatim, never re-provisioned
         let sh = d.join("fakebin");
         std::fs::write(&sh, "#!/bin/sh\nexit 0\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        match ensure_tool(&spec, Some(sh.to_str().unwrap()), &d, false, || None) {
+        match ensure_tool(&spec, Some(sh.to_str().unwrap()), &d, false, None, || None) {
             ToolStatus::Ready { source, .. } => assert_eq!(source, "flag"),
             other => panic!("expected Ready, got {:?}", other),
         }
@@ -319,7 +456,7 @@ mod tests {
         std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
         std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
         // detection would return a decoy — the cached pin must win without calling provision
-        match ensure_tool(&spec, None, &d, false, || Some("/decoy/builder".into())) {
+        match ensure_tool(&spec, None, &d, false, None, || Some("/decoy/builder".into())) {
             ToolStatus::Ready { path, source } => {
                 assert_eq!(source, "provisioned");
                 assert!(path.ends_with(&format!("builder3-{}/bin/{}", spec.pin, BUILDER3_PKG)));
@@ -332,7 +469,7 @@ mod tests {
     fn detection_is_the_fallback_when_provisioning_disabled() {
         let d = tmpdir("detect");
         let spec = fontc_spec();
-        match ensure_tool(&spec, None, &d, false, || Some("/detected/fontc".into())) {
+        match ensure_tool(&spec, None, &d, false, None, || Some("/detected/fontc".into())) {
             ToolStatus::Ready { path, source } => {
                 assert_eq!(source, "detected");
                 assert_eq!(path, "/detected/fontc");
@@ -340,7 +477,7 @@ mod tests {
             other => panic!("expected detected Ready, got {:?}", other),
         }
         // nothing detected either → Unavailable with an actionable message
-        match ensure_tool(&spec, None, &d, false, || None) {
+        match ensure_tool(&spec, None, &d, false, None, || None) {
             ToolStatus::Unavailable(msg) => assert!(msg.contains("auto-provisioning is disabled")),
             other => panic!("expected Unavailable, got {:?}", other),
         }
@@ -382,13 +519,13 @@ mod tests {
             install: InstallSource::Git { url: format!("file://{}", src.display()), rev, package: "gflib-fixture-tool" },
         };
         let tools = d.join("tools");
-        match ensure_tool(&spec, None, &tools, true, || None) {
+        match ensure_tool(&spec, None, &tools, true, None, || None) {
             ToolStatus::Ready { path, source } => {
                 assert_eq!(source, "provisioned");
                 let out = Command::new(&path).output().unwrap();
                 assert!(String::from_utf8_lossy(&out.stdout).contains("gflib-fixture-tool"));
                 // second resolution must hit the cache (no re-install)
-                match ensure_tool(&spec, None, &tools, false, || None) {
+                match ensure_tool(&spec, None, &tools, false, None, || None) {
                     ToolStatus::Ready { source, .. } => assert_eq!(source, "provisioned"),
                     other => panic!("cache miss: {:?}", other),
                 }

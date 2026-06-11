@@ -478,6 +478,15 @@ impl Orchestrator {
         use crate::toolchain as tc;
         let me = Arc::clone(self);
         thread::spawn(move || {
+            // drop-guard: if this thread unwinds (or returns early), anything still Pending gets
+            // an Unavailable verdict — workers waiting on the gate are NEVER stranded.
+            struct Guard(Arc<tc::Toolchain>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.resolve_pending("resolver aborted");
+                }
+            }
+            let _guard = Guard(Arc::clone(&me.toolchain));
             // a persisted-but-stale explicit path must not hard-fail the tool: soften it to None so
             // the pin engages (the control log explains). A LIVE explicit path is honored verbatim.
             let soften = |bin: &Option<String>, name: &str, me: &Arc<Orchestrator>| -> Option<String> {
@@ -495,7 +504,7 @@ impl Orchestrator {
             let explicit_fc = soften(&me.cfg.fontc_bin, "fontc", &me);
             let fc = tc::ensure_tool(
                 &tc::fontc_spec(), explicit_fc.as_deref(), &tools_root, me.cfg.auto_provision,
-                crate::discover::detect_fontc,
+                Some(&me.stop), crate::discover::detect_fontc,
             );
             me.log_tool_verdict("fontc", &fc);
             me.toolchain.set_fontc(fc);
@@ -507,7 +516,7 @@ impl Orchestrator {
                 let explicit_b3 = soften(&me.cfg.builder3_bin, "builder3", &me);
                 tc::ensure_tool(
                     &tc::builder3_spec(), explicit_b3.as_deref(), &tools_root, me.cfg.auto_provision,
-                    tc::detect_builder3,
+                    Some(&me.stop), tc::detect_builder3,
                 )
             };
             me.log_tool_verdict("builder3", &b3);
@@ -843,7 +852,9 @@ impl Orchestrator {
 
     /// Cached exact compiler version (run once per backend/venv — the cohort python matters because
     /// different cohorts can carry different fontmake/gftools versions). `fontc_bin` is the
-    /// toolchain-resolved binary (explicit / provisioned pin / detected).
+    /// toolchain-resolved binary (explicit / provisioned pin / detected). The cache key omits the
+    /// binary path: the toolchain resolves ONCE per run, so every attempt in a run sees the same
+    /// binaries — revisit if per-attempt binaries ever become a thing.
     fn compiler_version(&self, backend: &str, python: &str, fontc_bin: Option<&str>) -> String {
         let key = (backend.to_string(), python.to_string());
         {
@@ -2880,6 +2891,8 @@ fn run_builder(
     // interpreter's bin/ MUST be on PATH (running venv/bin/python does not by itself activate the
     // venv). Use the venv bin = the python's parent dir WITHOUT resolving symlinks (canonicalize would
     // follow venv/bin/python → the system /usr/bin and miss fontmake). python is absolute (resolved above).
+    // This applies to builder3 children too, deliberately: harmless when builder3 needs nothing from
+    // the venv, and correct if it ever shells out to a tool by name (e.g. ttfautohint).
     let bindir = {
         let p = Path::new(python);
         if p.is_absolute() { p.parent().map(|d| d.to_path_buf()) } else { None }

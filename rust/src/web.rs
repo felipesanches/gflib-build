@@ -566,7 +566,7 @@ function craterView(){const cv=snap.crater;
 function showIf(k,cf){const s=x=>(cf[x]==null?'':''+cf[x]);
  if(k=='google_fonts')return s('source')=='metadata';
  if(k=='fontc_bin')return s('backend')!='fontmake';
- if(k=='build_fontc')return s('backend')!='fontmake'&&!s('fontc_bin');
+ if(k=='auto_provision')return !s('fontc_bin');
  if(k=='compare')return s('source')=='metadata';
  return true}
 const CHOICES={source:['metadata','archive'],backend:['auto','fontc','fontmake','both'],orchestrator:['auto','builder3','builder2']};
@@ -575,7 +575,7 @@ const LIVE_APPLY={backend:1,jobs:1,percent:1,compare:1,build_debs:1};
 // logical groupings for the config panel (related settings under one sub-header)
 const GROUPS=[
  {t:'Sources & paths', k:['source','google_fonts','archive','build_dir']},
- {t:'Build engine',    k:['backend','fontc_bin','build_fontc','manage_venvs','jobs','timeout']},
+ {t:'Build engine',    k:['backend','orchestrator','fontc_bin','auto_provision','manage_venvs','jobs','timeout']},
  {t:'Scope',           k:['percent','retry_failed','populate_archive']},
  {t:'QA & packaging',  k:['compare','fontspector_qa','build_debs']},
 ];
