@@ -125,13 +125,39 @@ dirs and compares them — the fontc_crater-style equivalence check.
    relative to its own directory;
 3. otherwise an **auto-discovered** `sources/config.yaml` (etc.) is tried.
 
-### Build backends (`run_builder`)
+### Build backends — the attempt chain (`attempt_chain`, `run_builder`)
 
-When `--builder3-bin` is given, `run_builder` invokes the Rust-native `builder3` binary directly (no
-Python). Otherwise it runs `python -m gftools.builder <config>` with `SOURCE_DATE_EPOCH=0`, the
-interpreter's `bin/` prepended to `PATH` (gftools.builder shells out to `fontmake`/`ninja`/
-`ttfautohint` by name), and `--experimental-fontc <bin>` for the fontc backend. Each child runs in
-its **own process group** so a freeze/kill reaches the whole `python → fontmake → ninja` tree.
+Each family runs an **(orchestrator, compiler) attempt chain**, built by the pure
+`attempt_chain()` from the backend setting and which tools resolved. For `--backend auto` (the
+default) it is:
+
+1. **`builder3` + fontc** — the Rust-native `gftools-builder3` binary, invoked directly (zero
+   Python; it embeds fontc as a library, so it needs no fontc binary and can never run fontmake);
+2. **`builder2` + fontc** — `python -m gftools.builder <config> --experimental-fontc <bin>`;
+3. **`builder2` + fontmake** — plain `python -m gftools.builder <config>`.
+
+Every pair is the graceful fallback for the one before it; a family is counted toward the M5
+(Python-free) milestone only when attempt 1 succeeded. `--orchestrator builder3|builder2` forces
+one orchestrator (builder3 = an explicit no-Python-fallback run); `--backend both` compares the
+two compilers under builder2 on both sides, isolating the compiler axis. `Res.builder` /
+`builder_version` record the attempt that actually ran, per family, success or failure.
+
+builder2 children run with `SOURCE_DATE_EPOCH=0` and the interpreter's `bin/` prepended to `PATH`
+(gftools.builder shells out to `fontmake`/`ninja`/`ttfautohint` by name). Each child runs in its
+**own process group** so a freeze/kill reaches the whole `python → fontmake → ninja` tree.
+
+### The zero-setup toolchain (`toolchain.rs`)
+
+`fontc` and `gftools-builder3` are **guaranteed available with no user setup**. Neither can be a
+Cargo dependency (fontc is binary-only; builder3 has git dependencies and is unpublishable), so
+the tool provisions **pinned releases** itself: resolution per tool is explicit flag → the
+provisioned pin under `<data-dir>/tools/<name>-<pin>/` → `cargo install` the pin (fontc from
+crates.io, builder3 via `--git --rev --locked`) → a detected binary (PATH / sibling checkouts) as
+the last resort, so a stale local build never silently shadows the pin. A resolver thread fills a
+ready-gate at orchestrator start; workers wait on it (`Res.note = "waiting for toolchain"`), the
+provisioning shows up as pipeline tasks, and a tool that fails to provision is simply marked
+unavailable — the attempt chain degrades past it and the run continues. Pins are consts in
+`toolchain.rs`; bumping them re-provisions into a new version-keyed directory on the next run.
 
 ## Live config (the control channel)
 

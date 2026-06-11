@@ -55,20 +55,24 @@ the tool.
 
 ## Option C — a build backend
 
-Backends are run by the `Orchestrator` in `build.rs` (`run_backend_into` and the backend-ordering
-logic). Today: `fontc` (Rust), `fontmake` (Python), `both` (build each and compare), and the Rust
-`builder3` orchestrator, selected by `--backend {auto,fontc,fontmake,both}`. To add one (e.g. a new
-fully-native Rust builder):
+Each family runs an **(orchestrator, compiler) attempt chain** — `attempt_chain()` in `build.rs`
+(pure, fully unit-tested) builds it from `--backend {auto,fontc,fontmake,both}` and
+`--orchestrator {auto,builder3,builder2}`; `builder_command()` turns each pair into an argv and
+`run_builder()` executes it. Today's ladder for auto/auto: `builder3`+fontc →
+`builder2`+fontc → `builder2`+fontmake. To add a backend or orchestrator:
 
-1. Assemble its command line in `build.rs` (alongside the existing backends).
-2. Put it in the backend order — e.g. first in the `auto` chain so it's tried before the fallbacks.
-3. Add the name to the `--backend` field comment in `config.rs` **and** to the `--backend` line in
-   the help text (`print_help` in `main.rs`), so the documented choices stay in sync.
+1. Add its argv shape to `builder_command()` and its place in `attempt_chain()` — e.g. first in
+   the `auto` chain so it's tried before the fallbacks (and extend the `attempt_chain` unit tests
+   with the new combinations).
+2. If it needs a binary, give it a `ToolSpec` in `toolchain.rs` so it is auto-provisioned and
+   resolves through the same ready-gate (zero user setup, pinned, recorded in provenance).
+3. Add the name to the field comments in `config.rs` **and** to the help text (`print_help` in
+   `main.rs`), so the documented choices stay in sync.
 
-The per-family `backend` field and the `backends` snapshot counter then track it automatically —
-that record is the **Rust-migration metric** (M2–M4). Because the loop does a **fresh extraction per
-backend attempt**, adding a preferred backend that falls back to the existing ones is safe and
-"from scratch".
+The per-family `backend`/`builder` fields and the `backends`/`builders` snapshot counters then
+track it automatically — that record is the **Rust-migration metric** (M2–M5). Because the loop
+does a **fresh extraction per attempt**, adding a preferred backend that falls back to the
+existing ones is safe and "from scratch".
 
 ## Testing locally
 

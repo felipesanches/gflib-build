@@ -1,6 +1,6 @@
 # gflib-build
 
-**Build the entire Google Fonts library from source, on your own machine — fontc-first, with a live dashboard.**
+**Build the entire Google Fonts library from source, on your own machine — Rust-first, with a live dashboard.**
 
 > ⚠️ **Experimental — a very early prototype.** This is research tooling under active
 > development. Flags, the on-disk schema, and behavior can change without notice, and many
@@ -48,8 +48,12 @@ See [`docs/migration-milestones.md`](docs/migration-milestones.md) for the full 
   dashboard (`--ui web`), both rendered from the same live snapshot.
 - **Detach & resume** — builds run in a background daemon; quit the dashboard and the build keeps
   going; re-run to reattach. State is resumable across restarts.
-- **fontc-first** — `--backend auto` tries the Rust compiler first and falls back to `fontmake`,
-  recording which backend built each family (the migration metric).
+- **Rust-first, graceful fallback** — every family is attempted with the Rust-native
+  [`gftools-builder3`](https://github.com/simoncozens/gftools-builder3) first (zero Python in the
+  loop), then `gftools-builder` + `fontc`, then `fontmake` — recording which orchestrator and
+  compiler built each family (the migration metric).
+- **Zero-setup toolchain** — pinned `fontc` and `gftools-builder3` releases are auto-installed
+  (one-time `cargo install` into `<data-dir>/tools/`) when not found; no flags, no manual setup.
 - **Dependency cohorts** — families that share an identical pinned dependency set share one virtual
   environment, instead of one venv per family or one giant venv.
 - **Multi-Python ladder** — `--pythons` falls back to an older interpreter (keeping the exact pins)
@@ -84,9 +88,12 @@ To actually **build fonts** you also need, at runtime:
 - `git` and `python3` on your `PATH` (the tool creates cohort virtualenvs and installs pinned
   build deps into them automatically);
 - a **worklist source** — either a [`google/fonts`](https://github.com/google/fonts) clone
-  (`--source metadata`, the default) or a *repo archive* of bare mirrors (`--source archive`);
-- **optionally** a [`fontc`](https://github.com/googlefonts/fontc) binary (and `gftools-builder3`)
-  for the Rust backend — without them the tool uses `fontmake`.
+  (`--source metadata`, the default) or a *repo archive* of bare mirrors (`--source archive`).
+
+The Rust toolchain (`fontc` and `gftools-builder3`) needs **no setup**: pinned releases are
+auto-installed on first run (a one-time `cargo install` into `<data-dir>/tools/`, visible as
+pipeline tasks). `--fontc-bin`/`--builder3-bin` override with your own binaries;
+`--no-toolchain-provision` disables the auto-install.
 
 ## Quick start
 
@@ -148,9 +155,13 @@ gflib-data/           local data + build output (git-ignored; created on first r
 - **One daemon per build dir.** Re-running while a daemon already owns the build dir attaches a
   monitor instead of starting a new build; `--stop` first if you really want to restart. A daemon
   that was killed uncleanly can leave a stale lock.
-- **"fontc-first" replaces the *compiler*, not the whole pipeline.** Even the fontc path is currently
-  orchestrated by Python `gftools.builder`. A truly Python-free build is a milestone (M5/M7), **not**
-  the current reality.
+- **"Rust-first" is per-family, not absolute.** A family is Python-free only when the
+  `gftools-builder3` attempt succeeds; families it can't build yet fall back to the Python
+  `gftools.builder` (with `fontc`, then `fontmake`). The stats tab's `builder3(M5)` count is the
+  honest measure — a full Python-free build is a milestone (M5/M7), **not** the current reality.
+- **First-run toolchain provisioning takes minutes.** Installing the pinned `gftools-builder3`
+  compiles a ~700-crate dependency tree (and `fontc` similarly) — a one-time cost, shown live as
+  pipeline tasks; later runs reuse the cached installs under `<data-dir>/tools/`.
 - **Output is not guaranteed identical to shipped fonts.** The tool *measures* and records what
   built each family; byte-for-byte equivalence to the shipped/fontmake binaries is a goal (M3),
   not a promise.
