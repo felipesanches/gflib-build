@@ -386,6 +386,14 @@ function resetView(){
  let h='<div class="sec">Reset — delete a portion of the build system  <span class="muted">(archive & results are never touched · refused while builds are in flight)</span></div>';
  if(!ps.length)return h+'<div class="ln muted">(sizes are being measured — they refresh every ~30 s)</div>';
  h+=ps.map(p=>{
+  if(p.deleting){
+   // live deletion: a progress bar + the remaining bytes counting down to zero
+   const tot=p.bytes||1,fr=Math.min(p.freed||0,tot),pct=Math.floor(100*fr/tot),rem=tot-fr;
+   return '<div class="ln"><button class="btn" disabled>deleting…</button>  <b>'+E(p.label)+'</b>  '+
+    '<span class="y">'+human(rem)+' remaining</span>'+
+    '<div class="barwrap" style="max-width:46em"><div class="seg rg" style="width:'+pct+'%"></div><div class="seg dg" style="width:'+(100-pct)+'%"></div>'+
+    '<div class="barlbl">'+human(fr)+' / '+human(tot)+' deleted ('+pct+'%)</div></div></div>';
+  }
   const dis=p.bytes==0;
   return '<div class="ln"><button class="btn" '+(dis?'disabled':'')+' onclick="resetPortion(\''+p.key+'\',\''+E(p.label)+'\','+p.bytes+')">delete</button>  '+
    '<b>'+E(p.label)+'</b>  <span class="'+(dis?'muted':'y')+'">'+human(p.bytes)+'</span><br><span class="muted" style="margin-left:5.5em">'+E(p.hint)+'</span></div>';

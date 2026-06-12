@@ -971,6 +971,19 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
             // granular system reset: one row per deletable portion, with its live on-disk size.
             // ENTER explains what a deletion does; D inside the overlay confirms it.
             let rows = snap.reset_portions.iter().map(|p| {
+                if p.deleting {
+                    // live deletion: textual progress bar + the remaining bytes counting down
+                    let tot = p.bytes.max(1);
+                    let fr = p.freed.min(tot);
+                    let pct = (fr * 100 / tot) as usize;
+                    let fill = pct * 24 / 100;
+                    let bar: String = (0..24).map(|i| if i < fill { '#' } else { '-' }).collect();
+                    return vec![
+                        (format!("{:<44} ", head(&p.label, 44)), Color::White),
+                        (format!("[{}] {:>3}%  ", bar, pct), Color::Red),
+                        (format!("{} remaining", crate::util::human(tot - fr)), Color::Yellow),
+                    ];
+                }
                 vec![
                     (format!("{:<44} ", head(&p.label, 44)), Color::White),
                     (format!("{:>10}  ", crate::util::human(p.bytes)), if p.bytes > 0 { Color::Yellow } else { Color::DarkGrey }),

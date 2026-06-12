@@ -92,7 +92,8 @@ pub struct Shared {
     pub cohort_members: BTreeMap<String, Vec<String>>,
     pub cohort_reqs: BTreeMap<String, String>,
     pub cached_cohorts: HashSet<String>,
-    pub reset_portions: Vec<crate::model::ResetPortion>, // reset-tab portions + live sizes // cohorts with a venv on disk (off-thread; for the 'cached' flag)
+    pub reset_portions: Vec<crate::model::ResetPortion>, // reset-tab portions + live sizes
+    pub reset_progress: BTreeMap<String, (u64, u64)>, // in-flight deletions: key -> (freed, total) // cohorts with a venv on disk (off-thread; for the 'cached' flag)
     pub op_stats: HashMap<String, (f64, usize, f64)>, // op -> (total_secs, count, max) for timings.json
 }
 
@@ -413,6 +414,7 @@ impl Orchestrator {
             cohort_reqs: state.cohort_reqs,
             cached_cohorts: HashSet::new(),
             reset_portions: Vec::new(),
+            reset_progress: BTreeMap::new(),
             op_stats: HashMap::new(),
         };
         let venvs = if cfg.manage_venvs {
@@ -1621,7 +1623,7 @@ impl Orchestrator {
             }
         }
         let p = |key: &str, label: &str, bytes: u64, hint: &str| ResetPortion {
-            key: key.into(), label: label.into(), bytes, hint: hint.into(),
+            key: key.into(), label: label.into(), bytes, hint: hint.into(), ..Default::default()
         };
         vec![
             p("fonts-fontc", "font binaries built by fontc", fontc_bytes,
@@ -1662,43 +1664,73 @@ impl Orchestrator {
                 }
             }
             let bd = me.cfg.build_dir.clone();
-            let freed: u64 = match key.as_str() {
-                "fonts-fontc" | "fonts-fontmake" => {
-                    let compiler = key.trim_start_matches("fonts-");
-                    let targets: Vec<(String, String)> = {
-                        let sh = me.shared.lock().unwrap();
-                        sh.results.values().filter(|r| r.status == "built")
-                            .map(|r| (slug_to_logname(&r.slug), r.backend.clone())).collect()
-                    };
-                    delete_built_fonts(&bd.join("out"), &targets, compiler)
-                }
-                "variants" => remove_measured(&bd.join("variants")),
-                "debs" => {
-                    let n = remove_measured(&bd.join("packaging"));
-                    me.shared.lock().unwrap().packaged.clear();
-                    n
-                }
-                "venvs" => {
-                    let n = remove_measured(&bd.join("venvs"));
-                    me.shared.lock().unwrap().cached_cohorts.clear();
-                    n
-                }
-                "pip-cache" => remove_measured(&bd.join("pip-cache")),
-                "logs" => remove_measured(&bd.join("logs")),
-                "work" => remove_measured(&bd.join("work")),
-                "fontspector" => remove_measured(&bd.join("fontspector")),
-                "tools" => remove_measured(&me.cfg.data_dir.join("tools")),
+            // resolve the portion's target tree(s) + measure the total UP FRONT, so the progress
+            // bar has a stable denominator from the very first poll
+            let fonts_targets: Option<Vec<(String, String)>> = if key.starts_with("fonts-") {
+                let sh = me.shared.lock().unwrap();
+                Some(sh.results.values().filter(|r| r.status == "built")
+                    .map(|r| (slug_to_logname(&r.slug), r.backend.clone())).collect())
+            } else {
+                None
+            };
+            let dir: Option<PathBuf> = match key.as_str() {
+                "variants" => Some(bd.join("variants")),
+                "debs" => Some(bd.join("packaging")),
+                "venvs" => Some(bd.join("venvs")),
+                "pip-cache" => Some(bd.join("pip-cache")),
+                "logs" => Some(bd.join("logs")),
+                "work" => Some(bd.join("work")),
+                "fontspector" => Some(bd.join("fontspector")),
+                "tools" => Some(me.cfg.data_dir.join("tools")),
+                "fonts-fontc" | "fonts-fontmake" => None,
                 other => {
                     me.shared.lock().unwrap().control_log.push(format!("reset: unknown portion '{}'", other));
                     return;
                 }
             };
+            let compiler = key.trim_start_matches("fonts-").to_string();
+            let total: u64 = match (&dir, &fonts_targets) {
+                (Some(d), _) => dir_size(d),
+                (None, Some(t)) => t.iter().map(|(l, b)| match b.as_str() {
+                    x if x == compiler => dir_size(&bd.join("out").join(l)),
+                    "both" => dir_size(&bd.join("out").join(l).join(&compiler)),
+                    _ => 0,
+                }).sum(),
+                _ => 0,
+            };
+            me.shared.lock().unwrap().reset_progress.insert(key.clone(), (0, total));
+
+            // publish freed-bytes at most ~5×/s — the status writer snapshots every ~1 s anyway
+            let mut last_pub = std::time::Instant::now();
+            let me2 = Arc::clone(&me);
+            let k2 = key.clone();
+            let mut publish = move |freed: u64| {
+                if last_pub.elapsed() >= Duration::from_millis(200) {
+                    last_pub = std::time::Instant::now();
+                    me2.shared.lock().unwrap().reset_progress.insert(k2.clone(), (freed, total));
+                }
+            };
+
+            let mut freed = 0u64;
+            match (&dir, &fonts_targets) {
+                (Some(d), _) => remove_tree_progress(d, &mut freed, &mut publish),
+                (None, Some(t)) => {
+                    freed = delete_built_fonts(&bd.join("out"), t, &compiler, &mut publish);
+                }
+                _ => {}
+            }
+            match key.as_str() {
+                "debs" => me.shared.lock().unwrap().packaged.clear(),
+                "venvs" => me.shared.lock().unwrap().cached_cohorts.clear(),
+                _ => {}
+            }
             // logs/ is needed by every build — recreate the empty dir immediately
             if key == "logs" {
                 let _ = std::fs::create_dir_all(bd.join("logs"));
             }
             let portions = me.compute_reset_portions();
             let mut sh = me.shared.lock().unwrap();
+            sh.reset_progress.remove(&key);
             sh.reset_portions = portions;
             sh.control_log.push(format!("reset {}: freed {}", key, crate::util::human(freed)));
         });
@@ -2741,7 +2773,17 @@ impl Orchestrator {
                 .into_iter()
                 .collect(),
             tasks: self.toolchain_tasks(),
-            reset_portions: sh.reset_portions.clone(),
+            reset_portions: {
+                let mut ps = sh.reset_portions.clone();
+                for p in ps.iter_mut() {
+                    if let Some((freed, total)) = sh.reset_progress.get(&p.key) {
+                        p.deleting = true;
+                        p.freed = *freed;
+                        p.bytes = *total; // freeze the bar's denominator for the whole deletion
+                    }
+                }
+                ps
+            },
             archive_recent: Vec::new(),
             archive,
             config: {
@@ -3089,23 +3131,37 @@ fn stash_variant_outputs(build_dir: &Path, out_dir: &Path, logname: &str, prior:
     if moved { Some(dest) } else { None }
 }
 
-/// Measure then remove a directory tree; returns the bytes freed (0 if absent).
-fn remove_measured(dir: &Path) -> u64 {
-    let n = dir_size(dir);
-    let _ = std::fs::remove_dir_all(dir);
-    n
+/// Remove a tree file-by-file, accumulating freed bytes into `freed` and reporting after every
+/// file via `cb` (the caller throttles publication) — so the reset tab's progress bar moves while
+/// a multi-GB portion (venvs!) is being deleted, instead of jumping 100% at the end.
+fn remove_tree_progress(dir: &Path, freed: &mut u64, cb: &mut dyn FnMut(u64)) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                remove_tree_progress(&p, freed, cb);
+            } else {
+                if let Ok(m) = e.metadata() {
+                    *freed += m.len();
+                }
+                let _ = std::fs::remove_file(&p);
+                cb(*freed);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
 }
 
 /// Reset-tab: delete the built fonts of every family whose COMPILER matches (`fontc`/`fontmake`).
 /// A plain family's whole out/<slug> goes; a both-mode family loses only the matching compiler's
 /// subdir. Returns bytes freed. Results/state are deliberately untouched (same as --discard-fonts).
-fn delete_built_fonts(out_root: &Path, built: &[(String, String)], compiler: &str) -> u64 {
+fn delete_built_fonts(out_root: &Path, built: &[(String, String)], compiler: &str, cb: &mut dyn FnMut(u64)) -> u64 {
     let mut freed = 0u64;
     for (logname, backend) in built {
         if backend == compiler {
-            freed += remove_measured(&out_root.join(logname));
+            remove_tree_progress(&out_root.join(logname), &mut freed, cb);
         } else if backend == "both" {
-            freed += remove_measured(&out_root.join(logname).join(compiler));
+            remove_tree_progress(&out_root.join(logname).join(compiler), &mut freed, cb);
         }
     }
     freed
@@ -3803,8 +3859,13 @@ mod tests {
             ("ofl__b".to_string(), "fontmake".to_string()),
             ("ofl__c".to_string(), "both".to_string()),
         ];
-        let freed = delete_built_fonts(&out, &built, "fontc");
+        let mut seen: Vec<u64> = Vec::new();
+        let freed = delete_built_fonts(&out, &built, "fontc", &mut |f| seen.push(f));
         assert!(freed > 0);
+        // the progress callback fired with monotonically growing freed-bytes
+        assert!(!seen.is_empty());
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(*seen.last().unwrap(), freed);
         assert!(!out.join("ofl__a").exists(), "fontc-built family deleted");
         assert!(out.join("ofl__b/B.ttf").is_file(), "fontmake-built family untouched");
         assert!(!out.join("ofl__c/fontc").exists(), "both-mode fontc subdir deleted");

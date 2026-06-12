@@ -251,8 +251,11 @@ pub struct ArchiveView {
 pub struct ResetPortion {
     #[serde(default)] pub key: String,   // control verb value (reset_portion)
     #[serde(default)] pub label: String,
-    #[serde(default)] pub bytes: u64,    // current on-disk size (0 = nothing to delete)
+    #[serde(default)] pub bytes: u64,    // current on-disk size (0 = nothing to delete);
+                                         // while deleting: the frozen total the bar runs against
     #[serde(default)] pub hint: String,  // what deleting does / what survives
+    #[serde(default)] pub deleting: bool, // a deletion is in flight — UIs render the progress bar
+    #[serde(default)] pub freed: u64,    // bytes freed so far (live while deleting)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
