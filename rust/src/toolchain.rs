@@ -123,6 +123,10 @@ pub struct ToolSpec {
     pub bin_name: &'static str,     // the installed binary's file name
     pub pin: String,                // version or short rev — keys the install dir
     pub install: InstallSource,
+    /// Empirical minimum rustc the pin compiles with (from its lockfile). Checked BEFORE the
+    /// install so an old toolchain fails in milliseconds with "run rustup update", not after
+    /// minutes of compilation with the cause buried in a 200-line cargo log.
+    pub min_rustc: Option<&'static str>,
 }
 
 pub enum InstallSource {
@@ -142,6 +146,7 @@ pub fn fontc_spec() -> ToolSpec {
             version: FONTC_VERSION.into(),
             git_fallback: Some((FONTC_GIT.into(), format!("fontc-v{}", FONTC_VERSION))),
         },
+        min_rustc: None, // fontc 0.6.0 verified building on rustc 1.91
     }
 }
 
@@ -151,6 +156,9 @@ pub fn builder3_spec() -> ToolSpec {
         bin_name: BUILDER3_PKG,
         pin: BUILDER3_REV[..10.min(BUILDER3_REV.len())].into(),
         install: InstallSource::Git { url: BUILDER3_GIT.into(), rev: BUILDER3_REV.into(), package: BUILDER3_PKG },
+        // the cf74f20 lockfile pins ascii-dag 0.4.2, whose rust-version is 1.92 (verified
+        // empirically: rustc 1.91.1 fails the install). Re-derive when bumping BUILDER3_REV.
+        min_rustc: Some("1.92"),
     }
 }
 
@@ -160,11 +168,39 @@ pub fn provisioned_bin(tools_root: &Path, spec: &ToolSpec) -> PathBuf {
 }
 
 /// The toolchain signature stamped on every completed build attempt (Res.upgrade_attempted): the
-/// pins + the orchestrator preference — exactly the inputs that change what the attempt chain can
-/// reach. A built family below the top rung is automatically re-attempted ("upgrade") whenever its
-/// stamp differs, i.e. once per pin bump / preference change, never repeatedly.
-pub fn pins_sig(orchestrator: &str) -> String {
-    format!("builder3:{}+fontc:{}|{}", &BUILDER3_REV[..10], FONTC_VERSION, orchestrator)
+/// pins + the orchestrator preference + which tools were actually AVAILABLE for the attempt.
+/// Availability is part of the signature on purpose: a family built during a degraded run (e.g.
+/// builder3 provisioning failed on an old rustc) re-arms for its upgrade automatically once the
+/// tool becomes available — without it, the degraded stamp would suppress the upgrade forever.
+pub fn run_sig(orchestrator: &str, have_fontc: bool, have_builder3: bool) -> String {
+    format!(
+        "builder3:{}+fontc:{}|{}|b3={}|fc={}",
+        &BUILDER3_REV[..10], FONTC_VERSION, orchestrator,
+        if have_builder3 { "ok" } else { "no" },
+        if have_fontc { "ok" } else { "no" },
+    )
+}
+
+/// `rustc --version` → e.g. (1, 91). None when rustc can't be probed (cargo install will then
+/// surface its own error).
+fn rustc_minor() -> Option<(u32, u32)> {
+    let out = Command::new("rustc").arg("--version").output().ok()?;
+    let txt = String::from_utf8_lossy(&out.stdout);
+    parse_rustc_minor(&txt)
+}
+
+fn parse_rustc_minor(version_line: &str) -> Option<(u32, u32)> {
+    // "rustc 1.91.1 (abcdef 2026-01-01)" → (1, 91)
+    let ver = version_line.split_whitespace().nth(1)?;
+    let mut it = ver.split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+fn meets_min_rustc(have: (u32, u32), min: &str) -> bool {
+    let req = parse_rustc_minor(&format!("rustc {}", min)).unwrap_or((0, 0));
+    have >= req
 }
 
 /// Run a started child to completion with a hard deadline and an optional external stop flag.
@@ -248,6 +284,17 @@ pub fn ensure_tool(
 /// A per-tool lock file serializes concurrent daemons sharing one data dir; a hard deadline +
 /// the stop flag bound the cargo child (killed on shutdown, never orphaned past the wait).
 fn provision(spec: &ToolSpec, tools_root: &Path, stop: Option<&AtomicBool>) -> Result<PathBuf, String> {
+    // MSRV preflight: fail in milliseconds with the remedy, not after minutes of compilation
+    if let Some(min) = spec.min_rustc {
+        if let Some(have) = rustc_minor() {
+            if !meets_min_rustc(have, min) {
+                return Err(format!(
+                    "{}: the pinned build needs rustc >= {} but this machine has {}.{} — run `rustup update`, then restart the build to retry provisioning",
+                    spec.name, min, have.0, have.1
+                ));
+            }
+        }
+    }
     let root = tools_root.join(format!("{}-{}", spec.name, spec.pin));
     let _ = std::fs::create_dir_all(tools_root);
     let log = tools_root.join(format!("provision-{}.log", spec.name));
@@ -428,6 +475,20 @@ mod tests {
     }
 
     #[test]
+    fn rustc_msrv_parsing_and_comparison() {
+        assert_eq!(parse_rustc_minor("rustc 1.91.1 (abc 2026-01-01)"), Some((1, 91)));
+        assert_eq!(parse_rustc_minor("rustc 1.92.0"), Some((1, 92)));
+        assert_eq!(parse_rustc_minor("garbage"), None);
+        // the exact failure observed in the field: 1.91 vs builder3's lockfile needing 1.92
+        assert!(!meets_min_rustc((1, 91), "1.92"));
+        assert!(meets_min_rustc((1, 92), "1.92"));
+        assert!(meets_min_rustc((1, 93), "1.92"));
+        assert!(meets_min_rustc((2, 0), "1.92"));
+        // an unparsable min never blocks (fails open to cargo's own error)
+        assert!(meets_min_rustc((1, 0), "bogus"));
+    }
+
+    #[test]
     fn builder3_bin_name_contract() {
         // cargo install --root <root> lands the binary at <root>/bin/<[[bin]] name>; upstream's
         // Cargo.toml declares [[bin]] name = "gftools-builder" — BUILDER3_PKG must match it.
@@ -525,6 +586,7 @@ mod tests {
             bin_name: "gflib-fixture-tool",
             pin: rev[..10].into(),
             install: InstallSource::Git { url: format!("file://{}", src.display()), rev, package: "gflib-fixture-tool" },
+            min_rustc: None,
         };
         let tools = d.join("tools");
         match ensure_tool(&spec, None, &tools, true, None, || None) {

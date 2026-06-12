@@ -311,12 +311,18 @@ impl Orchestrator {
                     // builder2) is re-attempted at the better rungs — automatically, exactly once
                     // per toolchain signature (pins + orchestrator). The prior result is restored
                     // if the upgrade fails, so this never costs an existing success.
+                    // compare against the FULLY-CAPABLE signature: tool availability isn't known
+                    // yet (the resolver runs at start()), so enqueue optimistically — build_one
+                    // no-ops cheaply (quick restore, no extraction) when the actual capabilities
+                    // turn out to match what this result was already attempted under.
+                    let full_sig = crate::toolchain::run_sig(
+                        &cfg.orchestrator, true, cfg.orchestrator != "builder2");
                     let upgradable = cfg.auto_upgrade
                         && cfg.backend != "fontmake"
                         && cfg.backend != "both"
                         && p.backend != "both"
                         && result_rung(&p.builder, &p.backend) < 2
-                        && p.upgrade_attempted != crate::toolchain::pins_sig(&cfg.orchestrator);
+                        && p.upgrade_attempted != full_sig;
                     if upgradable {
                         ("queued", "upgrade")
                     } else {
@@ -1257,10 +1263,20 @@ impl Orchestrator {
             return;
         }
 
-        let tc_sig = crate::toolchain::pins_sig(&self.cfg.orchestrator);
+        // the stamp records what was actually REACHABLE for this attempt (pins + availability),
+        // so a result produced during a degraded run re-arms once the missing tool provisions
+        let tc_sig = crate::toolchain::run_sig(
+            &self.cfg.orchestrator, fontc_bin.is_some(), builder3_bin.is_some());
         let mut pairs = self.attempt_pairs(fontc_bin.is_some(), builder3_bin.is_some());
         let mut stash: Option<PathBuf> = None;
         if let Some(prior) = &upgrade_prior {
+            // already attempted under EXACTLY these capabilities? nothing new to learn — quick
+            // no-op restore (this is the common per-run path while a tool stays unavailable)
+            if prior.upgrade_attempted == tc_sig {
+                self.restore_prior(slug, prior, &tc_sig, "already attempted under this toolchain");
+                cleanup(&work, self.cfg.keep_work);
+                return;
+            }
             // an upgrade only ever tries rungs STRICTLY better than the kept success
             let floor = result_rung(&prior.builder, &prior.backend);
             pairs.retain(|(b, c)| result_rung(b, c) > floor);
@@ -3520,11 +3536,17 @@ mod tests {
     }
 
     #[test]
-    fn pins_sig_tracks_pins_and_orchestrator() {
-        let s = crate::toolchain::pins_sig("auto");
+    fn run_sig_tracks_pins_orchestrator_and_capabilities() {
+        use crate::toolchain::run_sig;
+        let s = run_sig("auto", true, true);
         assert!(s.contains(&crate::toolchain::BUILDER3_REV[..10]));
         assert!(s.contains(crate::toolchain::FONTC_VERSION));
-        assert_ne!(s, crate::toolchain::pins_sig("builder2")); // preference change re-arms upgrades
+        // preference change re-arms upgrades
+        assert_ne!(s, run_sig("builder2", true, true));
+        // a DEGRADED run (builder3 unavailable) stamps differently from a fully-capable one, so
+        // results built while a tool was missing re-arm automatically once it provisions
+        assert_ne!(run_sig("auto", true, false), run_sig("auto", true, true));
+        assert_ne!(run_sig("auto", false, true), run_sig("auto", true, true));
     }
 
     #[test]

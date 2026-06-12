@@ -167,6 +167,9 @@ gflib-data/           local data + build output (git-ignored; created on first r
 - **First-run toolchain provisioning takes minutes.** Installing the pinned `gftools-builder3`
   compiles a ~700-crate dependency tree (and `fontc` similarly) — a one-time cost, shown live as
   pipeline tasks; later runs reuse the cached installs under `<data-dir>/tools/`.
+- **Provisioning needs a current stable `rustc`.** The builder3 pin's lockfile currently requires
+  rustc ≥ 1.92; an older toolchain fails fast with a clear message (`rustup update`, then restart
+  the build). The run continues meanwhile on the rungs that did provision.
 - **Output is not guaranteed identical to shipped fonts.** The tool *measures* and records what
   built each family; byte-for-byte equivalence to the shipped/fontmake binaries is a goal (M3),
   not a promise.
