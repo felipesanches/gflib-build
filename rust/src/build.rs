@@ -2499,6 +2499,10 @@ impl Orchestrator {
                         backends.fontmake += 1;
                         *migration.entry("fontmake_fallback".into()).or_default() += 1;
                     }
+                    "both" => {
+                        backends.both += 1;
+                        *migration.entry("both".into()).or_default() += 1;
+                    }
                     _ => {}
                 }
                 // the M5 (Python-free) count: families whose ORCHESTRATOR was builder3
@@ -2798,6 +2802,7 @@ impl Orchestrator {
             queued_list,
             fail_categories,
             lint_categories,
+            build_debs: sh.build_debs,
             pkg_now: sh.pkg_now.clone(),
             pkg_pending,
             lint_total,

@@ -261,6 +261,8 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  /* segmented progress bar */
  .barwrap{position:relative;height:18px;background:var(--line);border-radius:4px;overflow:hidden;margin:6px 0;display:flex}
  .seg{height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden}.seg.bg{background:#22c55e}.seg.rg{background:#ef4444}.seg.dg{background:#334155}.seg.cg{background:#06b6d4}
+ /* built-portion split by compiler — three shades of green: both=lightest/brightest, fontc=medium, fontmake=darkest */
+ .seg.gfc{background:#22c55e}.seg.gfm{background:#15803d}.seg.gboth{background:#4ade80}
  .sl{font-size:10px;font-weight:600;color:#fff;text-shadow:0 0 3px #000;white-space:nowrap;padding:0 4px}.seg.dg .sl{color:#cbd5e1}
  .barlbl{position:absolute;left:0;right:0;top:0;line-height:18px;text-align:center;color:#fff;font-weight:600;font-size:11px;text-shadow:0 0 3px #000}
  .pkgbar{height:12px;margin:0 0 6px}.pkgbar .sl{font-size:9px}
@@ -718,10 +720,15 @@ function barHTML(){const c=snap.counts||{},ph=snap.phase;
  const hint=(c.skipped||0)?'<span class="skip">'+(c.skipped||0)+' skipped (not selected — raise % to 100 to build them)</span>':'';
  // each segment carries its own count + share-of-total label (hidden by overflow when the segment is too narrow)
  const seg=(w,cl,n,lbl)=>'<div class="seg '+cl+'" style="width:'+w+'%">'+(n>0?'<span class="sl">'+n+' '+lbl+' ('+Math.round(w)+'%)</span>':'')+'</div>';
+ // split the built (green) portion by compiler: fontc · fontmake · both (three shades of green),
+ // plus a base-green remainder for any built family with an unrecorded backend
+ const bk=snap.backends||{},bfc=bk.fontc||0,bfm=bk.fontmake||0,bb=bk.both||0,bother=Math.max(0,(c.built||0)-bfc-bfm-bb);
+ const builtSegs=seg(100*bfc/inscope,'gfc',bfc,'fontc')+seg(100*bfm/inscope,'gfm',bfm,'fontmake')
+   +seg(100*bb/inscope,'gboth',bb,'both')+(bother>0?seg(100*bother/inscope,'bg',bother,'built'):'');
  // the built/failed/building/queued counts now live in the per-segment bar labels + the top-right 'attempted'
  return '<div class="phase"> Phase: '+E(phaseLabel(ph))+err+hint+'</div>'+
-  '<div class="barwrap">'+seg(gw,'bg',c.built||0,'built')+seg(rw,'rg',c.failed||0,'failed')+seg(dw,'dg',rem,'left')+'</div>'+
-  packagingBar(gw);
+  '<div class="barwrap">'+builtSegs+seg(rw,'rg',c.failed||0,'failed')+seg(dw,'dg',rem,'left')+'</div>'+
+  (snap.build_debs?packagingBar(gw):'');  // packaging bar only when the .deb option is active
 }
 function phaseLabel(ph){return {init:'starting…',clone_gf:'cloning google/fonts',build_fontc:'building fontc from source',discover:'discovering worklist',archive:'populating archive (mirroring repos)',cohorts:'scanning dependency cohorts',build:'building',done:'done'}[ph]||ph||''}
 

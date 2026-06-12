@@ -89,6 +89,7 @@ pub struct Counts {
 pub struct Backends {
     #[serde(default)] pub fontc: usize,
     #[serde(default)] pub fontmake: usize,
+    #[serde(default)] pub both: usize, // built with --backend both (fontc AND fontmake compared)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -352,6 +353,7 @@ pub struct Snapshot {
     #[serde(default)] pub fail_categories: Vec<FailCategory>,
     #[serde(default)] pub lint_categories: Vec<LintCategory>, // lintian findings grouped by tag (packaging)
     // packaging/lint queue (the .deb pipeline, mirroring the main build queue)
+    #[serde(default)] pub build_debs: bool,      // the .deb packaging SETTING is active (gates the packaging bar)
     #[serde(default)] pub pkg_now: String,      // current package-worker activity ("packaging/linting <slug>" or "")
     #[serde(default)] pub pkg_pending: usize,    // built families not yet packaged (.deb to build)
     #[serde(default)] pub lint_total: usize,     // packages with a .deb (lintable)
