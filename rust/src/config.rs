@@ -20,6 +20,7 @@ pub struct Config {
     pub builder3_bin: Option<String>, // explicit override; None = resolve/provision automatically
     pub auto_provision: bool,  // cargo-install the pinned fontc/builder3 when absent (default on)
     pub auto_upgrade: bool,    // auto re-attempt built families below the top rung once per pin signature
+    pub cpu_slices: bool,      // confine each build to ~cpus/jobs CPUs via taskset (load control)
     pub build_python: String,
     pub base_python: String,            // interpreter used to CREATE cohort venvs (= pythons[0])
     pub pythons: Vec<String>,           // Python ladder, newest→oldest: a cohort whose pinned reqs have
@@ -78,6 +79,7 @@ impl Default for Config {
             builder3_bin: None,
             auto_provision: true,
             auto_upgrade: true,
+            cpu_slices: true,
             build_python: "python3".into(),
             base_python: "python3".into(),
             pythons: vec!["python3".into()],
@@ -195,6 +197,8 @@ pub fn parse(args: &[String]) -> Parsed {
             "--orchestrator" => cfg.orchestrator = next(&mut i, a),
             "--fontc-bin" => cfg.fontc_bin = Some(next(&mut i, a)),
             "--builder3-bin" => cfg.builder3_bin = Some(next(&mut i, a)),
+            "--cpu-slices" => cfg.cpu_slices = true,
+            "--no-cpu-slices" => cfg.cpu_slices = false,
             "--auto-upgrade" => cfg.auto_upgrade = true,
             "--no-auto-upgrade" => cfg.auto_upgrade = false,
             "--toolchain-provision" => cfg.auto_provision = true,

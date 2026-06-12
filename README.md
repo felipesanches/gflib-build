@@ -66,8 +66,10 @@ See [`docs/migration-milestones.md`](docs/migration-milestones.md) for the full 
 - **Archive-safe** — sources are read **read-only** (`git archive` from bare mirrors); upstream
   repos are never modified and never deleted; every byte of output lands in a separate build dir.
 - **Provenance (M0)** — records the compiler and exact version for every family, success or failure.
-- **Parallel & streaming** — a worker pool builds while the archive mirrors and cohorts are scanned,
-  with no barriers between phases.
+- **Parallel & streaming, load-bounded** — a worker pool builds while the archive mirrors and
+  cohorts are scanned, with no barriers between phases. Each build is confined to a ~cpus/jobs CPU
+  budget (taskset slice + per-tool job caps) and venv installs are throttled, so heavily-parallel
+  children (ninja, fontc, builder3, pip sdist builds) can't multiply into runaway load.
 - **Optional extras** — `fontc_crater` comparison, `fontspector` QA, and `.deb` packaging of built
   families (all works-in-progress).
 

@@ -242,6 +242,12 @@ reproducibility holds for everything that resolves. Each relaxation is surfaced 
   build.
 - Mutable orchestrator state lives in one `Shared` struct behind a single `Mutex`; `snapshot()` takes
   a consistent copy under it. A `Condvar` wakes parked workers when work or capacity changes.
+- **Per-build CPU budgets.** Each of the `jobs` workers confines its build to ~`cpus/jobs` CPUs:
+  a `taskset` CPU slice (disjoint across workers; inherited by every descendant, so ninja's
+  cpus+2 edges or a fork-happy Python can't escape it), `RAYON_NUM_THREADS` for fontc, and
+  builder3's own `--jobs`. Venv creation is additionally throttled to a few concurrent
+  `pip install`s with capped sdist-build parallelism — N workers × N uncapped numpy builds was
+  a real triple-digit load average in the field. `--no-cpu-slices` lifts the taskset confinement.
 - The **job regulator** keeps exactly `jobs` builds *actively* compiling. Lowering `jobs` below the
   number of running builds **freezes the newest excess with SIGSTOP** rather than killing it; as
   builds finish, freed slots **thaw the oldest frozen build first** (drain in-progress before starting

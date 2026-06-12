@@ -513,7 +513,12 @@ BUILD:
                                 'auto' to discover installed python3.N. A cohort whose exact pinned reqs
                                 have no wheel on a rung falls back to an older one (keeping the pins)
                                 before relaxing; the commit year picks the starting rung. Single = legacy.
-  --jobs <N>                    parallel workers (default = CPU count)
+  --jobs <N>                    parallel workers (default = CPU count). Each build is confined to a
+                                budget of ~cpus/jobs CPUs (taskset slice + RAYON_NUM_THREADS +
+                                builder3 --jobs), so heavily-parallel children (ninja, fontc,
+                                builder3, pip sdist builds) cannot multiply into cpus² load.
+                                Lower --jobs = fewer, fatter slices. --no-cpu-slices disables the
+                                taskset confinement (the soft caps remain).
   --timeout <SECS>              per-build timeout (default: none)
   --compare                     sha256-compare built fonts to shipped (metadata mode)
   --retry-failed / --rebuild    re-attempt failures / ignore prior state

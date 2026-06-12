@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 pub const REQ_FILES: [&str; 2] = ["requirements.txt", "requirements.in"];
 
@@ -589,6 +589,16 @@ struct Inner {
     pub relaxations: Vec<String>,
 }
 
+/// RAII venv-install slot — released (and waiters woken) on every exit path.
+struct InstallSlot<'a>(&'a VenvManager);
+impl Drop for InstallSlot<'_> {
+    fn drop(&mut self) {
+        let (lock, cv) = &self.0.install_gate;
+        *lock.lock().unwrap() -= 1;
+        cv.notify_all();
+    }
+}
+
 pub struct VenvManager {
     root: PathBuf,
     pip_cache: PathBuf,
@@ -597,6 +607,11 @@ pub struct VenvManager {
     pytags: Mutex<HashMap<String, (String, String)>>, // python bin -> (tag "py311", full "3.11.15")
     base_req: Option<PathBuf>,
     inner: Mutex<Inner>,
+    // Counted gate limiting CONCURRENT venv creations. N workers hitting N distinct cohorts used
+    // to mean N simultaneous `pip install`s, each compiling sdists (numpy!) with its own parallel
+    // make — the load-average storm Simon reported. Builds already venv'd are unaffected.
+    install_gate: (Mutex<usize>, Condvar),
+    install_slots: usize,
 }
 
 impl VenvManager {
@@ -627,7 +642,22 @@ impl VenvManager {
                 override_recorded: HashSet::new(),
                 relaxations: Vec::new(),
             }),
+            install_gate: (Mutex::new(0), Condvar::new()),
+            // ~1 concurrent install per 8 CPUs, min 1, max 3 — enough to hide install latency,
+            // few enough that parallel sdist builds can't swamp the machine
+            install_slots: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).div_euclid(8).clamp(1, 3),
         }
+    }
+
+    /// Acquire one venv-install slot (blocks while `install_slots` creations are in flight).
+    fn install_slot(&self) -> InstallSlot<'_> {
+        let (lock, cv) = &self.install_gate;
+        let mut n = lock.lock().unwrap();
+        while *n >= self.install_slots {
+            n = cv.wait(n).unwrap();
+        }
+        *n += 1;
+        InstallSlot(self)
     }
 
     /// (tag, full_version) for a python binary, e.g. ("py311", "3.11.15"). None if not runnable. Cached
@@ -806,6 +836,17 @@ impl VenvManager {
                 }
             }
         }
+        // limit concurrent creations machine-wide: the marker check above stays lock-free (the
+        // common path), only actual venv-create + pip-install work waits for a slot
+        let _slot = self.install_slot();
+        // another worker may have finished creating this exact venv while we waited on the slot
+        if ready.exists() && py.exists() {
+            if let Ok(m) = std::fs::read_to_string(&ready) {
+                if m.trim() == want_hash {
+                    return (py.to_string_lossy().to_string(), String::new());
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&vdir);
         let rc = Command::new(python).args(["-m", "venv", &vdir.to_string_lossy()]).output();
         match rc {
@@ -896,6 +937,16 @@ impl VenvManager {
                     let mut cmd = Command::new(&py);
                     cmd.args(["-m", "pip", "install", "--disable-pip-version-check", "--cache-dir",
                               &self.pip_cache.to_string_lossy(), "-r", &eff_path.to_string_lossy()]);
+                    // bound the parallelism of sdist builds pip kicks off (numpy/lxml/…): one
+                    // uncapped numpy build can spawn a compiler job per CPU, and several pips at
+                    // once multiplied that into triple-digit load averages. Covers the make,
+                    // cmake, meson/ninja and torch-style build paths.
+                    let sdist_jobs = std::thread::available_parallelism()
+                        .map(|n| n.get()).unwrap_or(4).div_euclid(4).clamp(1, 8).to_string();
+                    cmd.env("MAKEFLAGS", format!("-j{}", sdist_jobs))
+                        .env("NPY_NUM_BUILD_JOBS", &sdist_jobs)
+                        .env("CMAKE_BUILD_PARALLEL_LEVEL", &sdist_jobs)
+                        .env("MAX_JOBS", &sdist_jobs);
                     // force a wheel for every package whose sdist already failed to build here, so the
                     // resolver cannot regress onto an even older pre-cp313 sdist of the same package
                     if !wheel_only.is_empty() {

@@ -1018,9 +1018,12 @@ impl Orchestrator {
             Err(e) => return (false, e, BTreeMap::new(), 0),
         };
         let t0 = now();
-        // the 'both' comparison runs each compiler under builder2 (the compiler axis, isolated)
+        // the 'both' comparison runs each compiler under builder2 (the compiler axis, isolated);
+        // budget applies, slice doesn't (no stable worker identity on this path)
+        let total_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let inner = inner_jobs(total_cpus, self.job_limit.load(Ordering::Relaxed).max(1));
         if let Err(e) = run_builder(python, &cfg_path, work, log_path, self.cfg.timeout, "builder2",
-                                    backend, fontc_bin, None,
+                                    backend, fontc_bin, None, inner, None,
                                     &fam.slug, &self.running, &self.frozen, &self.job_limit) {
             return (false, format!("{}: {}", backend, e), BTreeMap::new(), 0);
         }
@@ -1349,6 +1352,15 @@ impl Orchestrator {
                 builder, backend, backend, cver, bver, label, builder
             ));
             let t0 = now();
+            // per-build CPU budget from the LIVE jobs target (recomputed per attempt, so a live
+            // jobs change reshapes the budget for subsequent builds)
+            let total_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            let inner = inner_jobs(total_cpus, self.job_limit.load(Ordering::Relaxed).max(1));
+            let slice = if self.cfg.cpu_slices {
+                Some(cpu_slice(_worker, inner, total_cpus))
+            } else {
+                None
+            };
             let run = self.timed(slug, "build", || run_builder(
                 &python,
                 &cfg_path,
@@ -1359,6 +1371,8 @@ impl Orchestrator {
                 backend,
                 fontc_bin.as_deref(),
                 builder3_bin.as_deref(),
+                inner,
+                slice.as_deref(),
                 slug,
                 &self.running,
                 &self.frozen,
@@ -2966,8 +2980,37 @@ fn unstash_outputs(stash: &Path, out_dir: &Path) {
     }
 }
 
+/// Per-build CPU budget: with `jobs` builds in flight, each gets ~total/jobs CPUs. The children
+/// are themselves heavily parallel (builder3 defaults to ALL cores, fontc is rayon-wide, ninja
+/// runs cpus+2 edges, fontmake forks) — without a budget, jobs × cores produced the triple-digit
+/// load averages Simon reported.
+pub fn inner_jobs(total_cpus: usize, jobs: usize) -> usize {
+    (total_cpus / jobs.max(1)).max(1)
+}
+
+/// Worker `w`'s CPU range for `taskset -c` ("4-7") — disjoint across workers when jobs×inner ≤
+/// total, so each build is HARD-confined to its slice and a child's internal over-parallelism
+/// (ninja, python multiprocessing, anything) physically cannot swamp the machine. Affinity is
+/// inherited by every descendant process.
+pub fn cpu_slice(worker: usize, inner: usize, total: usize) -> String {
+    let total = total.max(1);
+    let start = (worker * inner) % total;
+    let end = (start + inner - 1).min(total - 1);
+    if start == end { format!("{}", start) } else { format!("{}-{}", start, end) }
+}
+
+fn taskset_available() -> bool {
+    static AVAIL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAIL.get_or_init(|| {
+        std::process::Command::new("taskset").arg("-V")
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false)
+    })
+}
+
 /// The argv for one builder attempt — factored out of run_builder so the exact command shapes
-/// are unit-testable. Returns (program, args).
+/// are unit-testable. Returns (program, args). `inner` caps the attempt's internal parallelism
+/// (builder3's own job pool; the slice + RAYON env cover the rest).
 fn builder_command(
     builder: &str,
     backend: &str,
@@ -2975,10 +3018,14 @@ fn builder_command(
     config_path: &Path,
     fontc_bin: Option<&str>,
     builder3_bin: Option<&str>,
+    inner: usize,
 ) -> (String, Vec<String>) {
     if builder == "builder3" {
         let b3 = builder3_bin.unwrap_or("gftools-builder");
-        return (b3.to_string(), vec![config_path.to_string_lossy().into_owned()]);
+        return (b3.to_string(), vec![
+            config_path.to_string_lossy().into_owned(),
+            "--jobs".into(), inner.to_string(),
+        ]);
     }
     let mut args = vec!["-m".to_string(), "gftools.builder".to_string(), config_path.to_string_lossy().into_owned()];
     if backend == "fontc" {
@@ -3003,6 +3050,8 @@ fn run_builder(
     backend: &str,
     fontc_bin: Option<&str>,
     builder3_bin: Option<&str>,
+    inner: usize,
+    cpu_slice: Option<&str>,
     slug: &str,
     running: &Mutex<RunReg>,
     frozen: &AtomicBool,
@@ -3042,11 +3091,27 @@ fn run_builder(
         config_path
     };
 
-    let (program, args) = builder_command(builder, backend, python, config_path, fontc_bin, builder3_bin);
-    let mut cmd = Command::new(&program);
-    cmd.args(&args);
+    let (program, args) = builder_command(builder, backend, python, config_path, fontc_bin, builder3_bin, inner);
+    // Confine the whole child tree to this worker's CPU slice (taskset affinity is inherited by
+    // every descendant — ninja, fontmake, python multiprocessing), so jobs × per-child
+    // parallelism can never exceed the machine. Skipped when taskset is absent (e.g. macOS);
+    // the RAYON/--jobs caps below still apply there.
+    let mut cmd;
+    match cpu_slice {
+        Some(slice) if taskset_available() => {
+            cmd = Command::new("taskset");
+            cmd.arg("-c").arg(slice).arg(&program).args(&args);
+        }
+        _ => {
+            cmd = Command::new(&program);
+            cmd.args(&args);
+        }
+    }
+    // fontc (standalone or embedded in builder3) sizes its rayon pool from this
+    cmd.env("RAYON_NUM_THREADS", inner.to_string());
     let orch = if builder == "builder3" { "gftools-builder3" } else { "gftools.builder" };
-    log_line(log_path, &format!("===== {} (backend={}) =====", orch, backend));
+    log_line(log_path, &format!("===== {} (backend={}, inner_jobs={}{}) =====", orch, backend, inner,
+        cpu_slice.map(|s| format!(", cpus {}", s)).unwrap_or_default()));
     // gftools.builder shells out to fontmake / ninja / gftools / ttfautohint BY NAME, so the chosen
     // interpreter's bin/ MUST be on PATH (running venv/bin/python does not by itself activate the
     // venv). Use the venv bin = the python's parent dir WITHOUT resolving symlinks (canonicalize would
@@ -3578,18 +3643,29 @@ mod tests {
     #[test]
     fn builder_command_shapes() {
         let cfgp = Path::new("sources/config.yaml");
-        // builder3: the binary, the config, nothing else (no Python anywhere)
-        let (prog, args) = builder_command("builder3", "fontc", "/v/bin/python", cfgp, Some("/t/fontc"), Some("/t/gftools-builder"));
+        // builder3: the binary, the config, and its own job cap (no Python anywhere)
+        let (prog, args) = builder_command("builder3", "fontc", "/v/bin/python", cfgp, Some("/t/fontc"), Some("/t/gftools-builder"), 4);
         assert_eq!(prog, "/t/gftools-builder");
-        assert_eq!(args, vec!["sources/config.yaml"]);
+        assert_eq!(args, vec!["sources/config.yaml", "--jobs", "4"]);
         // builder2 + fontc: gftools.builder with --experimental-fontc
-        let (prog, args) = builder_command("builder2", "fontc", "/v/bin/python", cfgp, Some("/t/fontc"), None);
+        let (prog, args) = builder_command("builder2", "fontc", "/v/bin/python", cfgp, Some("/t/fontc"), None, 4);
         assert_eq!(prog, "/v/bin/python");
         assert_eq!(args, vec!["-m", "gftools.builder", "sources/config.yaml", "--experimental-fontc", "/t/fontc"]);
         // builder2 + fontmake: plain gftools.builder
-        let (prog, args) = builder_command("builder2", "fontmake", "/v/bin/python", cfgp, Some("/t/fontc"), None);
+        let (prog, args) = builder_command("builder2", "fontmake", "/v/bin/python", cfgp, Some("/t/fontc"), None, 4);
         assert_eq!(prog, "/v/bin/python");
         assert_eq!(args, vec!["-m", "gftools.builder", "sources/config.yaml"]);
+        // the CPU budget: jobs*inner ≈ cpus, never zero
+        assert_eq!(inner_jobs(32, 10), 3);
+        assert_eq!(inner_jobs(8, 8), 1);
+        assert_eq!(inner_jobs(4, 16), 1);  // oversubscribed jobs: floor of 1
+        assert_eq!(inner_jobs(64, 1), 64); // a single build may use the whole machine
+        // disjoint slices while jobs*inner <= total; wraps (never panics) past it
+        assert_eq!(cpu_slice(0, 4, 32), "0-3");
+        assert_eq!(cpu_slice(7, 4, 32), "28-31");
+        assert_eq!(cpu_slice(8, 4, 32), "0-3"); // wraps
+        assert_eq!(cpu_slice(0, 1, 8), "0");
+        assert_eq!(cpu_slice(3, 3, 8), "1-3"); // partial overlap when not evenly divisible
     }
 
     #[test]
