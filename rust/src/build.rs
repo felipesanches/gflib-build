@@ -91,7 +91,8 @@ pub struct Shared {
     // cohort map (R1: preserved across resume/migration; populated by R2's VenvManager later)
     pub cohort_members: BTreeMap<String, Vec<String>>,
     pub cohort_reqs: BTreeMap<String, String>,
-    pub cached_cohorts: HashSet<String>, // cohorts with a venv on disk (off-thread; for the 'cached' flag)
+    pub cached_cohorts: HashSet<String>,
+    pub reset_portions: Vec<crate::model::ResetPortion>, // reset-tab portions + live sizes // cohorts with a venv on disk (off-thread; for the 'cached' flag)
     pub op_stats: HashMap<String, (f64, usize, f64)>, // op -> (total_secs, count, max) for timings.json
 }
 
@@ -411,6 +412,7 @@ impl Orchestrator {
             cohort_members: state.cohort_members,
             cohort_reqs: state.cohort_reqs,
             cached_cohorts: HashSet::new(),
+            reset_portions: Vec::new(),
             op_stats: HashMap::new(),
         };
         let venvs = if cfg.manage_venvs {
@@ -1579,10 +1581,126 @@ impl Orchestrator {
                     if ctl.seq != last {
                         last = ctl.seq;
                         me.apply_live(&ctl.set);
+                        // reset-tab deletions run off-thread (a venv tree can be many GB); handled
+                        // here rather than in apply_live because spawning needs the Arc
+                        if let Some(key) = ctl.set.reset_portion.clone() {
+                            me.spawn_reset_portion(key);
+                        }
                     }
                 }
                 thread::sleep(Duration::from_millis(700));
             }
+        });
+    }
+
+    /// The reset tab's deletable portions with live sizes. Everything is under the build dir
+    /// (plus the provisioned toolchain under data-dir); the repo archive and google/fonts clone
+    /// are NEVER part of any portion. Build RESULTS (state.json) are kept by every portion —
+    /// deleting binaries leaves families 'built (fonts discarded)', same as --discard-fonts.
+    fn compute_reset_portions(&self) -> Vec<crate::model::ResetPortion> {
+        use crate::model::ResetPortion;
+        let bd = &self.cfg.build_dir;
+        // per-compiler font sizes need the slug→backend map
+        let by_backend: Vec<(String, String)> = {
+            let sh = self.shared.lock().unwrap();
+            sh.results.values().filter(|r| r.status == "built")
+                .map(|r| (slug_to_logname(&r.slug), r.backend.clone())).collect()
+        };
+        let out_root = bd.join("out");
+        let mut fontc_bytes = 0u64;
+        let mut fontmake_bytes = 0u64;
+        for (logname, backend) in &by_backend {
+            match backend.as_str() {
+                "fontc" => fontc_bytes += dir_size(&out_root.join(logname)),
+                "fontmake" => fontmake_bytes += dir_size(&out_root.join(logname)),
+                "both" => {
+                    fontc_bytes += dir_size(&out_root.join(logname).join("fontc"));
+                    fontmake_bytes += dir_size(&out_root.join(logname).join("fontmake"));
+                }
+                _ => {}
+            }
+        }
+        let p = |key: &str, label: &str, bytes: u64, hint: &str| ResetPortion {
+            key: key.into(), label: label.into(), bytes, hint: hint.into(),
+        };
+        vec![
+            p("fonts-fontc", "font binaries built by fontc", fontc_bytes,
+              "deletes out/ fonts of fontc-built families (incl. builder3); results stay 'built' — use retrigger/rebuild to rebuild"),
+            p("fonts-fontmake", "font binaries built by fontmake", fontmake_bytes,
+              "deletes out/ fonts of fontmake-built families; results stay 'built' — use retrigger/rebuild to rebuild"),
+            p("variants", "superseded upgrade binaries (variants/)", dir_size(&bd.join("variants")),
+              "older rungs' binaries kept by successful auto-upgrades, for output comparison"),
+            p("debs", ".deb packages + packaging trees", dir_size(&bd.join("packaging")),
+              "deletes the whole packaging/ tree; the package worker re-drafts from the existing fonts"),
+            p("venvs", "dependency-cohort venvs", dir_size(&bd.join("venvs")),
+              "cohort venvs are recreated on demand from the pinned requirements (first builds get slower)"),
+            p("pip-cache", "pip download cache", dir_size(&bd.join("pip-cache")),
+              "wheels/sdists re-download on the next venv creation"),
+            p("logs", "per-family build logs", dir_size(&bd.join("logs")),
+              "includes the archived failure logs; failure-history.jsonl is kept"),
+            p("work", "leftover work extractions", dir_size(&bd.join("work")),
+              "throwaway trees (normally cleaned after each build; --keep-work leaves them)"),
+            p("fontspector", "fontspector QA results", dir_size(&bd.join("fontspector")),
+              "the QA pass recreates them on the next run"),
+            p("tools", "provisioned toolchain (fontc/builder3)", dir_size(&self.cfg.data_dir.join("tools")),
+              "pinned binaries re-provision automatically on the next run (minutes)"),
+        ]
+    }
+
+    /// Execute one reset-tab deletion off-thread. Refused while builds are in flight (a deletion
+    /// racing a build's collect/venv use would corrupt it) — pause or let the queue drain first.
+    fn spawn_reset_portion(self: &Arc<Self>, key: String) {
+        let me = Arc::clone(self);
+        thread::spawn(move || {
+            {
+                let mut sh = me.shared.lock().unwrap();
+                let building = sh.results.values().filter(|r| r.status == "building").count();
+                if building > 0 {
+                    sh.control_log.push(format!(
+                        "reset {}: REFUSED — {} build(s) in flight; pause the build first", key, building));
+                    return;
+                }
+            }
+            let bd = me.cfg.build_dir.clone();
+            let freed: u64 = match key.as_str() {
+                "fonts-fontc" | "fonts-fontmake" => {
+                    let compiler = key.trim_start_matches("fonts-");
+                    let targets: Vec<(String, String)> = {
+                        let sh = me.shared.lock().unwrap();
+                        sh.results.values().filter(|r| r.status == "built")
+                            .map(|r| (slug_to_logname(&r.slug), r.backend.clone())).collect()
+                    };
+                    delete_built_fonts(&bd.join("out"), &targets, compiler)
+                }
+                "variants" => remove_measured(&bd.join("variants")),
+                "debs" => {
+                    let n = remove_measured(&bd.join("packaging"));
+                    me.shared.lock().unwrap().packaged.clear();
+                    n
+                }
+                "venvs" => {
+                    let n = remove_measured(&bd.join("venvs"));
+                    me.shared.lock().unwrap().cached_cohorts.clear();
+                    n
+                }
+                "pip-cache" => remove_measured(&bd.join("pip-cache")),
+                "logs" => remove_measured(&bd.join("logs")),
+                "work" => remove_measured(&bd.join("work")),
+                "fontspector" => remove_measured(&bd.join("fontspector")),
+                "tools" => remove_measured(&me.cfg.data_dir.join("tools")),
+                other => {
+                    me.shared.lock().unwrap().control_log.push(format!("reset: unknown portion '{}'", other));
+                    return;
+                }
+            };
+            // logs/ is needed by every build — recreate the empty dir immediately
+            if key == "logs" {
+                let _ = std::fs::create_dir_all(bd.join("logs"));
+            }
+            let portions = me.compute_reset_portions();
+            let mut sh = me.shared.lock().unwrap();
+            sh.reset_portions = portions;
+            sh.control_log.push(format!("reset {}: freed {}", key, crate::util::human(freed)));
         });
     }
 
@@ -1871,11 +1989,16 @@ impl Orchestrator {
                     sh.disk_archive_nested = nested;
                     sh.archive_total = arc_count;
                 }
+                // reset-tab portion sizes: a second (bucketed) walk, every ~30 s
+                let portions = if tick % 3 == 0 { Some(me.compute_reset_portions()) } else { None };
                 {
                     let mut sh = me.shared.lock().unwrap();
                     sh.disk_build_total = build_total;
                     sh.disk_free = free;
                     sh.cached_cohorts = cached;
+                    if let Some(p) = portions {
+                        sh.reset_portions = p;
+                    }
                 }
                 tick += 1;
                 for _ in 0..10 {
@@ -2618,6 +2741,7 @@ impl Orchestrator {
                 .into_iter()
                 .collect(),
             tasks: self.toolchain_tasks(),
+            reset_portions: sh.reset_portions.clone(),
             archive_recent: Vec::new(),
             archive,
             config: {
@@ -2963,6 +3087,28 @@ fn stash_variant_outputs(build_dir: &Path, out_dir: &Path, logname: &str, prior:
         }
     }
     if moved { Some(dest) } else { None }
+}
+
+/// Measure then remove a directory tree; returns the bytes freed (0 if absent).
+fn remove_measured(dir: &Path) -> u64 {
+    let n = dir_size(dir);
+    let _ = std::fs::remove_dir_all(dir);
+    n
+}
+
+/// Reset-tab: delete the built fonts of every family whose COMPILER matches (`fontc`/`fontmake`).
+/// A plain family's whole out/<slug> goes; a both-mode family loses only the matching compiler's
+/// subdir. Returns bytes freed. Results/state are deliberately untouched (same as --discard-fonts).
+fn delete_built_fonts(out_root: &Path, built: &[(String, String)], compiler: &str) -> u64 {
+    let mut freed = 0u64;
+    for (logname, backend) in built {
+        if backend == compiler {
+            freed += remove_measured(&out_root.join(logname));
+        } else if backend == "both" {
+            freed += remove_measured(&out_root.join(logname).join(compiler));
+        }
+    }
+    freed
 }
 
 /// Undo `stash_variant_outputs` after a declined upgrade: the kept binaries go back to being the
@@ -3637,6 +3783,32 @@ mod tests {
         let out2 = root.join("out").join("ofl__empty");
         std::fs::create_dir_all(&out2).unwrap();
         assert!(stash_variant_outputs(&root, &out2, "ofl__empty", &prior).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_built_fonts_targets_only_the_matching_compiler() {
+        let root = std::env::temp_dir().join(format!("_reset_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let out = root.join("out");
+        for d in ["ofl__a", "ofl__b", "ofl__c/fontc", "ofl__c/fontmake"] {
+            std::fs::create_dir_all(out.join(d)).unwrap();
+        }
+        std::fs::write(out.join("ofl__a/A.ttf"), b"fontc-built").unwrap();
+        std::fs::write(out.join("ofl__b/B.ttf"), b"fontmake-built").unwrap();
+        std::fs::write(out.join("ofl__c/fontc/C.ttf"), b"c1").unwrap();
+        std::fs::write(out.join("ofl__c/fontmake/C.ttf"), b"c2").unwrap();
+        let built = vec![
+            ("ofl__a".to_string(), "fontc".to_string()),
+            ("ofl__b".to_string(), "fontmake".to_string()),
+            ("ofl__c".to_string(), "both".to_string()),
+        ];
+        let freed = delete_built_fonts(&out, &built, "fontc");
+        assert!(freed > 0);
+        assert!(!out.join("ofl__a").exists(), "fontc-built family deleted");
+        assert!(out.join("ofl__b/B.ttf").is_file(), "fontmake-built family untouched");
+        assert!(!out.join("ofl__c/fontc").exists(), "both-mode fontc subdir deleted");
+        assert!(out.join("ofl__c/fontmake/C.ttf").is_file(), "both-mode fontmake subdir kept");
         let _ = std::fs::remove_dir_all(&root);
     }
 

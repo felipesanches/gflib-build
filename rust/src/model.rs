@@ -248,6 +248,14 @@ pub struct ArchiveView {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ResetPortion {
+    #[serde(default)] pub key: String,   // control verb value (reset_portion)
+    #[serde(default)] pub label: String,
+    #[serde(default)] pub bytes: u64,    // current on-disk size (0 = nothing to delete)
+    #[serde(default)] pub hint: String,  // what deleting does / what survives
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TaskItem {
     #[serde(default)] pub key: String,
     #[serde(default)] pub name: String,
@@ -362,6 +370,8 @@ pub struct Snapshot {
     #[serde(default)] pub op_stats: BTreeMap<String, OpStat>,       // per-op timing (stats tab)
     #[serde(default)] pub phase_durations: BTreeMap<String, f64>,
     #[serde(default)] pub tasks: Vec<TaskItem>,
+    #[serde(default)] pub reset_portions: Vec<ResetPortion>, // the reset tab's deletable portions + sizes
+
     #[serde(default)] pub archive_recent: Vec<ArchiveRecent>,
     #[serde(default)] pub archive: ArchiveView,
     #[serde(default)] pub config: BTreeMap<String, serde_json::Value>,
@@ -410,6 +420,9 @@ pub struct ControlSet {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub repackage_all: Option<bool>, // rebuild every .deb from existing fonts (apply packaging fixes + re-lint)
     #[serde(default, skip_serializing_if = "Option::is_none")] pub build_debs: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub restart: Option<bool>, // re-exec the daemon (apply startup-only settings)
+    // delete one resettable portion of the build system (reset tab): fonts-fontc | fonts-fontmake |
+    // variants | debs | venvs | pip-cache | logs | work | fontspector | tools
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub reset_portion: Option<String>,
 }
 
 #[cfg(test)]

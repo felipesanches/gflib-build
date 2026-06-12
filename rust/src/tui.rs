@@ -20,8 +20,8 @@ use std::time::Duration;
 
 // Tab order MUST match the web UI's TABS (a user switching between the terminal and the browser
 // sees the same tabs in the same order).
-const TABS: [&str; 12] = [
-    "config", "overview", "queue", "cohorts", "archive", "built", "packaging", "tools", "failures", "stats", "fontspector", "crater",
+const TABS: [&str; 13] = [
+    "config", "overview", "queue", "cohorts", "archive", "built", "packaging", "tools", "failures", "stats", "fontspector", "crater", "reset",
 ];
 
 /// Succinct glossary of the Python->Rust migration milestones, shown in the tools tab so a UI label
@@ -496,6 +496,14 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
                     match k.code {
                         KeyCode::Up => ui.dscroll = ui.dscroll.saturating_sub(1),
                         KeyCode::Down => ui.dscroll = (ui.dscroll + 1).min(ui.detail_lines.len().saturating_sub(1)),
+                        // reset tab: the detail overlay IS the confirmation step — Enter to read,
+                        // then D fires the deletion (refused daemon-side while builds are in flight)
+                        KeyCode::Char('d') | KeyCode::Char('D') if TABS.get(ui.tab) == Some(&"reset") => {
+                            if let Some(p) = snap.reset_portions.get(ui.sel) {
+                                source.control(&ControlSet { reset_portion: Some(p.key.clone()), ..Default::default() });
+                            }
+                            ui.detail = false;
+                        }
                         KeyCode::Enter | KeyCode::Backspace | KeyCode::Left => ui.detail = false,
                         _ => {}
                     }
@@ -958,6 +966,21 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                 dview: "package", rows, keys: snap.packages.iter().map(|b| b.slug.clone()).collect(),
             });
             secs
+        }
+        "reset" => {
+            // granular system reset: one row per deletable portion, with its live on-disk size.
+            // ENTER explains what a deletion does; D inside the overlay confirms it.
+            let rows = snap.reset_portions.iter().map(|p| {
+                vec![
+                    (format!("{:<44} ", head(&p.label, 44)), Color::White),
+                    (format!("{:>10}  ", crate::util::human(p.bytes)), if p.bytes > 0 { Color::Yellow } else { Color::DarkGrey }),
+                    (head(&p.hint, 70), Color::Grey),
+                ]
+            }).collect();
+            vec![SectionR {
+                title: "Reset — delete a portion of the build system  (ENTER = what it does · D in the overlay = DELETE · archive & results are never touched)".into(),
+                dview: "reset", rows, keys: snap.reset_portions.iter().map(|p| p.key.clone()).collect(),
+            }]
         }
         "tools" => {
             // build-tool packages, classified python/rust: the M5 (Python->Rust) burn-down view.
@@ -1874,6 +1897,17 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
         _ => sections_for(snap, tab, fc_sel).get(section).map(|s| s.dview).unwrap_or(""),
     };
     match dview {
+        "reset" => {
+            if let Some(p) = snap.reset_portions.get(sel) {
+                o.push(format!(" reset: {}", p.label));
+                o.push(format!("   on disk now: {}", crate::util::human(p.bytes)));
+                o.push(format!("   {}", p.hint));
+                o.push("   the repo archive, google/fonts clone and build RESULTS are never touched".into());
+                o.push(String::new());
+                o.push("   ▶ press D to DELETE this portion now (refused while builds are in flight — pause first)".into());
+            }
+            return o;
+        }
         "failures" => {
             // rows may come from a selected cause's family list (not failures_recent), so
             // resolve the slug via the section's keys, then look it up in recent → history.

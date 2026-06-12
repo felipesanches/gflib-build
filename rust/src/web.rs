@@ -334,7 +334,7 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
 <script>
 let snap={}, tab='overview';
 // tab order MUST match the TUI's VIEWS
-const TABS=['config','overview','queue','cohorts','archive','built','packaging','tools','failures','stats','fontspector','crater'];
+const TABS=['config','overview','queue','cohorts','archive','built','packaging','tools','failures','stats','fontspector','crater','reset'];
 // colour a fontc_crater verdict token (magenta = fontc can't build it — the gold pairing on our built rows)
 function craterCol(tok){if(!tok)return 'muted';if(tok=='fontc-fail'||tok=='both-fail'||tok=='src-miss')return 'm';if(tok=='fmake-fail')return 'muted';if(tok[0]=='~')return 'y';return 'c'}
 // readable label for the fontc_crater verdict (was the cryptic "cr:<token>")
@@ -376,6 +376,23 @@ function Rp(s,n){return (''+s).padStart(n)}
 function trunc(s,n){s=(s==null?'':''+s);return s.length>n?s.slice(0,n-1)+'…':s}
 function prov(x){const c=x.compiler_version||x.backend||'';return c+(x.builder_version?' · '+x.builder_version:'')}
 function ctl(set){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({set:set})})}
+// --- reset tab: granular deletion of build-system portions (mirrors the TUI's reset tab) ---
+function resetPortion(key,label,bytes){
+ if(!confirm('DELETE '+label+' ('+human(bytes)+')?\n\nThe repo archive, google/fonts clone and build RESULTS are never touched.\nDeletions are refused while builds are in flight (pause first).'))return;
+ ctl({reset_portion:key});
+}
+function resetView(){
+ const ps=snap.reset_portions||[];
+ let h='<div class="sec">Reset — delete a portion of the build system  <span class="muted">(archive & results are never touched · refused while builds are in flight)</span></div>';
+ if(!ps.length)return h+'<div class="ln muted">(sizes are being measured — they refresh every ~30 s)</div>';
+ h+=ps.map(p=>{
+  const dis=p.bytes==0;
+  return '<div class="ln"><button class="btn" '+(dis?'disabled':'')+' onclick="resetPortion(\''+p.key+'\',\''+E(p.label)+'\','+p.bytes+')">delete</button>  '+
+   '<b>'+E(p.label)+'</b>  <span class="'+(dis?'muted':'y')+'">'+human(p.bytes)+'</span><br><span class="muted" style="margin-left:5.5em">'+E(p.hint)+'</span></div>';
+ }).join('');
+ h+='<div class="ln muted">outcomes are reported in the control log (config tab) — e.g. "reset venvs: freed 12.3GiB"</div>';
+ return h;
+}
 function setTab(t){tab=t;location.hash=t;render()}
 async function poll(){try{snap=await (await fetch('/api/status')).json()}catch(e){}sample();render();checkNotify()}
 
@@ -669,6 +686,7 @@ function render(){
  else if(tab=='fontspector')body+=fsView();
  else if(tab=='crater')body+=craterView();
  else if(tab=='packaging')body+=packagingView();
+ else if(tab=='reset')body+=resetView();
  else if(tab=='overview')body+=sections(tab).map(renderSec).join(''); // stacked, like the TUI: Pipeline on top, Recent failures below
  else{body+=(tab=='stats'?statsPrefix():'')+sections(tab).map(renderSec).join('');}
  document.getElementById('body').innerHTML=body;
