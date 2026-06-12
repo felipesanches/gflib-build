@@ -386,9 +386,51 @@ fn provision(spec: &ToolSpec, tools_root: &Path, stop: Option<&AtomicBool>) -> R
         if status.success() && bin.is_file() {
             return Ok(bin);
         }
-        last = format!("{}: cargo install failed (rc={}) — see {}", spec.name, status, log.display());
+        // surface the CAUSE (and remedy, when known) right in the task detail — not just an rc
+        let cause = std::fs::read_to_string(&log).ok().and_then(|t| summarize_cargo_log(&t));
+        last = match cause {
+            Some(c) => format!("{}: {} — full log: {}", spec.name, c, log.display()),
+            None => format!("{}: cargo install failed (rc={}) — see {}", spec.name, status, log.display()),
+        };
     }
     Err(last)
+}
+
+/// Distill a failed cargo-install log into one actionable line for the dashboard task detail /
+/// control log, so the common failures explain themselves without opening the log file. Pure
+/// (takes the log text) so each known pattern is unit-tested against real cargo output.
+fn summarize_cargo_log(txt: &str) -> Option<String> {
+    // MSRV refusal — the exact failure seen in the field:
+    //   "rustc 1.91.1 is not supported by the following package:\n  ascii-dag@0.4.2 requires rustc 1.92"
+    // (also covers a stale min_rustc const after a pin bump)
+    if let Some(line) = txt.lines().find(|l| l.contains("is not supported by the following package")) {
+        let who = txt.lines()
+            .skip_while(|l| !l.contains("is not supported by the following package"))
+            .nth(1)
+            .map(str::trim)
+            .unwrap_or("");
+        return Some(format!(
+            "{} ({}) — run `rustup update`, then restart the build to retry",
+            line.trim().trim_end_matches(':'), who
+        ));
+    }
+    if txt.contains("linker `cc` not found") {
+        return Some("no C linker on this machine — install your distro's build-essential/gcc package, then restart the build".into());
+    }
+    if ["spurious network error", "Could not resolve host", "failed to fetch", "network failure", "Connection timed out"]
+        .iter().any(|p| txt.contains(p))
+    {
+        return Some("network failure while fetching sources — check connectivity and restart the build to retry".into());
+    }
+    if txt.contains("no space left on device") {
+        return Some("disk full — free some space, then restart the build to retry".into());
+    }
+    // fallback: cargo's last error line is still better than a bare exit code
+    txt.lines().rev()
+        .map(str::trim)
+        .find(|l| l.starts_with("error") && !l.starts_with("error: failed to compile"))
+        .or_else(|| txt.lines().rev().map(str::trim).find(|l| l.starts_with("error")))
+        .map(str::to_string)
 }
 
 /// Removes the provision lock file on every exit path (incl. panic unwind).
@@ -472,6 +514,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn cargo_log_summaries_are_actionable() {
+        // verbatim from the failed host run (2026-06-12)
+        let msrv = "error: failed to compile `gftools-builder v3.0.0 (...)`\n\nCaused by:\n  rustc 1.91.1 is not supported by the following package:\n    ascii-dag@0.4.2 requires rustc 1.92\n  Either upgrade rustc or select compatible dependency versions\n";
+        let s = summarize_cargo_log(msrv).unwrap();
+        assert!(s.contains("rustc 1.91.1 is not supported"), "{}", s);
+        assert!(s.contains("ascii-dag@0.4.2 requires rustc 1.92"), "{}", s);
+        assert!(s.contains("rustup update"), "{}", s);
+
+        let linker = "error: linker `cc` not found\n  = note: No such file or directory\n";
+        assert!(summarize_cargo_log(linker).unwrap().contains("build-essential"));
+
+        let net = "warning: spurious network error (3 tries remaining)\nerror: failed to fetch into ...\n";
+        assert!(summarize_cargo_log(net).unwrap().contains("network failure"));
+
+        let disk = "error: failed to write ...: no space left on device\n";
+        assert!(summarize_cargo_log(disk).unwrap().contains("disk full"));
+
+        // unknown failure: the last real error line, not the generic compile-failed wrapper
+        let other = "   Compiling foo v1.0\nerror[E0599]: no method named `frob` found\nerror: failed to compile `bar`\n";
+        assert_eq!(summarize_cargo_log(other).unwrap(), "error[E0599]: no method named `frob` found");
+
+        // a log with no error lines yields None (caller falls back to the rc message)
+        assert!(summarize_cargo_log("   Compiling foo\n    Finished\n").is_none());
     }
 
     #[test]
