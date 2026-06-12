@@ -256,6 +256,7 @@ pub struct ResetPortion {
     #[serde(default)] pub hint: String,  // what deleting does / what survives
     #[serde(default)] pub deleting: bool, // a deletion is in flight — UIs render the progress bar
     #[serde(default)] pub freed: u64,    // bytes freed so far (live while deleting)
+    #[serde(default)] pub note: String,  // transient outcome shown on the row ("✓ freed X" / "⛔ refused …")
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

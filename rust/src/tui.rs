@@ -984,14 +984,20 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                         (format!("{} remaining", crate::util::human(tot - fr)), Color::Yellow),
                     ];
                 }
+                let tail = if !p.note.is_empty() {
+                    let col = if p.note.starts_with('⛔') { Color::Red } else { Color::Green };
+                    (p.note.clone(), col)
+                } else {
+                    (head(&p.hint, 70), Color::Grey)
+                };
                 vec![
                     (format!("{:<44} ", head(&p.label, 44)), Color::White),
                     (format!("{:>10}  ", crate::util::human(p.bytes)), if p.bytes > 0 { Color::Yellow } else { Color::DarkGrey }),
-                    (head(&p.hint, 70), Color::Grey),
+                    tail,
                 ]
             }).collect();
             vec![SectionR {
-                title: "Reset — delete a portion of the build system  (ENTER = what it does · D in the overlay = DELETE · archive & results are never touched)".into(),
+                title: "Reset — delete a portion of the build system  (ENTER = what it does · D in the overlay = DELETE · items in use by a running build are kept · archive & results are never touched)".into(),
                 dview: "reset", rows, keys: snap.reset_portions.iter().map(|p| p.key.clone()).collect(),
             }]
         }
@@ -1917,7 +1923,7 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
                 o.push(format!("   {}", p.hint));
                 o.push("   the repo archive, google/fonts clone and build RESULTS are never touched".into());
                 o.push(String::new());
-                o.push("   ▶ press D to DELETE this portion now (refused while builds are in flight — pause first)".into());
+                o.push("   ▶ press D to DELETE now — items in use by a running build are kept, the rest are deleted".into());
             }
             return o;
         }

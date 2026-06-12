@@ -378,12 +378,12 @@ function prov(x){const c=x.compiler_version||x.backend||'';return c+(x.builder_v
 function ctl(set){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({set:set})})}
 // --- reset tab: granular deletion of build-system portions (mirrors the TUI's reset tab) ---
 function resetPortion(key,label,bytes){
- if(!confirm('DELETE '+label+' ('+human(bytes)+')?\n\nThe repo archive, google/fonts clone and build RESULTS are never touched.\nDeletions are refused while builds are in flight (pause first).'))return;
+ if(!confirm('DELETE '+label+' ('+human(bytes)+')?\n\nThe repo archive, google/fonts clone and build RESULTS are never touched.\nItems in use by a running build are kept; everything else is deleted.'))return;
  ctl({reset_portion:key});
 }
 function resetView(){
  const ps=snap.reset_portions||[];
- let h='<div class="sec">Reset — delete a portion of the build system  <span class="muted">(archive & results are never touched · refused while builds are in flight)</span></div>';
+ let h='<div class="sec">Reset — delete a portion of the build system  <span class="muted">(items in use by a running build are kept · archive & results are never touched)</span></div>';
  if(!ps.length)return h+'<div class="ln muted">(sizes are being measured — they refresh every ~30 s)</div>';
  h+=ps.map(p=>{
   if(p.deleting){
@@ -395,8 +395,10 @@ function resetView(){
     '<div class="barlbl">'+human(fr)+' / '+human(tot)+' deleted ('+pct+'%)</div></div></div>';
   }
   const dis=p.bytes==0;
+  const note=p.note?'<span class="'+(p.note.indexOf('\u26d4')==0?'r':'g')+'"> — '+E(p.note)+'</span>':'';
+  const sub=p.note?'':('<br><span class="muted" style="margin-left:5.5em">'+E(p.hint)+'</span>');
   return '<div class="ln"><button class="btn" '+(dis?'disabled':'')+' onclick="resetPortion(\''+p.key+'\',\''+E(p.label)+'\','+p.bytes+')">delete</button>  '+
-   '<b>'+E(p.label)+'</b>  <span class="'+(dis?'muted':'y')+'">'+human(p.bytes)+'</span><br><span class="muted" style="margin-left:5.5em">'+E(p.hint)+'</span></div>';
+   '<b>'+E(p.label)+'</b>  <span class="'+(dis?'muted':'y')+'">'+human(p.bytes)+'</span>'+note+sub+'</div>';
  }).join('');
  h+='<div class="ln muted">outcomes are reported in the control log (config tab) — e.g. "reset venvs: freed 12.3GiB"</div>';
  return h;

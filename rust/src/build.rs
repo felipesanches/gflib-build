@@ -93,7 +93,8 @@ pub struct Shared {
     pub cohort_reqs: BTreeMap<String, String>,
     pub cached_cohorts: HashSet<String>,
     pub reset_portions: Vec<crate::model::ResetPortion>, // reset-tab portions + live sizes
-    pub reset_progress: BTreeMap<String, (u64, u64)>, // in-flight deletions: key -> (freed, total) // cohorts with a venv on disk (off-thread; for the 'cached' flag)
+    pub reset_progress: BTreeMap<String, (u64, u64)>, // in-flight deletions: key -> (freed, total)
+    pub reset_notes: BTreeMap<String, (String, f64)>, // transient per-portion outcome: key -> (msg, set_at) // cohorts with a venv on disk (off-thread; for the 'cached' flag)
     pub op_stats: HashMap<String, (f64, usize, f64)>, // op -> (total_secs, count, max) for timings.json
 }
 
@@ -415,6 +416,7 @@ impl Orchestrator {
             cached_cohorts: HashSet::new(),
             reset_portions: Vec::new(),
             reset_progress: BTreeMap::new(),
+            reset_notes: BTreeMap::new(),
             op_stats: HashMap::new(),
         };
         let venvs = if cfg.manage_venvs {
@@ -1649,55 +1651,100 @@ impl Orchestrator {
         ]
     }
 
-    /// Execute one reset-tab deletion off-thread. Refused while builds are in flight (a deletion
-    /// racing a build's collect/venv use would corrupt it) — pause or let the queue drain first.
+    /// Execute one reset-tab deletion off-thread. Instead of refusing the whole portion when any
+    /// build is in flight, it deletes every ITEM that is not actively in use and SKIPS the few
+    /// that are: per-family artifacts of currently-building families are kept, as are cohort venvs
+    /// a building family is using and (while any build runs) the shared toolchain it executes.
     fn spawn_reset_portion(self: &Arc<Self>, key: String) {
         let me = Arc::clone(self);
         thread::spawn(move || {
-            {
-                let mut sh = me.shared.lock().unwrap();
-                let building = sh.results.values().filter(|r| r.status == "building").count();
-                if building > 0 {
-                    sh.control_log.push(format!(
-                        "reset {}: REFUSED — {} build(s) in flight; pause the build first", key, building));
-                    return;
-                }
-            }
+            me.shared.lock().unwrap().reset_notes.remove(&key); // fresh attempt → clear any old outcome
             let bd = me.cfg.build_dir.clone();
-            // resolve the portion's target tree(s) + measure the total UP FRONT, so the progress
-            // bar has a stable denominator from the very first poll
-            let fonts_targets: Option<Vec<(String, String)>> = if key.starts_with("fonts-") {
+
+            // what's actively in use right now — never deleted out from under a running build
+            let (building_lognames, in_use_cohorts, n_building, built_by_backend) = {
                 let sh = me.shared.lock().unwrap();
-                Some(sh.results.values().filter(|r| r.status == "built")
-                    .map(|r| (slug_to_logname(&r.slug), r.backend.clone())).collect())
-            } else {
-                None
+                let building: HashSet<String> = sh.results.values()
+                    .filter(|r| r.status == "building").map(|r| slug_to_logname(&r.slug)).collect();
+                let cohorts: HashSet<String> = sh.results.values()
+                    .filter(|r| r.status == "building" && !r.cohort.is_empty())
+                    .map(|r| r.cohort.clone()).collect();
+                let by_backend: Vec<(String, String)> = sh.results.values().filter(|r| r.status == "built")
+                    .map(|r| (slug_to_logname(&r.slug), r.backend.clone())).collect();
+                (building, cohorts, sh.results.values().filter(|r| r.status == "building").count(), by_backend)
             };
-            let dir: Option<PathBuf> = match key.as_str() {
-                "variants" => Some(bd.join("variants")),
-                "debs" => Some(bd.join("packaging")),
-                "venvs" => Some(bd.join("venvs")),
-                "pip-cache" => Some(bd.join("pip-cache")),
-                "logs" => Some(bd.join("logs")),
-                "work" => Some(bd.join("work")),
-                "fontspector" => Some(bd.join("fontspector")),
-                "tools" => Some(me.cfg.data_dir.join("tools")),
-                "fonts-fontc" | "fonts-fontmake" => None,
+
+            // gather the concrete paths to delete for this portion, already excluding in-use items
+            let mut targets: Vec<PathBuf> = Vec::new();
+            let mut skipped = 0usize;
+            // immediate children of `dir` keyed by a family logname (file stem or dir name): keep
+            // the ones currently building, delete the rest. `strip` removes a suffix like ".log".
+            let mut per_family_dir = |dir: &Path, strip: &str| {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for e in entries.flatten() {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        let logname = name.strip_suffix(strip).unwrap_or(&name).to_string();
+                        if building_lognames.contains(&logname) { skipped += 1; } else { targets.push(e.path()); }
+                    }
+                }
+            };
+            match key.as_str() {
+                "fonts-fontc" | "fonts-fontmake" => {
+                    let compiler = key.trim_start_matches("fonts-");
+                    let (t, s) = select_font_targets(&bd.join("out"), &built_by_backend, compiler, &building_lognames);
+                    targets = t; skipped += s;
+                }
+                "variants" => per_family_dir(&bd.join("variants"), ""),
+                "work" => per_family_dir(&bd.join("work"), ""),
+                "fontspector" => per_family_dir(&bd.join("fontspector"), ""),
+                "logs" => {
+                    per_family_dir(&bd.join("logs"), ".log"); // keep a building family's live log
+                    // logs/failed/ archived copies aren't a building family's live log → fair game
+                    // (per_family_dir already queued it as a dir entry named "failed"; that's fine)
+                }
+                "debs" => {
+                    // per-family debian trees keep building families'; the global pool/index go
+                    let pkg = bd.join("packaging");
+                    if let Ok(entries) = std::fs::read_dir(&pkg) {
+                        for e in entries.flatten() {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            if building_lognames.contains(&name) { skipped += 1; } else { targets.push(e.path()); }
+                        }
+                    }
+                }
+                "venvs" => {
+                    if let Ok(entries) = std::fs::read_dir(bd.join("venvs")) {
+                        for e in entries.flatten() {
+                            let cohort = e.file_name().to_string_lossy().to_string();
+                            // a venv is in use if a building family's cohort key is a prefix of it
+                            // (the multi-Python ladder appends -py<tag> to the base cohort key)
+                            let in_use = in_use_cohorts.iter().any(|c| cohort == *c || cohort.starts_with(&format!("{}-py", c)));
+                            if in_use { skipped += 1; } else { targets.push(e.path()); }
+                        }
+                    }
+                }
+                "pip-cache" => targets.push(bd.join("pip-cache")), // shared; worst case a re-download
+                "tools" => {
+                    // the provisioned binaries are executed by EVERY in-flight build; deleting them
+                    // would break not-yet-started attempts. Allowed only when nothing is building.
+                    if n_building > 0 {
+                        let now = me.elapsed();
+                        let msg = format!("⛔ kept — in use by {} running build(s); pause to delete", n_building);
+                        let mut sh = me.shared.lock().unwrap();
+                        sh.control_log.push(format!("reset tools: {}", msg));
+                        sh.reset_notes.insert(key.clone(), (msg, now));
+                        return;
+                    }
+                    targets.push(me.cfg.data_dir.join("tools"));
+                }
                 other => {
                     me.shared.lock().unwrap().control_log.push(format!("reset: unknown portion '{}'", other));
                     return;
                 }
-            };
-            let compiler = key.trim_start_matches("fonts-").to_string();
-            let total: u64 = match (&dir, &fonts_targets) {
-                (Some(d), _) => dir_size(d),
-                (None, Some(t)) => t.iter().map(|(l, b)| match b.as_str() {
-                    x if x == compiler => dir_size(&bd.join("out").join(l)),
-                    "both" => dir_size(&bd.join("out").join(l).join(&compiler)),
-                    _ => 0,
-                }).sum(),
-                _ => 0,
-            };
+            }
+
+            // measure the selected targets up front so the bar has a stable denominator
+            let total: u64 = targets.iter().map(|p| dir_size(p)).sum();
             me.shared.lock().unwrap().reset_progress.insert(key.clone(), (0, total));
 
             // publish freed-bytes at most ~5×/s — the status writer snapshots every ~1 s anyway
@@ -1710,29 +1757,35 @@ impl Orchestrator {
                     me2.shared.lock().unwrap().reset_progress.insert(k2.clone(), (freed, total));
                 }
             };
-
             let mut freed = 0u64;
-            match (&dir, &fonts_targets) {
-                (Some(d), _) => remove_tree_progress(d, &mut freed, &mut publish),
-                (None, Some(t)) => {
-                    freed = delete_built_fonts(&bd.join("out"), t, &compiler, &mut publish);
+            for p in &targets {
+                if p.is_dir() { remove_tree_progress(p, &mut freed, &mut publish); }
+                else if let Ok(m) = std::fs::metadata(p) {
+                    freed += m.len();
+                    let _ = std::fs::remove_file(p);
+                    publish(freed);
                 }
-                _ => {}
             }
+
             match key.as_str() {
                 "debs" => me.shared.lock().unwrap().packaged.clear(),
-                "venvs" => me.shared.lock().unwrap().cached_cohorts.clear(),
+                "venvs" => me.shared.lock().unwrap().cached_cohorts.retain(|c| in_use_cohorts.contains(c)),
+                "logs" => { let _ = std::fs::create_dir_all(bd.join("logs")); } // every build needs logs/
                 _ => {}
             }
-            // logs/ is needed by every build — recreate the empty dir immediately
-            if key == "logs" {
-                let _ = std::fs::create_dir_all(bd.join("logs"));
-            }
+
             let portions = me.compute_reset_portions();
+            let now = me.elapsed();
             let mut sh = me.shared.lock().unwrap();
             sh.reset_progress.remove(&key);
             sh.reset_portions = portions;
-            sh.control_log.push(format!("reset {}: freed {}", key, crate::util::human(freed)));
+            let msg = if skipped > 0 {
+                format!("✓ freed {} (kept {} in use)", crate::util::human(freed), skipped)
+            } else {
+                format!("✓ freed {}", crate::util::human(freed))
+            };
+            sh.reset_notes.insert(key.clone(), (msg.clone(), now)); // lingers ~6 s
+            sh.control_log.push(format!("reset {}: {}", key, msg));
         });
     }
 
@@ -2775,11 +2828,15 @@ impl Orchestrator {
             tasks: self.toolchain_tasks(),
             reset_portions: {
                 let mut ps = sh.reset_portions.clone();
+                let now = self.elapsed();
                 for p in ps.iter_mut() {
                     if let Some((freed, total)) = sh.reset_progress.get(&p.key) {
                         p.deleting = true;
                         p.freed = *freed;
                         p.bytes = *total; // freeze the bar's denominator for the whole deletion
+                    }
+                    if let Some((msg, at)) = sh.reset_notes.get(&p.key) {
+                        if now - at < 6.0 { p.note = msg.clone(); }
                     }
                 }
                 ps
@@ -3152,19 +3209,20 @@ fn remove_tree_progress(dir: &Path, freed: &mut u64, cb: &mut dyn FnMut(u64)) {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// Reset-tab: delete the built fonts of every family whose COMPILER matches (`fontc`/`fontmake`).
-/// A plain family's whole out/<slug> goes; a both-mode family loses only the matching compiler's
-/// subdir. Returns bytes freed. Results/state are deliberately untouched (same as --discard-fonts).
-fn delete_built_fonts(out_root: &Path, built: &[(String, String)], compiler: &str, cb: &mut dyn FnMut(u64)) -> u64 {
-    let mut freed = 0u64;
+/// Reset-tab: the out/ font dirs to delete for one COMPILER (`fontc`/`fontmake`) — a plain
+/// family's whole out/<logname>, a both-mode family's matching-compiler subdir — skipping any
+/// family currently building. Pure (returns the path list + #skipped) so it's unit-tested; the
+/// caller deletes the paths with progress. Results/state are untouched (same as --discard-fonts).
+fn select_font_targets(out_root: &Path, built: &[(String, String)], compiler: &str,
+                       building: &HashSet<String>) -> (Vec<PathBuf>, usize) {
+    let mut targets = Vec::new();
+    let mut skipped = 0;
     for (logname, backend) in built {
-        if backend == compiler {
-            remove_tree_progress(&out_root.join(logname), &mut freed, cb);
-        } else if backend == "both" {
-            remove_tree_progress(&out_root.join(logname).join(compiler), &mut freed, cb);
-        }
+        if building.contains(logname) { skipped += 1; continue; }
+        if backend == compiler { targets.push(out_root.join(logname)); }
+        else if backend == "both" { targets.push(out_root.join(logname).join(compiler)); }
     }
-    freed
+    (targets, skipped)
 }
 
 /// Undo `stash_variant_outputs` after a declined upgrade: the kept binaries go back to being the
@@ -3859,17 +3917,21 @@ mod tests {
             ("ofl__b".to_string(), "fontmake".to_string()),
             ("ofl__c".to_string(), "both".to_string()),
         ];
-        let mut seen: Vec<u64> = Vec::new();
-        let freed = delete_built_fonts(&out, &built, "fontc", &mut |f| seen.push(f));
-        assert!(freed > 0);
-        // the progress callback fired with monotonically growing freed-bytes
-        assert!(!seen.is_empty());
-        assert!(seen.windows(2).all(|w| w[0] <= w[1]));
-        assert_eq!(*seen.last().unwrap(), freed);
+        // pick the fontc targets, with ofl__b currently BUILDING (must be skipped if it matched)
+        let building: std::collections::HashSet<String> = std::iter::once("ofl__never".to_string()).collect();
+        let (targets, skipped) = select_font_targets(&out, &built, "fontc", &building);
+        assert_eq!(skipped, 0);
+        assert_eq!(targets.len(), 2, "fontc plain dir + both-mode fontc subdir");
+        for t in &targets { if t.is_dir() { let _ = std::fs::remove_dir_all(t); } }
         assert!(!out.join("ofl__a").exists(), "fontc-built family deleted");
         assert!(out.join("ofl__b/B.ttf").is_file(), "fontmake-built family untouched");
         assert!(!out.join("ofl__c/fontc").exists(), "both-mode fontc subdir deleted");
         assert!(out.join("ofl__c/fontmake/C.ttf").is_file(), "both-mode fontmake subdir kept");
+        // a currently-building family is skipped, not deleted
+        let busy: std::collections::HashSet<String> = std::iter::once("ofl__a".to_string()).collect();
+        let (t2, s2) = select_font_targets(&out, &built, "fontc", &busy);
+        assert_eq!(s2, 1);
+        assert!(!t2.iter().any(|p| p.ends_with("ofl__a")), "building family not targeted");
         let _ = std::fs::remove_dir_all(&root);
     }
 
