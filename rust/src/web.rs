@@ -250,7 +250,7 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  :root{--g:#86efac;--r:#fca5a5;--c:#67e8f9;--dc:#0e9bbd;--y:#fde68a;--o:#fb923c;--muted:#7c8aa0;--dr:#c77d7d;--w:#fff;--gr:#cbd5e1;--m:#f0abfc;--bg:#0b0e14;--panel:#11161f;--line:#1e293b;--secbg:#0e1420;--hover:#16202f;--pinbg:#1a1505}
  body[data-theme=light]{--g:#15803d;--r:#b91c1c;--c:#0e7490;--dc:#0e6d85;--y:#a16207;--o:#c2620a;--muted:#64748b;--dr:#b45454;--w:#0b1220;--gr:#1e293b;--m:#a21caf;--bg:#f6f7f9;--panel:#ffffff;--line:#e2e8f0;--secbg:#eef2f7;--hover:#e8edf3;--pinbg:#fdf6e3}
  body{background:var(--bg);color:var(--gr);font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:10px 12px}
- /* W5: responsive multi-pane (overview sections side by side on wide screens) */
+ /* W5: responsive multi-pane (side-by-side panels on wide screens — used by the packaging tab) */
  .panes{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
  @media(max-width:900px){.panes{grid-template-columns:1fr}}
  .w5{font-size:11px}
@@ -669,7 +669,7 @@ function render(){
  else if(tab=='fontspector')body+=fsView();
  else if(tab=='crater')body+=craterView();
  else if(tab=='packaging')body+=packagingView();
- else if(tab=='overview')body+='<div class="panes">'+sections(tab).map(s=>'<div>'+renderSec(s)+'</div>').join('')+'</div>'; // multi-pane
+ else if(tab=='overview')body+=sections(tab).map(renderSec).join(''); // stacked, like the TUI: Pipeline on top, Recent failures below
  else{body+=(tab=='stats'?statsPrefix():'')+sections(tab).map(renderSec).join('');}
  document.getElementById('body').innerHTML=body;
 }
