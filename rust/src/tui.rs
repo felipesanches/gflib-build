@@ -540,6 +540,13 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
                         ui.detail_lines = build_detail(&snap, ui.tab, ui.section, ui.sel, ui.fc_sel, &source.build_dir());
                         if !ui.detail_lines.is_empty() { ui.dscroll = 0; ui.detail = true; }
                     }
+                    // reset tab: D deletes the selected portion immediately (no overlay/confirm —
+                    // matches the web button; outcome shows on the row as a bar then '✓ freed X')
+                    KeyCode::Char('d') | KeyCode::Char('D') if TABS.get(ui.tab) == Some(&"reset") => {
+                        if let Some(p) = snap.reset_portions.get(ui.sel) {
+                            source.control(&ControlSet { reset_portion: Some(p.key.clone()), ..Default::default() });
+                        }
+                    }
                     KeyCode::Char('p') | KeyCode::Char('P') => {
                         source.control(&ControlSet { paused: Some(!snap.paused), ..Default::default() });
                     }
@@ -997,7 +1004,7 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                 ]
             }).collect();
             vec![SectionR {
-                title: "Reset — delete a portion of the build system  (ENTER = what it does · D in the overlay = DELETE · items in use by a running build are kept · archive & results are never touched)".into(),
+                title: "Reset — delete a portion of the build system  (D = delete the selected row · ENTER = details · items in use by a running build are kept · archive & results are never touched)".into(),
                 dview: "reset", rows, keys: snap.reset_portions.iter().map(|p| p.key.clone()).collect(),
             }]
         }
