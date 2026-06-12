@@ -363,6 +363,7 @@ const SCHEMA=[
  {k:'populate_archive',l:'populate archive (fetch repos)',t:'bool',live:true},
  {k:'manage_venvs',l:'cohort venvs',t:'bool',live:false},
  {k:'retry_failed',l:'retry ALL failed (incl. genuine errors)',t:'bool',live:false},
+ {k:'auto_upgrade',l:'auto-upgrade built families (better backend)',t:'bool',live:false},
  {k:'compare',l:'compare to shipped',t:'bool',live:true},
  {k:'fontspector_qa',l:'fontspector QA on green builds',t:'bool',live:false},
  {k:'build_debs',l:'build .deb packages (auto-package built families)',t:'bool',live:true},
@@ -407,7 +408,7 @@ function taskRow(t){const m=TASK_MARK[t.status]||'?',cl=TASK_CLS[t.status]||'gr'
  const prog=t.total?(t.done+'/'+t.total):'',el=t.elapsed?hms(t.elapsed):'';
  return {segs:[[m+' '+L(t.name,26)+' '+L(prog,11)+Rp(el,8)+'  '+(t.detail||''),cl]],det:['task',t.key]}}
 function failRow(f){const segs=[[L(f.slug,34)+' ','r']];if(f.rebuild_note)segs.push(['⟳ ','y']);if(f.crater)segs.push(['['+craterLabel(f.crater)+'] ',craterCol(f.crater),CRATER_TIP]);segs.push([f.error||'','dr']);return {segs,rt:f.slug,det:['failed',f.slug]}}
-function qRow(q){const kc={retry:'y',rebuild:'c'}[q.kind]||'g';const segs=[['  '+L(q.kind,8)+' ',kc],[L(q.slug||'',38)+' ','gr']];if(q.crater)segs.push([craterLabel(q.crater),craterCol(q.crater),CRATER_TIP]);return {segs,rt:q.slug,det:['queue',q.slug]}}
+function qRow(q){const kc={retry:'y',rebuild:'c',upgrade:'m'}[q.kind]||'g';const segs=[['  '+L(q.kind,8)+' ',kc],[L(q.slug||'',38)+' ','gr']];if(q.crater)segs.push([craterLabel(q.crater),craterCol(q.crater),CRATER_TIP]);return {segs,rt:q.slug,det:['queue',q.slug]}}
 // cohort member colour by build status: built=green, failed=red, building=yellow, else grey
 function famCls(st){return {built:'g',failed:'r',building:'y'}[st]||'muted'}
 function cohortRow(c){const segs=[[c.cached?'● ':'○ ',c.cached?'g':'muted'],[Rp(c.count,4)+'  '+L(c.key,14)+' ',!c.cached?'muted':(c.key=='base'?'w':'c')]];
@@ -576,7 +577,7 @@ const LIVE_APPLY={backend:1,jobs:1,percent:1,compare:1,build_debs:1};
 const GROUPS=[
  {t:'Sources & paths', k:['source','google_fonts','archive','build_dir']},
  {t:'Build engine',    k:['backend','orchestrator','fontc_bin','auto_provision','manage_venvs','jobs','timeout']},
- {t:'Scope',           k:['percent','retry_failed','populate_archive']},
+ {t:'Scope',           k:['percent','retry_failed','auto_upgrade','populate_archive']},
  {t:'QA & packaging',  k:['compare','fontspector_qa','build_debs']},
 ];
 // one form control per field: live → an editable widget that posts straight to control.json;

@@ -159,6 +159,14 @@ pub fn provisioned_bin(tools_root: &Path, spec: &ToolSpec) -> PathBuf {
     tools_root.join(format!("{}-{}", spec.name, spec.pin)).join("bin").join(spec.bin_name)
 }
 
+/// The toolchain signature stamped on every completed build attempt (Res.upgrade_attempted): the
+/// pins + the orchestrator preference — exactly the inputs that change what the attempt chain can
+/// reach. A built family below the top rung is automatically re-attempted ("upgrade") whenever its
+/// stamp differs, i.e. once per pin bump / preference change, never repeatedly.
+pub fn pins_sig(orchestrator: &str) -> String {
+    format!("builder3:{}+fontc:{}|{}", &BUILDER3_REV[..10], FONTC_VERSION, orchestrator)
+}
+
 /// Run a started child to completion with a hard deadline and an optional external stop flag.
 /// Polls (no extra threads); on deadline/stop the child is killed and an Err returned. The child
 /// is plain `kill()` (SIGKILL): provisioning children are ours and disposable.

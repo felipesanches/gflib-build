@@ -291,7 +291,7 @@ impl Orchestrator {
         let mut results = BTreeMap::new();
         let mut families = BTreeMap::new();
         // (slug, prior_duration) for queued families — sorted longest-first below to shrink the tail
-        let mut queued_with_dur: Vec<(String, f64, bool)> = Vec::new(); // (slug, prior_dur, requested_rebuild)
+        let mut queued_with_dur: Vec<(String, f64, bool, bool)> = Vec::new(); // (slug, prior_dur, requested_rebuild, is_upgrade)
         for f in fams {
             let slug = f.slug.clone();
             families.insert(slug.clone(), f);
@@ -306,7 +306,23 @@ impl Orchestrator {
             } else if force {
                 ("queued", "rebuild")
             } else { match prev {
-                Some(p) if p.status == "built" && !cfg.rebuild => ("built", ""),
+                Some(p) if p.status == "built" && !cfg.rebuild => {
+                    // auto-upgrade: a kept success below the top rung (fontmake, or fontc under
+                    // builder2) is re-attempted at the better rungs — automatically, exactly once
+                    // per toolchain signature (pins + orchestrator). The prior result is restored
+                    // if the upgrade fails, so this never costs an existing success.
+                    let upgradable = cfg.auto_upgrade
+                        && cfg.backend != "fontmake"
+                        && cfg.backend != "both"
+                        && p.backend != "both"
+                        && result_rung(&p.builder, &p.backend) < 2
+                        && p.upgrade_attempted != crate::toolchain::pins_sig(&cfg.orchestrator);
+                    if upgradable {
+                        ("queued", "upgrade")
+                    } else {
+                        ("built", "")
+                    }
+                }
                 Some(p) if p.status == "failed" => {
                     let (cause, _) = crate::classify::categorize_failure(&p.error);
                     let retry = cfg.rebuild
@@ -336,17 +352,19 @@ impl Orchestrator {
                 // everything, so it isn't a per-family priority signal.
                 let requested = force;
                 r.queued_kind = if cfg.rebuild || force { "rebuild".into() } else { kind.into() };
-                queued_with_dur.push((slug.clone(), prior_dur, requested));
+                queued_with_dur.push((slug.clone(), prior_dur, requested, kind == "upgrade"));
             }
             results.insert(slug, r);
         }
         // requested rebuilds (--retrigger) first; then longest-first (known long prior build) so big
-        // families parallelize early; never-built (dur 0) last.
+        // families parallelize early; never-built (dur 0) last. Auto-UPGRADES go at the very end:
+        // improving an existing success must never delay first-time coverage or a real retry.
         queued_with_dur.sort_by(|a, b| {
             b.2.cmp(&a.2)
+                .then(a.3.cmp(&b.3)) // non-upgrades before upgrades
                 .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
         });
-        let queue: VecDeque<String> = queued_with_dur.into_iter().map(|(s, _, _)| s).collect();
+        let queue: VecDeque<String> = queued_with_dur.into_iter().map(|(s, _, _, _)| s).collect();
 
         let failure_history = persist::read_failure_history(&cfg.build_dir);
         // jobs 0 = inspect-only: keep the loaded data + UI live but spawn NO build workers.
@@ -1144,6 +1162,12 @@ impl Orchestrator {
                 None => return,
             }
         };
+        // auto-UPGRADE runs keep a full snapshot of the prior (built) result: if no better rung
+        // succeeds, the snapshot is restored verbatim — an upgrade can never cost a success.
+        let upgrade_prior: Option<Res> = {
+            let sh = self.shared.lock().unwrap();
+            sh.results.get(slug).filter(|r| r.queued_kind == "upgrade").cloned()
+        };
         let logname = slug_to_logname(slug);
         let log_path = self.cfg.build_dir.join("logs").join(format!("{}.log", logname));
         let work = self.cfg.build_dir.join("work").join(&logname);
@@ -1233,7 +1257,23 @@ impl Orchestrator {
             return;
         }
 
-        let pairs = self.attempt_pairs(fontc_bin.is_some(), builder3_bin.is_some());
+        let tc_sig = crate::toolchain::pins_sig(&self.cfg.orchestrator);
+        let mut pairs = self.attempt_pairs(fontc_bin.is_some(), builder3_bin.is_some());
+        let mut stash: Option<PathBuf> = None;
+        if let Some(prior) = &upgrade_prior {
+            // an upgrade only ever tries rungs STRICTLY better than the kept success
+            let floor = result_rung(&prior.builder, &prior.backend);
+            pairs.retain(|(b, c)| result_rung(b, c) > floor);
+            if pairs.is_empty() {
+                // nothing better is reachable right now (e.g. builder3 unavailable): keep the
+                // success untouched and stamp the signature so this isn't re-tried until a pin bump
+                self.restore_prior(slug, prior, &tc_sig, "no better rung available");
+                cleanup(&work, self.cfg.keep_work);
+                return;
+            }
+            // park the prior rung's binaries: kept for comparison on success, restored on decline
+            stash = stash_variant_outputs(&self.cfg.build_dir, &out_dir, &logname, prior);
+        }
         if pairs.is_empty() {
             let backend = self.shared.lock().unwrap().backend.clone();
             self.fail(slug, "no usable backend", &format!(
@@ -1355,6 +1395,7 @@ impl Orchestrator {
                 String::new()
             };
             let used = backend.to_string();
+            let sig = tc_sig.clone();
             self.set_result(slug, |r| {
                 r.status = "built".into();
                 r.ended = now();
@@ -1363,10 +1404,25 @@ impl Orchestrator {
                 r.backend = used.clone();
                 r.compare = cmp.clone();
                 r.note = String::new();
+                r.queued_kind = String::new();
+                // this run's chain already tried every better rung first — stamp the signature so
+                // the auto-upgrade pass doesn't pointlessly re-attempt under the same toolchain
+                r.upgrade_attempted = sig;
             });
             log_line(&log_path, &format!(
                 "DONE: builder={} backend={} bytes={} missing={}", builder, backend, bytes, missing
             ));
+            if let (Some(prior), Some(v)) = (&upgrade_prior, &stash) {
+                // both rungs' binaries are now on disk: the new canonical in out/, the superseded
+                // rung under variants/ — kept so the outputs can be compared later (M3)
+                log_line(&log_path, &format!(
+                    "UPGRADED from {} via {} — its binaries are kept for comparison at {}",
+                    prior.backend, prior.builder, v.display()
+                ));
+                self.shared.lock().unwrap().control_log.push(format!(
+                    "upgrade {}: {} → {} (prior binaries kept under variants/)", slug, prior.backend, used
+                ));
+            }
             self.emit("built", slug, serde_json::json!({"backend": used, "builder": builder, "bytes": bytes, "compare": cmp}));
             self.enqueue_qa(slug);
             // keep the built fonts when deb-packaging is on: the live package worker needs them on
@@ -1380,11 +1436,43 @@ impl Orchestrator {
 
         if !built_any {
             let err = if last_err.is_empty() { "build failed".into() } else { last_err };
+            if let Some(prior) = &upgrade_prior {
+                // the upgrade didn't pan out — the kept success is RESTORED, never overwritten
+                // (result fields AND the parked binaries). The attempt details stay in the family
+                // log; the failure tabs/history are for real regressions, not declined upgrades.
+                if let Some(v) = &stash {
+                    unstash_outputs(v, &out_dir);
+                }
+                log_line(&log_path, &format!("UPGRADE declined (prior {} via {} kept): {}", prior.backend, prior.builder, err));
+                self.emit("upgrade_declined", slug, serde_json::json!({"kept": prior.backend, "error": err}));
+                self.restore_prior(slug, prior, &tc_sig, &err);
+                cleanup(&work, self.cfg.keep_work);
+                return;
+            }
             let (cause, _) = crate::classify::categorize_failure(&err);
             self.fail(slug, cause, &err);
             let _ = fontc_err;
         }
         cleanup(&work, self.cfg.keep_work);
+    }
+
+    /// Put a kept success back after a declined auto-upgrade: the prior result verbatim (backend,
+    /// builder, versions, bytes, compare, ended), status `built`, stamped with the toolchain
+    /// signature so the upgrade isn't re-attempted until a pin/preference change.
+    fn restore_prior(&self, slug: &str, prior: &Res, sig: &str, why: &str) {
+        let p = prior.clone();
+        let sig = sig.to_string();
+        self.set_result(slug, |r| {
+            *r = p;
+            r.status = "built".into();
+            r.note = String::new();
+            r.queued_kind = String::new();
+            r.upgrade_attempted = sig;
+        });
+        self.shared.lock().unwrap().control_log.push(format!(
+            "upgrade {}: kept existing result ({})", slug, &why[..why.len().min(120)]
+        ));
+        self.cond.notify_all();
     }
 
     fn fail(&self, slug: &str, cause: &str, msg: &str) {
@@ -2806,6 +2894,62 @@ pub fn attempt_chain(
     chain
 }
 
+/// A result's quality rung on the Rust-migration ladder: builder3 (2, Python-free) >
+/// builder2+fontc (1) > fontmake / legacy records (0). Used both to grade prior results
+/// (auto-upgrade eligibility) and to filter an upgrade's attempt chain to strictly-better rungs.
+pub fn result_rung(builder: &str, backend: &str) -> u8 {
+    if builder == "builder3" {
+        2
+    } else if backend == "fontc" {
+        1
+    } else {
+        0
+    }
+}
+
+/// Move a family's current (flat) output fonts aside before an upgrade attempt, into
+/// `<build-dir>/variants/<slug>/<builder>-<backend>/`. A SUCCESSFUL upgrade leaves them there —
+/// every rung's binaries are kept so they can be compared later (the M3 axis) — while a declined
+/// upgrade moves them straight back via `unstash_outputs`. The variants tree is deliberately
+/// OUTSIDE `out/`: everything that scans out/ (packaging, QA, comparisons) must keep seeing
+/// exactly one canonical set of fonts per family.
+fn stash_variant_outputs(build_dir: &Path, out_dir: &Path, logname: &str, prior: &Res) -> Option<PathBuf> {
+    let builder = if prior.builder.is_empty() { "builder2" } else { prior.builder.as_str() };
+    let backend = if prior.backend.is_empty() { "unknown" } else { prior.backend.as_str() };
+    let dest = build_dir.join("variants").join(logname).join(format!("{}-{}", builder, backend));
+    let mut moved = false;
+    if let Ok(entries) = std::fs::read_dir(out_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_file() && matches!(p.extension().and_then(|x| x.to_str()), Some("ttf") | Some("otf")) {
+                if !moved {
+                    if std::fs::create_dir_all(&dest).is_err() {
+                        return None; // can't preserve → leave everything in place
+                    }
+                    moved = true;
+                }
+                let _ = std::fs::rename(&p, dest.join(e.file_name()));
+            }
+        }
+    }
+    if moved { Some(dest) } else { None }
+}
+
+/// Undo `stash_variant_outputs` after a declined upgrade: the kept binaries go back to being the
+/// family's canonical output, and the emptied variant dir is removed.
+fn unstash_outputs(stash: &Path, out_dir: &Path) {
+    let _ = std::fs::create_dir_all(out_dir);
+    if let Ok(entries) = std::fs::read_dir(stash) {
+        for e in entries.flatten() {
+            let _ = std::fs::rename(e.path(), out_dir.join(e.file_name()));
+        }
+    }
+    let _ = std::fs::remove_dir(stash); // only if now empty
+    if let Some(parent) = stash.parent() {
+        let _ = std::fs::remove_dir(parent); // remove variants/<slug> too when empty
+    }
+}
+
 /// The argv for one builder attempt — factored out of run_builder so the exact command shapes
 /// are unit-testable. Returns (program, args).
 fn builder_command(
@@ -3352,6 +3496,61 @@ mod tests {
         assert_eq!(attempt_chain("fontmake", "builder3", true, true), Vec::<(&str, &str)>::new());
         // builder3 forced but unavailable: empty (fail loudly, don't silently use Python)
         assert!(attempt_chain("auto", "builder3", true, false).is_empty());
+    }
+
+    #[test]
+    fn result_rung_orders_the_migration_ladder() {
+        assert_eq!(result_rung("builder3", "fontc"), 2);
+        assert_eq!(result_rung("builder2", "fontc"), 1);
+        assert_eq!(result_rung("builder2", "fontmake"), 0);
+        assert_eq!(result_rung("", ""), 0); // legacy pre-M0 record == fontmake-era floor
+        // the upgrade filter contract: only strictly-better rungs are attempted
+        let fontmake_floor = result_rung("builder2", "fontmake");
+        let chain = attempt_chain("auto", "auto", true, true);
+        let upgrades: Vec<_> = chain.into_iter().filter(|(b, c)| result_rung(b, c) > fontmake_floor).collect();
+        assert_eq!(upgrades, vec![("builder3", "fontc"), ("builder2", "fontc")]);
+        // a builder2+fontc success only has builder3 left above it
+        let fc_floor = result_rung("builder2", "fontc");
+        let chain = attempt_chain("auto", "auto", true, true);
+        let upgrades: Vec<_> = chain.into_iter().filter(|(b, c)| result_rung(b, c) > fc_floor).collect();
+        assert_eq!(upgrades, vec![("builder3", "fontc")]);
+        // a builder3 result has nowhere to go
+        let chain = attempt_chain("auto", "auto", true, true);
+        assert!(chain.into_iter().filter(|(b, c)| result_rung(b, c) > 2).next().is_none());
+    }
+
+    #[test]
+    fn pins_sig_tracks_pins_and_orchestrator() {
+        let s = crate::toolchain::pins_sig("auto");
+        assert!(s.contains(&crate::toolchain::BUILDER3_REV[..10]));
+        assert!(s.contains(crate::toolchain::FONTC_VERSION));
+        assert_ne!(s, crate::toolchain::pins_sig("builder2")); // preference change re-arms upgrades
+    }
+
+    #[test]
+    fn stash_and_unstash_preserve_the_prior_binaries() {
+        let root = std::env::temp_dir().join(format!("_stash_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let out = root.join("out").join("ofl__abel");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("Abel-Regular.ttf"), b"FONTMAKE").unwrap();
+        std::fs::write(out.join("build.log"), b"not a font").unwrap();
+        let prior = Res { builder: "builder2".into(), backend: "fontmake".into(), ..Default::default() };
+        // stash: fonts move to variants/<slug>/builder2-fontmake/, non-fonts stay
+        let stash = stash_variant_outputs(&root, &out, "ofl__abel", &prior).expect("stashed");
+        assert!(stash.ends_with("variants/ofl__abel/builder2-fontmake"));
+        assert!(stash.join("Abel-Regular.ttf").is_file());
+        assert!(!out.join("Abel-Regular.ttf").exists());
+        assert!(out.join("build.log").is_file());
+        // declined upgrade: unstash moves them back and removes the empty variant dirs
+        unstash_outputs(&stash, &out);
+        assert_eq!(std::fs::read(out.join("Abel-Regular.ttf")).unwrap(), b"FONTMAKE");
+        assert!(!stash.exists());
+        // empty out dir → nothing to stash → None (an upgrade with --discard-fonts priors)
+        let out2 = root.join("out").join("ofl__empty");
+        std::fs::create_dir_all(&out2).unwrap();
+        assert!(stash_variant_outputs(&root, &out2, "ofl__empty", &prior).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

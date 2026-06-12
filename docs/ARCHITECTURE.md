@@ -146,6 +146,24 @@ builder2 children run with `SOURCE_DATE_EPOCH=0` and the interpreter's `bin/` pr
 (gftools.builder shells out to `fontmake`/`ninja`/`ttfautohint` by name). Each child runs in its
 **own process group** so a freeze/kill reaches the whole `python → fontmake → ninja` tree.
 
+### Automatic upgrades (kept successes are never spent)
+
+At reconcile time, a kept success **below the top rung** (fontmake, or fontc under builder2) is
+re-queued as an `upgrade` — automatically, **once per toolchain signature** (the pins + the
+orchestrator preference, stamped on every completed attempt as `Res.upgrade_attempted`), and
+always **after** all new/retry work. An upgrade attempts only the rungs *strictly better* than the
+recorded one. Before it runs, the family's current output fonts are parked under
+`<build-dir>/variants/<slug>/<builder>-<backend>/`:
+
+- **declined** (no better rung succeeded): the prior result is restored verbatim — record *and*
+  binaries — and the family never appears as failed; the attempt lives in the family log and an
+  `upgrade_declined` event.
+- **succeeded**: the new result becomes canonical in `out/<slug>/`, and the superseded rung's
+  binaries stay under `variants/` — every compiler's successful output is kept so the binaries
+  can be compared later (the M3 axis).
+
+`--no-auto-upgrade` (or the config-tab toggle) disables the pass; bumping a pin re-arms it.
+
 ### The zero-setup toolchain (`toolchain.rs`)
 
 `fontc` and `gftools-builder3` are **guaranteed available with no user setup**. Neither can be a

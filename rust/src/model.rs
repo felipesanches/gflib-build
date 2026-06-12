@@ -68,6 +68,10 @@ pub struct Res {
     #[serde(default)]
     pub config_sig: String, // content hash of the gflib-build override config (+ build_rules entry) used
                             // for this attempt; lets the daemon auto-rebuild when we change the fix
+    #[serde(default)]
+    pub upgrade_attempted: String, // toolchain signature (pins + orchestrator) this result was last
+                                   // attempted under; a built family below the top rung is auto
+                                   // re-attempted ("upgrade") exactly once per signature
 }
 
 // ---- snapshot sub-records (mirrors of the dicts Python's snapshot() emits) ----

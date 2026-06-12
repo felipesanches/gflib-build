@@ -99,6 +99,7 @@ fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
         // Scope
         ("percent", "percent of library", CfgKind::Step { step: 5.0, min: 1.0, max: 100.0 }, true),
         ("retry_failed", "retry ALL failed (incl. genuine errors)", CfgKind::Bool, false),
+        ("auto_upgrade", "auto-upgrade built families (better backend)", CfgKind::Bool, false),
         ("populate_archive", "populate archive (fetch repos)", CfgKind::Bool, true),
         // QA & packaging
         ("compare", "compare to shipped", CfgKind::Bool, true),
@@ -112,7 +113,7 @@ fn cfg_group(key: &str) -> &'static str {
     match key {
         "source" | "google_fonts" | "archive" | "build_dir" => "Sources & paths",
         "backend" | "orchestrator" | "fontc_bin" | "auto_provision" | "manage_venvs" | "jobs" | "timeout" => "Build engine",
-        "percent" | "retry_failed" | "populate_archive" => "Scope",
+        "percent" | "retry_failed" | "auto_upgrade" | "populate_archive" => "Scope",
         "compare" | "fontspector_qa" | "build_debs" => "QA & packaging",
         _ => "Other",
     }
@@ -825,7 +826,7 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
             ]
         }
         "queue" => {
-            let kcol = |kind: &str| match kind { "retry" => Color::Yellow, "rebuild" => Color::Cyan, _ => Color::Green };
+            let kcol = |kind: &str| match kind { "retry" => Color::Yellow, "rebuild" => Color::Cyan, "upgrade" => Color::Magenta, _ => Color::Green };
             let rows = snap.queued_list.iter().map(|q| {
                 let mut segs = vec![
                     (format!("  {:<8} ", q.kind), kcol(&q.kind)),
@@ -1710,6 +1711,7 @@ fn field_help(key: &str) -> &str {
         "orchestrator" => "auto = prefer builder3 (Rust), fall back to builder2 · builder3/builder2 = that one only",
         "fontc_bin" => "explicit fontc binary — empty = auto (provisioned pin / detected)",
         "auto_provision" => "cargo-install the pinned fontc + builder3 when absent (zero-setup toolchain)",
+        "auto_upgrade" => "re-attempt fontmake/builder2-built families at better rungs (once per pin); a failed upgrade keeps the existing result + binaries",
         "jobs" => "how many families build in parallel",
         "percent" => "build only this % of the library (evenly-spaced sample); raise it live to build more",
         "timeout" => "per-build timeout in seconds (0 = never time out)",
@@ -1761,6 +1763,7 @@ fn focus_info(snap: &Snapshot, ui: &Ui) -> Vec<String> {
             let why = match q.kind.as_str() {
                 "retry" => "re-attempt after a previous build failure",
                 "rebuild" => "rebuild of a family that already built (--rebuild / [R])",
+                "upgrade" => "auto-upgrade: built with a lower rung (e.g. fontmake) — re-attempting builder3/fontc; the existing result is kept if this fails",
                 _ => "a fresh target — never built before",
             };
             vec![format!(" queued: {}  —  {}", q.slug, q.kind), format!("   {}", why)]

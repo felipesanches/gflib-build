@@ -502,6 +502,12 @@ BUILD:
   --builder3-bin <PATH>         explicit gftools-builder3 binary (default: auto, like fontc)
   --no-toolchain-provision      don't cargo-install missing pinned tools (fontc/builder3); detection only.
                                 Zero-setup default: the pins auto-install once into <data-dir>/tools/.
+  --no-auto-upgrade             don't automatically re-attempt built families at better rungs.
+                                Default ON: a family built with fontmake (or fontc under builder2)
+                                is re-attempted with builder3/fontc — once per toolchain pin, queued
+                                AFTER all new work. A failed upgrade keeps the existing result; a
+                                successful one keeps the superseded binaries under
+                                <build-dir>/variants/<family>/ for later comparison.
   --build-python <PATH>         interpreter for builds (default python3)
   --pythons <a,b,c|auto>        cohort-venv Python ladder, newest→oldest (e.g. python3.13,python3.11), or
                                 'auto' to discover installed python3.N. A cohort whose exact pinned reqs

@@ -54,6 +54,11 @@ See [`docs/migration-milestones.md`](docs/migration-milestones.md) for the full 
   compiler built each family (the migration metric).
 - **Zero-setup toolchain** — pinned `fontc` and `gftools-builder3` releases are auto-installed
   (one-time `cargo install` into `<data-dir>/tools/`) when not found; no flags, no manual setup.
+- **Automatic upgrades, never at the cost of a result** — families already built with `fontmake`
+  (or `fontc` under the Python orchestrator) are automatically re-attempted at the better rungs,
+  once per toolchain pin, queued after all new work. A declined upgrade restores the existing
+  result *and* its binaries; a successful one keeps the superseded rung's binaries under
+  `<build-dir>/variants/` so the outputs of different compilers can be compared later.
 - **Dependency cohorts** — families that share an identical pinned dependency set share one virtual
   environment, instead of one venv per family or one giant venv.
 - **Multi-Python ladder** — `--pythons` falls back to an older interpreter (keeping the exact pins)

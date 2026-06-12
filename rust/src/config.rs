@@ -19,6 +19,7 @@ pub struct Config {
     pub fontc_bin: Option<String>,    // explicit override; None = resolve/provision automatically
     pub builder3_bin: Option<String>, // explicit override; None = resolve/provision automatically
     pub auto_provision: bool,  // cargo-install the pinned fontc/builder3 when absent (default on)
+    pub auto_upgrade: bool,    // auto re-attempt built families below the top rung once per pin signature
     pub build_python: String,
     pub base_python: String,            // interpreter used to CREATE cohort venvs (= pythons[0])
     pub pythons: Vec<String>,           // Python ladder, newest→oldest: a cohort whose pinned reqs have
@@ -76,6 +77,7 @@ impl Default for Config {
             fontc_bin: None,
             builder3_bin: None,
             auto_provision: true,
+            auto_upgrade: true,
             build_python: "python3".into(),
             base_python: "python3".into(),
             pythons: vec!["python3".into()],
@@ -193,6 +195,8 @@ pub fn parse(args: &[String]) -> Parsed {
             "--orchestrator" => cfg.orchestrator = next(&mut i, a),
             "--fontc-bin" => cfg.fontc_bin = Some(next(&mut i, a)),
             "--builder3-bin" => cfg.builder3_bin = Some(next(&mut i, a)),
+            "--auto-upgrade" => cfg.auto_upgrade = true,
+            "--no-auto-upgrade" => cfg.auto_upgrade = false,
             "--toolchain-provision" => cfg.auto_provision = true,
             "--no-toolchain-provision" => cfg.auto_provision = false,
             "--build-python" => cfg.build_python = next(&mut i, a),
@@ -281,6 +285,7 @@ fn merge_persisted(cfg: &mut Config, loaded: &BTreeMap<String, serde_json::Value
             "backend" => if let Some(x) = s(v) { cfg.backend = x },
             "orchestrator" => if let Some(x) = s(v) { cfg.orchestrator = x },
             "auto_provision" => if let Some(x) = v.as_bool() { cfg.auto_provision = x },
+            "auto_upgrade" => if let Some(x) = v.as_bool() { cfg.auto_upgrade = x },
             "fontc_bin" => cfg.fontc_bin = s(v),
             "builder3_bin" => cfg.builder3_bin = s(v),
             "build_python" => if let Some(x) = s(v) { cfg.build_python = x },
@@ -312,6 +317,7 @@ pub fn save_config(cfg: &Config) {
     m.insert("backend".into(), json!(cfg.backend));
     m.insert("orchestrator".into(), json!(cfg.orchestrator));
     m.insert("auto_provision".into(), json!(cfg.auto_provision));
+    m.insert("auto_upgrade".into(), json!(cfg.auto_upgrade));
     m.insert("fontc_bin".into(), json!(cfg.fontc_bin));
     m.insert("builder3_bin".into(), json!(cfg.builder3_bin));
     m.insert("build_python".into(), json!(cfg.build_python));
@@ -386,6 +392,7 @@ pub fn config_map(cfg: &Config) -> BTreeMap<String, serde_json::Value> {
     m.insert("orchestrator".into(), json!(cfg.orchestrator));
     m.insert("fontc_bin".into(), json!(cfg.fontc_bin.as_ref().map(|p| disp_path(p)).unwrap_or_default()));
     m.insert("auto_provision".into(), json!(cfg.auto_provision));
+    m.insert("auto_upgrade".into(), json!(cfg.auto_upgrade));
     m.insert("jobs".into(), json!(cfg.jobs));
     m.insert("percent".into(), json!(cfg.percent));
     // store as null when unset, matching the editor's "0 → no timeout" convention (so the config tab
@@ -412,6 +419,7 @@ pub fn apply_setup_map(cfg: &mut Config, m: &BTreeMap<String, serde_json::Value>
     if let Some(v) = s("backend") { cfg.backend = v; }
     if let Some(v) = s("orchestrator") { cfg.orchestrator = v; }
     if let Some(b) = m.get("auto_provision").and_then(|v| v.as_bool()) { cfg.auto_provision = b; }
+    if let Some(b) = m.get("auto_upgrade").and_then(|v| v.as_bool()) { cfg.auto_upgrade = b; }
     cfg.fontc_bin = s("fontc_bin").filter(|v| !v.is_empty());
     if let Some(j) = m.get("jobs").and_then(|v| v.as_i64()) { cfg.jobs = j.max(0) as usize; } // 0 = inspect-only
     if let Some(p) = m.get("percent").and_then(|v| v.as_f64()) { cfg.percent = p; }
