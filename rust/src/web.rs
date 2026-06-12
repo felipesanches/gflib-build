@@ -378,8 +378,7 @@ function prov(x){const c=x.compiler_version||x.backend||'';return c+(x.builder_v
 function ctl(set){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({set:set})})}
 // --- reset tab: granular deletion of build-system portions (mirrors the TUI's reset tab) ---
 function resetPortion(key,label,bytes){
- if(!confirm('DELETE '+label+' ('+human(bytes)+')?\n\nThe repo archive, google/fonts clone and build RESULTS are never touched.\nItems in use by a running build are kept; everything else is deleted.'))return;
- ctl({reset_portion:key});
+ ctl({reset_portion:key}); // fires immediately; the row reports progress + '✓ freed X'
 }
 function resetView(){
  const ps=snap.reset_portions||[];
