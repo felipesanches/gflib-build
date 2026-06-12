@@ -1286,9 +1286,9 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
             1,
             0,
             &format!(
-                " {}  free {}  jobs {}{}  cohorts {}  fontc {}/fontmake {}/both {}",
+                " {}  free {}  jobs {}{}  cohorts {}  both {}/fontc {}/fontmake {}",
                 disk, human(snap.disk_free), snap.jobs, job_frozen, snap.cohorts.len(),
-                snap.backends.fontc, snap.backends.fontmake, snap.backends.both
+                snap.backends.both, snap.backends.fontc, snap.backends.fontmake
             ),
             Color::Cyan,
             w,
@@ -1338,13 +1338,13 @@ fn render_progress(scr: &mut Screen, snap: &Snapshot, w: u16) {
     let barw = (w.saturating_sub(4)).max(10) as usize;
     if segmented {
         // colour the IN-SCOPE bar by outcome: built (green) · failed (red) · not-yet-attempted (dim).
-        // the built (green) span is split by compiler in three shades: fontc · fontmake · both —
-        // both = lightest/brightest, fontc = medium, fontmake = darkest (matches the web bar).
+        // the built (green) span is split by compiler in three shades, ordered as a pipeline
+        // toward the end-goal: both · fontc · fontmake (brightest→darkest), matching the web bar.
         let base = inscope.max(1);
         let bw = barw * c.built / base;
         let fw = barw * c.failed / base;
         let rest = barw.saturating_sub(bw + fw); // queued + building (not yet attempted)
-        // sub-widths of the built span, in the SAME order as the web (fontc, fontmake, both),
+        // sub-widths of the built span, in the SAME order as the web (both, fontc, fontmake),
         // with a base-green remainder so the three always sum to bw
         let wfc = barw * snap.backends.fontc / base;
         let wfm = barw * snap.backends.fontmake / base;
@@ -1355,7 +1355,7 @@ fn render_progress(scr: &mut Screen, snap: &Snapshot, w: u16) {
         const BOTH: Color = Color::Rgb { r: 74, g: 222, b: 128 };    // lightest/brightest green
         put(scr, 3, 1, "[", Color::White, w);
         let mut x = 2u16;
-        for (width, col) in [(wfc, FONTC), (wfm, FONTMAKE), (wboth, BOTH), (wother, Color::Green)] {
+        for (width, col) in [(wboth, BOTH), (wfc, FONTC), (wfm, FONTMAKE), (wother, Color::Green)] {
             if width > 0 { put(scr, 3, x, &"#".repeat(width), col, w); x += width as u16; }
         }
         if fw > 0 { put(scr, 3, x, &"#".repeat(fw), Color::Red, w); x += fw as u16; }

@@ -720,11 +720,12 @@ function barHTML(){const c=snap.counts||{},ph=snap.phase;
  const hint=(c.skipped||0)?'<span class="skip">'+(c.skipped||0)+' skipped (not selected — raise % to 100 to build them)</span>':'';
  // each segment carries its own count + share-of-total label (hidden by overflow when the segment is too narrow)
  const seg=(w,cl,n,lbl)=>'<div class="seg '+cl+'" style="width:'+w+'%">'+(n>0?'<span class="sl">'+n+' '+lbl+' ('+Math.round(w)+'%)</span>':'')+'</div>';
- // split the built (green) portion by compiler: fontc · fontmake · both (three shades of green),
+ // split the built (green) portion by compiler, ordered as a pipeline toward the end-goal:
+ // both · fontc · fontmake (three shades of green, brightest→darkest left to right),
  // plus a base-green remainder for any built family with an unrecorded backend
  const bk=snap.backends||{},bfc=bk.fontc||0,bfm=bk.fontmake||0,bb=bk.both||0,bother=Math.max(0,(c.built||0)-bfc-bfm-bb);
- const builtSegs=seg(100*bfc/inscope,'gfc',bfc,'fontc')+seg(100*bfm/inscope,'gfm',bfm,'fontmake')
-   +seg(100*bb/inscope,'gboth',bb,'both')+(bother>0?seg(100*bother/inscope,'bg',bother,'built'):'');
+ const builtSegs=seg(100*bb/inscope,'gboth',bb,'both')+seg(100*bfc/inscope,'gfc',bfc,'fontc')
+   +seg(100*bfm/inscope,'gfm',bfm,'fontmake')+(bother>0?seg(100*bother/inscope,'bg',bother,'built'):'');
  // the built/failed/building/queued counts now live in the per-segment bar labels + the top-right 'attempted'
  return '<div class="phase"> Phase: '+E(phaseLabel(ph))+err+hint+'</div>'+
   '<div class="barwrap">'+builtSegs+seg(rw,'rg',c.failed||0,'failed')+seg(dw,'dg',rem,'left')+'</div>'+
