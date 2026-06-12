@@ -89,9 +89,9 @@ per-repo as repos land.
    the mirror (`read_requirements_from_mirror`, a `git show`, no checkout), then obtain the shared
    cohort interpreter via `VenvManager::get_python`. Without `--manage-venvs`, every family builds
    with the single `--build-python`.
-3. **backend attempts** — `backend_order()` yields `["fontc","fontmake"]` for `auto` (fontc-first,
-   fontmake fallback, only if a fontc binary is present), or a single backend, or `both`. For each
-   attempt:
+3. **chain attempts** — `attempt_chain()` yields the (orchestrator, compiler) ladder (see
+   *Build backends* below): builder3+fontc → builder2+fontc → builder2+fontmake for `auto`. For
+   each attempt:
    - **`extract_tree`** streams the committed tree at the pinned commit into `work/<slug>` via
      `git archive | tar -x` — the only way sources are ever read;
    - any registered **pre-build commands** (`rules::run_pre_build`) run in the extracted tree;
