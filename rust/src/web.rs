@@ -647,7 +647,7 @@ function cfgCell(f,cf){
   if(live)return '<select onchange="ctl({'+f.k+':this.value})">'+ch.map(o=>'<option'+(o==v?' selected':'')+'>'+E(o)+'</option>').join('')+'</select>';
   return '<span class="muted">'+E(ch.includes(v)?v:(ch[0]||''))+'</span>';}
  if(live&&f.t=='step')
-  return '<input type="number"'+(f.k=='percent'?' min="1" max="100"':' min="1"')+' value="'+E(v==null?'':v)+'" onchange="ctl({'+f.k+':+this.value})">';
+  return '<input type="number"'+(f.k=='percent'?' min="1" max="100"':(f.k=='jobs'?' min="0"':' min="1"'))+' value="'+E(v==null?'':v)+'" onchange="ctl({'+f.k+':+this.value})">';
  return '<span class="muted">'+E(v==null?(f.k=='timeout'?'0':''):''+v)+'</span>';
 }
 function cfgView(){const base=snap.config||{},cf={};

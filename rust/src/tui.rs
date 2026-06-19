@@ -94,7 +94,7 @@ fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
         ("fontc_bin", "fontc binary (override)", CfgKind::Path, false),
         ("auto_provision", "auto-provision pinned toolchain", CfgKind::Bool, false),
         ("manage_venvs", "cohort venvs", CfgKind::Bool, false),
-        ("jobs", "parallel jobs", CfgKind::Step { step: 1.0, min: 1.0, max: 256.0 }, true),
+        ("jobs", "parallel jobs", CfgKind::Step { step: 1.0, min: 0.0, max: 256.0 }, true), // 0 = drain (no new builds)
         ("timeout", "per-build timeout (0=off)", CfgKind::Step { step: 30.0, min: 0.0, max: 100000.0 }, true),
         // Scope
         ("percent", "percent of library", CfgKind::Step { step: 5.0, min: 1.0, max: 100.0 }, true),
@@ -327,7 +327,7 @@ fn cfg_apply_live(fields: &[CfgField], snap: &Snapshot, src: &dyn Source) -> Str
     }
     if changed("jobs") {
         if let Some(j) = new.get("jobs").and_then(|v| v.as_i64()) {
-            set.jobs = Some(j.max(1) as usize);
+            set.jobs = Some(j.max(0) as usize); // allow 0 (drain) — apply_live clamps [0, MAX_JOBS]
         }
     }
     if changed("percent") {

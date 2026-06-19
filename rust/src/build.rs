@@ -156,6 +156,18 @@ impl RunReg {
             }
             return (freeze, thaw);
         }
+        // jobs == 0 is DRAIN, not pause: the worker ready-gate (id < jobs) stops NEW builds starting, but
+        // every in-flight build must run to COMPLETION. So thaw any build that a prior jobs-cut or pause
+        // left SIGSTOP-frozen (else it would sit suspended forever — never draining), and freeze nothing.
+        if jobs == 0 {
+            for e in self.entries.iter_mut() {
+                if e.frozen {
+                    e.frozen = false;
+                    thaw.push(e.pgid);
+                }
+            }
+            return (freeze, thaw);
+        }
         let mut unfrozen = self.entries.iter().filter(|e| !e.frozen).count();
         if unfrozen > jobs {
             for e in self.entries.iter_mut().rev() {
@@ -195,6 +207,11 @@ pub struct Orchestrator {
     pub resumed_elapsed: f64,
     pub active: AtomicUsize,
     pub reset_all_running: AtomicBool, // a "delete everything" wipe is in progress — reject re-entry
+    // Set by "delete everything" to ABORT in-flight builds: build_one bails between attempts instead of
+    // advancing to the next (builder,backend) pair after its compile is SIGKILLed, and the venv installer
+    // kills its pip subprocess. Shared (Arc) so the VenvManager can read it. Distinct from `stop`, which
+    // exits the daemon — this just unwinds the current builds while the daemon stays alive (paused).
+    pub abort_builds: Arc<AtomicBool>,
     pub spawned: Mutex<usize>,
     pub venvs: Option<VenvManager>, // cohort venv manager (R2); None unless --manage-venvs
     pub build_rules: std::collections::HashMap<String, Vec<String>>, // per-family pre-build (R3)
@@ -422,8 +439,9 @@ impl Orchestrator {
             reset_notes: BTreeMap::new(),
             op_stats: HashMap::new(),
         };
+        let abort_builds = Arc::new(AtomicBool::new(false));
         let venvs = if cfg.manage_venvs {
-            Some(VenvManager::new(&cfg.build_dir, &cfg.pythons, cfg.base_requirements.clone()))
+            Some(VenvManager::new(&cfg.build_dir, &cfg.pythons, cfg.base_requirements.clone(), abort_builds.clone()))
         } else {
             None
         };
@@ -442,6 +460,7 @@ impl Orchestrator {
             resumed_elapsed: state.elapsed_so_far, // cumulative clock survives restart/migration (R1)
             active: AtomicUsize::new(0),
             reset_all_running: AtomicBool::new(false),
+            abort_builds,
             spawned: Mutex::new(0),
             venvs,
             build_rules,
@@ -1341,6 +1360,13 @@ impl Orchestrator {
         for (i, (builder, backend)) in pairs.iter().enumerate() {
             let builder: &str = builder;
             let backend: &str = backend;
+            // "delete everything" set the abort flag: a SIGKILLed compile returns Err and we land back
+            // here — do NOT start another attempt (that's why a one-shot kill alone kept families
+            // "building"). Bail the whole family so the worker returns and the drain can complete.
+            if self.abort_builds.load(Ordering::Relaxed) {
+                last_err = "aborted (delete everything)".into();
+                break;
+            }
             // fresh extraction for each backend attempt (a previous attempt may have dirtied work/)
             self.set_result(slug, |r| r.note = "checkout".into());
             if let Err(e) = self.timed(slug, "extract", || extract_tree(&mirror, &fam.commit, &work, EXTRACT_TIMEOUT, &log_path)) {
@@ -1390,6 +1416,11 @@ impl Orchestrator {
             } else {
                 None
             };
+            // an abort may have landed during checkout/venv/config — don't start a fresh compile
+            if self.abort_builds.load(Ordering::Relaxed) {
+                last_err = "aborted (delete everything)".into();
+                break;
+            }
             let run = self.timed(slug, "build", || run_builder(
                 &python,
                 &cfg_path,
@@ -1995,6 +2026,10 @@ impl Orchestrator {
             sh.control_log.push("delete everything: pausing and stopping all running jobs…".into());
         }
         self.frozen.store(true, Ordering::Relaxed);
+        // ABORT in-flight builds: build_one bails between attempts (so a killed compile doesn't just
+        // advance to the next backend) and the venv installer kills its pip tree. Without this a one-shot
+        // SIGKILL only stopped the current attempt; the family then restarted on the next (builder,backend).
+        self.abort_builds.store(true, Ordering::Relaxed);
         // 2) terminate every in-flight builder process group (thaw a frozen child first so it can die)
         self.signal_running(SIGCONT);
         self.signal_running(SIGKILL);
@@ -2019,13 +2054,16 @@ impl Orchestrator {
         // under a live build (the CLI run_reset refuses-when-running for the same reason). Stay PAUSED so
         // the user can retry once it settles; nothing was deleted and no results were reset.
         if busy() {
+            self.abort_builds.store(false, Ordering::Relaxed); // didn't wipe — let the in-flight builds finish normally
             let now = self.elapsed();
             let mut sh = self.shared.lock().unwrap();
-            let msg = "⛔ couldn't stop all jobs within 60s (a venv install or clone is in flight) — nothing deleted; still PAUSED, click again once it settles".to_string();
+            let msg = "⛔ couldn't stop all jobs within 60s (a clone or pre-build step is in flight) — nothing deleted; still PAUSED, click again once it settles".to_string();
             sh.reset_notes.insert("all".into(), (msg.clone(), now));
             sh.control_log.push(format!("delete everything: {}", msg));
             return;
         }
+        // drained — clear the abort flag so the rebuild after resume proceeds normally
+        self.abort_builds.store(false, Ordering::Relaxed);
         // 4) reset the in-memory worklist to pristine queued (bar regresses to 0 built / 0 failed)
         {
             let mut sh = self.shared.lock().unwrap();
@@ -2181,12 +2219,16 @@ impl Orchestrator {
         {
             let mut sh = self.shared.lock().unwrap();
             if let Some(j) = set.jobs {
-                let j = j.clamp(1, MAX_JOBS);
+                let j = j.clamp(0, MAX_JOBS); // 0 = drain: start no new builds, let in-flight finish
                 sh.jobs = j;
                 self.job_limit.store(j, Ordering::Relaxed); // regulator reads this lock-free
                 new_jobs = Some(j);
                 persist.insert("jobs".into(), serde_json::json!(j));
-                log.push(format!("jobs → {}", j));
+                log.push(if j == 0 {
+                    "jobs → 0 (drain — no new builds start; in-flight builds finish)".into()
+                } else {
+                    format!("jobs → {}", j)
+                });
             }
             if let Some(p) = set.percent {
                 let np = p.clamp(0.0, 100.0);
@@ -3451,7 +3493,7 @@ const SIGSTOP: i32 = 19;
 
 /// Send `sig` to a whole process group (negative pid) — catches the builder's descendants, not just
 /// the direct child. A pgid <= 1 is never signalled (would hit pid 1 / every process).
-fn signal_group(pgid: i32, sig: i32) {
+pub(crate) fn signal_group(pgid: i32, sig: i32) {
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
@@ -4205,6 +4247,26 @@ mod jobs_freeze_tests {
         assert!(freeze2.is_empty());
         assert_eq!(thaw2, vec![1, 2]);
         assert_eq!(r.unfrozen(), 2);
+    }
+
+    #[test]
+    fn jobs_zero_drains_thaws_frozen_and_freezes_nothing() {
+        // jobs=0 is DRAIN, not pause: every in-flight build (running OR previously frozen) must run to
+        // completion; the worker ready-gate blocks NEW builds. So plan(false,0) freezes nothing and thaws
+        // ALL frozen — never leaving a build SIGSTOPped forever.
+        let mut r = reg(&[(1, false), (2, false), (3, true), (4, true)]); // 2 running, 2 frozen
+        let (freeze, thaw) = r.plan(false, 0);
+        assert!(freeze.is_empty(), "drain must not freeze in-flight builds");
+        assert_eq!(sorted(thaw), vec![3, 4], "drain thaws every frozen build so it can finish");
+        assert_eq!(r.unfrozen(), 4);
+        // a second pass is a no-op (all already unfrozen)
+        let (f2, t2) = r.plan(false, 0);
+        assert!(f2.is_empty() && t2.is_empty());
+        // paused still wins over jobs=0 (freeze all), and resume at 0 drains again
+        let (fp, _) = r.plan(true, 0);
+        assert_eq!(sorted(fp), vec![1, 2, 3, 4]);
+        let (_, tr) = r.plan(false, 0);
+        assert_eq!(sorted(tr), vec![1, 2, 3, 4]);
     }
 
     #[test]

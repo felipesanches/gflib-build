@@ -612,10 +612,13 @@ pub struct VenvManager {
     // make — the load-average storm Simon reported. Builds already venv'd are unaffected.
     install_gate: (Mutex<usize>, Condvar),
     install_slots: usize,
+    // set by "delete everything" — a pip install in flight kills its process group and bails
+    abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl VenvManager {
-    pub fn new(build_dir: &Path, pythons: &[String], base_requirements: Option<PathBuf>) -> Self {
+    pub fn new(build_dir: &Path, pythons: &[String], base_requirements: Option<PathBuf>,
+               abort: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
         let root = build_dir.join("venvs");
         let pip_cache = build_dir.join("pip-cache");
         let _ = std::fs::create_dir_all(&root);
@@ -646,6 +649,7 @@ impl VenvManager {
             // ~1 concurrent install per 8 CPUs, min 1, max 3 — enough to hide install latency,
             // few enough that parallel sdist builds can't swamp the machine
             install_slots: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).div_euclid(8).clamp(1, 3),
+            abort,
         }
     }
 
@@ -751,6 +755,11 @@ impl VenvManager {
         let n = rungs.len();
         let mut last_err = String::new();
         for (i, (python, key, pyver)) in rungs.iter().enumerate() {
+            // "delete everything" abort: don't start the next rung's install (the in-flight pip, if any,
+            // was just SIGKILLed by the poll in create()) — bail the whole ladder so the worker returns fast
+            if self.abort.load(std::sync::atomic::Ordering::Relaxed) {
+                return (String::new(), key.clone(), pyver.clone(), "aborted (delete everything)".into());
+            }
             let lock = self.lock_for(key);
             let _g = lock.lock().unwrap(); // serialize creation of THIS cohort under full parallelism
             {
@@ -774,6 +783,10 @@ impl VenvManager {
     /// install runs ONCE with the exact pins (a missing wheel just fails, so the caller can try an older
     /// Python rung); when true it runs the self-healing relax loop. Faithful port of the Python `_create`.
     fn create(&self, python: &str, key: &str, req_text: &str, allow_relax: bool) -> (String, String) {
+        // "delete everything" abort: don't start a fresh venv (its seed/pip installs) — bail immediately
+        if self.abort.load(std::sync::atomic::Ordering::Relaxed) {
+            return (String::new(), "aborted (delete everything)".into());
+        }
         let vdir = self.root.join(key);
         let py = vdir.join("bin").join("python");
         let ready = vdir.join(".gflib-installed");
@@ -904,6 +917,10 @@ impl VenvManager {
         // surfaces ONE wheel-build failure per run, so each is relaxed one attempt at a time.
         let max_attempts = if allow_relax { 24 } else { 1 };
         for attempt in 0..max_attempts {
+            // a killed pip (abort) must not trigger the relax-and-retry loop to re-spawn another pip
+            if self.abort.load(std::sync::atomic::Ordering::Relaxed) {
+                return (String::new(), "aborted (delete everything)".into());
+            }
             let eff = relax_requirements(&src_lines, &relax);
             let _ = std::fs::write(&eff_path, eff.join("\n") + "\n");
             let mut header = String::new();
@@ -956,8 +973,31 @@ impl VenvManager {
                     }
                     cmd.env("PIP_CONSTRAINT", &con_path); // setuptools<81 in the venv AND build envs
                     cmd.stdout(Stdio::from(lf))
-                        .stderr(lf2.map(Stdio::from).unwrap_or(Stdio::null()))
-                        .status()
+                        .stderr(lf2.map(Stdio::from).unwrap_or(Stdio::null()));
+                    // own process group so "delete everything" can kill the whole pip → sdist (make/cc)
+                    // tree, then poll so we observe an abort instead of blocking the worker for minutes
+                    { use std::os::unix::process::CommandExt; cmd.process_group(0); }
+                    match cmd.spawn() {
+                        Ok(mut child) => {
+                            let pgid = child.id() as i32;
+                            loop {
+                                match child.try_wait() {
+                                    Ok(Some(st)) => break Ok(st),
+                                    Ok(None) => {
+                                        if self.abort.load(std::sync::atomic::Ordering::Relaxed) {
+                                            crate::build::signal_group(pgid, 9); // SIGKILL the pip tree
+                                            let _ = child.wait();
+                                            break Err(std::io::Error::new(std::io::ErrorKind::Interrupted,
+                                                "aborted (delete everything)"));
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(200));
+                                    }
+                                    Err(e) => break Err(e),
+                                }
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 Err(e) => return (String::new(), format!("open install log: {}", e)),
             };
@@ -1159,7 +1199,7 @@ mod tests {
     fn pyinfo_reports_a_tag_and_skips_missing_interpreters() {
         let bd = std::env::temp_dir().join(format!("_vmpy_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&bd);
-        let vm = VenvManager::new(&bd, &["python3".to_string()], None);
+        let vm = VenvManager::new(&bd, &["python3".to_string()], None, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
         let (tag, full) = vm.pyinfo("python3").expect("python3 must be runnable");
         assert!(tag.starts_with("py3") && full.starts_with("3."), "tag={} full={}", tag, full);
         assert!(vm.pyinfo("python-does-not-exist-zzz").is_none());
@@ -1183,7 +1223,7 @@ mod tests {
         let want = sha_hex("sha256sum", "wheel\n|gflib-policy:setuptools<81");
         std::fs::write(vdir.join(".gflib-installed"), format!("{}\n", &want[..want.len().min(16)])).unwrap();
 
-        let vm = VenvManager::new(&bd, &["python3".to_string()], Some(basereq));
+        let vm = VenvManager::new(&bd, &["python3".to_string()], Some(basereq), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
         // on_install is a "starting" notification (called before create() regardless of reuse). The
         // real reuse signal: create() returns early WITHOUT rmtree, so the dummy file is untouched.
         let (py, key, _pyver, err) = vm.get_python("", None, |_| {});
