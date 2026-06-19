@@ -1615,27 +1615,51 @@ impl Orchestrator {
                 .map(|r| (slug_to_logname(&r.slug), r.backend.clone())).collect()
         };
         let out_root = bd.join("out");
+        let logs_root = bd.join("logs");
+        let log_bytes = |logname: &str|
+            std::fs::metadata(logs_root.join(format!("{}.log", logname))).map(|m| m.len()).unwrap_or(0);
+        // Per-compiler footprint = the out/ binaries PLUS the per-family build logs the cascade would
+        // delete. `reset_any` tracks whether the portion would re-queue at least one family — so the
+        // button stays actionable when only logs (or only the 'built' result) remain after the binaries
+        // were already removed, instead of going dead at bytes==0 (an otherwise unreachable state).
         let mut fontc_bytes = 0u64;
         let mut fontmake_bytes = 0u64;
+        let mut fontc_reset_any = false;
+        let mut fontmake_reset_any = false;
         for (logname, backend) in &by_backend {
             match backend.as_str() {
-                "fontc" => fontc_bytes += dir_size(&out_root.join(logname)),
-                "fontmake" => fontmake_bytes += dir_size(&out_root.join(logname)),
+                "fontc" => { // a fontc-built family is always fully un-built by this portion
+                    fontc_bytes += dir_size(&out_root.join(logname)) + log_bytes(logname);
+                    fontc_reset_any = true;
+                }
+                "fontmake" => {
+                    fontmake_bytes += dir_size(&out_root.join(logname)) + log_bytes(logname);
+                    fontmake_reset_any = true;
+                }
                 "both" => {
-                    fontc_bytes += dir_size(&out_root.join(logname).join("fontc"));
-                    fontmake_bytes += dir_size(&out_root.join(logname).join("fontmake"));
+                    let fc = dir_size(&out_root.join(logname).join("fontc"));
+                    let fm = dir_size(&out_root.join(logname).join("fontmake"));
+                    fontc_bytes += fc;
+                    fontmake_bytes += fm;
+                    // a 'both' family is reset (and its log deleted) by one compiler's portion only once
+                    // the OTHER compiler's half is also gone — match families_to_requeue's rule.
+                    if fm == 0 { fontc_bytes += log_bytes(logname); fontc_reset_any = true; }
+                    if fc == 0 { fontmake_bytes += log_bytes(logname); fontmake_reset_any = true; }
                 }
                 _ => {}
             }
         }
         let p = |key: &str, label: &str, bytes: u64, hint: &str| ResetPortion {
-            key: key.into(), label: label.into(), bytes, hint: hint.into(), ..Default::default()
+            key: key.into(), label: label.into(), bytes, hint: hint.into(),
+            actionable: bytes > 0, ..Default::default() // most portions: clickable iff there's something on disk
         };
         vec![
-            p("fonts-fontc", "font binaries built by fontc", fontc_bytes,
-              "deletes out/ fonts of fontc-built families (incl. builder3) + their build logs, and re-queues them — the progress bar regresses (pause first if you don't want them rebuilt)"),
-            p("fonts-fontmake", "font binaries built by fontmake", fontmake_bytes,
-              "deletes out/ fonts of fontmake-built families + their build logs, and re-queues them — the progress bar regresses (pause first if you don't want them rebuilt)"),
+            ResetPortion { actionable: fontc_bytes > 0 || fontc_reset_any,
+              ..p("fonts-fontc", "font binaries built by fontc", fontc_bytes,
+              "deletes out/ fonts of fontc-built families (incl. builder3) + their build logs, and re-queues them — the progress bar regresses (pause first if you don't want them rebuilt)") },
+            ResetPortion { actionable: fontmake_bytes > 0 || fontmake_reset_any,
+              ..p("fonts-fontmake", "font binaries built by fontmake", fontmake_bytes,
+              "deletes out/ fonts of fontmake-built families + their build logs, and re-queues them — the progress bar regresses (pause first if you don't want them rebuilt)") },
             p("variants", "superseded upgrade binaries (variants/)", dir_size(&bd.join("variants")),
               "older rungs' binaries kept by successful auto-upgrades, for output comparison"),
             p("debs", ".deb packages + packaging trees", dir_size(&bd.join("packaging")),
@@ -1814,7 +1838,9 @@ impl Orchestrator {
                         requeued += 1;
                         sh.packaged.remove(slug);
                         if !sh.queue.contains(slug) { sh.queue.push_back(slug.clone()); }
-                        let _ = std::fs::remove_file(logs_dir.join(format!("{}.log", logname)));
+                        let lp = logs_dir.join(format!("{}.log", logname));
+                        if let Ok(m) = std::fs::metadata(&lp) { freed += m.len(); } // count the log we delete
+                        let _ = std::fs::remove_file(&lp);
                     }
                     drop(sh);
                     if requeued > 0 {
@@ -2255,6 +2281,7 @@ impl Orchestrator {
             if o.skipped == Some("no_fonts") {
                 results.insert(slug.clone(), serde_json::json!({
                     "built": false,
+                    "no_fonts": true, // not a dpkg-deb failure — packaging skipped because the fonts are gone
                     "error": "no fonts on disk (rebuild with .deb packaging enabled to keep them)",
                 }));
                 self.shared.lock().unwrap().packaged.insert(slug.clone());
@@ -2452,6 +2479,16 @@ impl Orchestrator {
                         let built = res.get("built").and_then(|b| b.as_bool()).unwrap_or(false);
                         let validated = res.get("validated").and_then(|b| b.as_bool()).unwrap_or(false);
                         let lint = res.get("lint").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        // "no fonts on disk" is NOT a dpkg-deb failure — the family's binaries were
+                        // discarded so packaging was never attempted. Detect it (explicit flag, with an
+                        // error-string fallback for entries written before the flag existed) and report it
+                        // as its own non-failure state so the bar shows "not packaged", not "deb-failed".
+                        // match the EXACT legacy phrase (entries written before the no_fonts flag), not a
+                        // broad "no fonts" substring — so a genuine failure like "no fonts to package" is
+                        // never misread as the discarded-fonts skip.
+                        let no_fonts = res.get("no_fonts").and_then(|b| b.as_bool()).unwrap_or(false)
+                            || res.get("error").and_then(|e| e.as_str())
+                                .map(|e| e.starts_with("no fonts on disk")).unwrap_or(false);
                         // once lintian has run, the lintian verdict supersedes "validated":
                         //   errors   -> lintian-fail    (a regression — dpkg-deb ok, but lintian found errors)
                         //   warnings -> lint-warn        (passed lintian, no errors, but with warnings)
@@ -2462,7 +2499,9 @@ impl Orchestrator {
                             else if lint == "clean" { "lint-clean" }
                             else if lint.contains("warning") { "lint-warn" }
                             else { "validated" }
-                        } else if built { "built" } else { "failed" };
+                        } else if built { "built" }
+                          else if no_fonts { "no-fonts" } // fonts discarded → not packaged, not failed
+                          else { "failed" };
                         (slug.clone(), (st.to_string(), lint))
                     })
                     .collect()

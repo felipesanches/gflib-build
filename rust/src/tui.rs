@@ -909,6 +909,7 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                     "lintian-fail" => ("lintian-fail", Color::Red), // validated by dpkg-deb but lintian errors
                     "validated" => ("validated", Color::DarkCyan),  // dpkg-deb ok; lintian not run yet
                     "built" => ("built", Color::Cyan),
+                    "no-fonts" => ("no fonts", Color::DarkGrey), // fonts discarded — not packaged, not a failure (distinct from draftable's Grey)
                     "failed" => ("deb-failed", Color::DarkRed),
                     _ if b.packaged => ("drafted", Color::DarkYellow),
                     _ => ("draftable", Color::Grey),

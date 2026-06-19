@@ -401,7 +401,9 @@ function resetView(){
     '<div class="barwrap" style="max-width:46em"><div class="seg rg" style="width:'+pct+'%"></div><div class="seg dg" style="width:'+(100-pct)+'%"></div>'+
     '<div class="barlbl">'+human(fr)+' / '+human(tot)+' deleted ('+pct+'%)</div></div></div>';
   }
-  const dis=p.bytes==0;
+  // enable on 'actionable' (frees disk / deletes a log / resets a result), not raw bytes — so a font
+  // portion stays clickable when only logs or 'built' results remain. Fall back to bytes for old snapshots.
+  const dis=(p.actionable===undefined)?(p.bytes==0):!p.actionable;
   const note=p.note?'<span class="'+(p.note.indexOf('\u26d4')==0?'r':'g')+'"> — '+E(p.note)+'</span>':'';
   const sub=p.note?'':('<br><span class="muted" style="margin-left:5.5em">'+E(p.hint)+'</span>');
   return '<div class="ln"><button class="btn" '+(dis?'disabled':'')+' onclick="resetPortion(\''+p.key+'\',\''+E(p.label)+'\','+p.bytes+')">delete</button>  '+
@@ -472,6 +474,7 @@ function debStatus(b){const ds=b.deb_status||'',lint=b.deb_lint||'';
  if(ds=='lint-warn')return ['lint-warn','o','Validated, and lintian found NO errors — only warnings. lintian: '+lint+'.'];
  if(ds=='validated')return ['validated','dc',DEB_VTIP+((lint&&lint!='not run (lintian absent)')?' lintian: '+lint+'.':' (lintian has not run yet)')];
  if(ds=='built')return ['built','c','The .deb was produced, but it did NOT pass validation: the control failed to parse or the archive has no .ttf/.otf.'];
+ if(ds=='no-fonts')return ['no fonts','muted','The fonts were discarded, so no .deb was packaged — not a failure. Re-run a build with .deb packaging enabled to keep the fonts.'];
  if(ds=='failed')return ['deb-failed','r','dpkg-deb failed to build the .deb for this family.'];
  if(b.packaged)return ['drafted','y','A debian/ packaging tree is drafted on disk; the .deb has not been built yet.'];
  return ['draftable','gr','Built family, ready to draft a debian/ tree (no debian/ on disk yet).'];}
@@ -938,10 +941,12 @@ const PKG_STATES=[
  ['built','#06b6d4','.deb produced but did NOT pass dpkg-deb validation (control failed, or no fonts inside)'],
  ['drafted','#eab308','a debian/ tree is drafted on disk; the .deb is not built yet'],
  ['draftable','#64748b','built family, ready to draft a debian/ tree'],
+ ['no-fonts','#7c6f9c','fonts were discarded — not packaged yet (re-run a build with .deb packaging on to keep the fonts)'],
  ['deb-failed','#b91c1c','dpkg-deb failed to build the .deb'],
 ];
 function pkgStatusKey(b){const ds=b.deb_status||'';
  if(ds=='lint-clean'||ds=='lint-warn'||ds=='lintian-fail'||ds=='validated'||ds=='built')return ds;
+ if(ds=='no-fonts')return 'no-fonts';
  if(ds=='failed')return 'deb-failed';
  return b.packaged?'drafted':'draftable';}
 function pkgCounts(){const cnt={};(snap.packages||[]).forEach(b=>{const k=pkgStatusKey(b);cnt[k]=(cnt[k]||0)+1});return cnt;}
