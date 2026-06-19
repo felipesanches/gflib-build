@@ -1258,10 +1258,24 @@ impl Orchestrator {
         // every family builds with the single --build-python.
         let python = if let Some(v) = &self.venvs {
             let req = venv::read_requirements_from_mirror(&mirror, &fam.commit);
-            self.set_result(slug, |r| r.note = "installing deps".into());
+            self.set_result(slug, |r| r.note = "resolving deps".into()); // checking for a cached cohort venv
             // in multi-Python mode, the commit year picks the starting ladder rung (skip too-new interpreters)
             let cyear = if self.cfg.pythons.len() > 1 { commit_year(&mirror, &fam.commit) } else { None };
-            let (py, cohort, pyver, verr) = self.timed(slug, "venv", || v.get_python(&req, cyear, |_k| {}));
+            // name what we'd install, so the status says WHICH deps (the on_install cb fires only when a
+            // venv is actually built, not when a cached one is reused — so it never lies about installing)
+            let dep_names = v.dep_names(&req);
+            let (py, cohort, pyver, verr) = self.timed(slug, "venv", || v.get_python(&req, cyear, |_k| {
+                let n = dep_names.len();
+                let shown = dep_names.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+                // NOTE: must keep the "installing deps" prefix — both UIs match it to flag an install that
+                // will freeze on reaching the compile step (web buildingRow / TUI 'INS→').
+                let note = match n {
+                    0 => "installing deps".to_string(),
+                    1..=4 => format!("installing deps ({}): {}", n, shown),
+                    _ => format!("installing deps ({}): {}, …", n, shown),
+                };
+                self.set_result(slug, |r| r.note = note);
+            }));
             if !verr.is_empty() {
                 let msg = format!("venv: {}", verr);
                 let (cause, _) = crate::classify::categorize_failure(&msg);

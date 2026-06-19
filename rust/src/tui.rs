@@ -1440,7 +1440,7 @@ fn render_tabbar_body(scr: &mut Screen, snap: &Snapshot, ui: &Ui, w: u16, h: u16
         for (i, b) in snap.building.iter().take(shown).enumerate() {
             let cr = row + (i / cols) as u16;
             let cx = ((i % cols) * colw) as u16;
-            let pending = !b.frozen && b.note == "installing deps" && over_limit;
+            let pending = !b.frozen && b.note.starts_with("installing deps") && over_limit;
             let (color, tag) = if b.frozen {
                 (Color::Blue, "FRZ ")
             } else if pending {

@@ -509,7 +509,7 @@ function buildingRow(b){const note=b.note||b.backend||'';
  // an install (pip) over the lowered job limit / pause can't be frozen mid-stream — it WILL start frozen the
  // moment it reaches the compile step, so flag it (magenta) as draining toward that.
  const overLimit=snap.paused||(((snap.building||[]).length-(snap.frozen_builds||0))>(snap.jobs||1));
- if(note==='installing deps'&&overLimit)
+ if(note.indexOf('installing deps')===0&&overLimit)
   return {segs:[['w'+Rp(b.worker,2)+' '+L(b.slug,30)+' '+Rp(hms(b.dur),8)+'  [finishing install before freezing]','m']],det:['building',b.slug]};
  return {segs:[['w'+Rp(b.worker,2)+' '+L(b.slug,34)+' '+Rp(hms(b.dur),8)+'  '+note,'y']],det:['building',b.slug]}}
 

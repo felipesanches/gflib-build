@@ -197,8 +197,12 @@ pub fn apply_pin_overrides(lines: &[String]) -> (Vec<String>, Vec<String>) {
 
 // ---------- cohort-signature normalization: QA filtering + `-r` include expansion ----------
 
-/// QA-only tools dropped from cohort requirements entirely (they don't affect the build).
-const QA_PKGS: [&str; 2] = ["fontbakery", "fontspector"];
+/// QA / proofing / diffing tools dropped from cohort requirements entirely — they have NO role in
+/// BUILDING fonts (only in QA), so dropping them shrinks the venv AND avoids dependency conflicts they
+/// drag in. diffenator2/fontprimer pin protobuf<=3.20.3, which is mutually exclusive with a recent
+/// gftools (git main) that needs protobuf>=6.33 — keeping them made every fresh venv install fail with
+/// ResolutionImpossible. drawbot-skia is their rendering backend (proof images), build-irrelevant too.
+const QA_PKGS: [&str; 5] = ["fontbakery", "fontspector", "diffenator2", "fontprimer", "drawbot-skia"];
 
 /// True for a package that is QA-only (build-irrelevant) and should be dropped from a cohort.
 pub fn is_qa_pkg(pkg: &str) -> bool {
@@ -210,10 +214,19 @@ pub fn is_qa_pkg(pkg: &str) -> bool {
 fn strip_qa_line(line: &str) -> Option<String> {
     let pkg = req_pkg_name(line);
     if pkg.is_empty() {
-        return Some(line.to_string()); // blank/comment/option/URL — leave untouched
+        // A PEP 508 URL requirement ("name @ git+https://…") has no version pin, so req_pkg_name returns
+        // "" — but it still names a package, so drop it too when that package is QA-only (e.g.
+        // "fontprimer @ git+https://github.com/simoncozens/fontprimer"). The name is the token before '@';
+        // a bare URL with no "name @" prefix yields a non-package token that no QA entry matches.
+        if let Some((name, _)) = line.split_once('@') {
+            if is_qa_pkg(name.trim().to_lowercase().as_str()) {
+                return None;
+            }
+        }
+        return Some(line.to_string()); // blank/comment/option/non-QA URL — leave untouched
     }
     if is_qa_pkg(&pkg) {
-        return None; // fontbakery / fontspector → dropped entirely
+        return None; // QA-only (fontbakery / fontspector / diffenator2 / fontprimer / drawbot-skia) → dropped
     }
     // strip a `[extra,...]` group, removing any `qa`; drop the brackets if nothing remains
     if let (Some(lb), Some(rb)) = (line.find('['), line.find(']')) {
@@ -686,6 +699,46 @@ impl VenvManager {
 
     pub fn relaxations(&self) -> Vec<String> {
         self.inner.lock().unwrap().relaxations.clone()
+    }
+
+    /// The package NAMES this cohort's venv installs — the family's own requirements first (the
+    /// distinctive deps), then the base toolchain — QA-filtered and de-duped. Names only; the exact pins
+    /// live in venvs/<cohort>.install.log. Used to make the "installing deps" status say WHAT it's installing.
+    pub fn dep_names(&self, req_text: &str) -> Vec<String> {
+        let name_of = |line: &str| -> Option<String> {
+            let n = req_pkg_name(line);
+            if !n.is_empty() {
+                return Some(n);
+            }
+            // a PEP 508 URL requirement ("name @ git+https://…") — take the name before the first '@'
+            if let Some((nm, _)) = line.split_once('@') {
+                let nm = nm.trim().to_lowercase();
+                if !nm.is_empty()
+                    && nm.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+                {
+                    return Some(nm);
+                }
+            }
+            None
+        };
+        let base: Vec<String> = self
+            .base_req
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| t.lines().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        let family: Vec<String> = req_text.lines().map(|s| s.to_string()).collect();
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        // family first (a family pin overrides the same base pin), then the base toolchain
+        for line in filter_qa_requirements(&family).iter().chain(filter_qa_requirements(&base).iter()) {
+            if let Some(n) = name_of(line) {
+                if seen.insert(n.clone()) {
+                    names.push(n);
+                }
+            }
+        }
+        names
     }
 
     pub fn ready_count(&self) -> usize {
@@ -1257,6 +1310,44 @@ mod tests {
             out,
             vec!["gftools==0.9.99", "fontmake==3.11.1", "gftools[ci]>=0.9", "# a comment", "-e ."]
         );
+    }
+
+    #[test]
+    fn qa_filtering_drops_diffenator_and_proofing_incl_url_lines() {
+        // the base-toolchain cluster that conflicted with gftools@main on protobuf — all QA/proofing,
+        // dropped from the build venv. fontprimer is a git-URL ("name @ url") requirement.
+        let lines: Vec<String> = [
+            "gftools @ git+https://github.com/googlefonts/gftools@main", // build tool — KEPT (note the @main ref)
+            "diffenator2>=0.2.5",                                        // QA diffing — dropped
+            "fontprimer @ git+https://github.com/simoncozens/fontprimer", // proofing (URL) — dropped
+            "drawbot-skia>=0.4.8",                                       // proof rendering — dropped
+            "fontmake>=2.4",                                             // build tool — kept
+        ]
+        .iter().map(|s| s.to_string()).collect();
+        let out = filter_qa_requirements(&lines);
+        assert_eq!(out, vec![
+            "gftools @ git+https://github.com/googlefonts/gftools@main",
+            "fontmake>=2.4",
+        ]);
+        // a bare URL with no "name @" prefix is left untouched (no false drop)
+        assert_eq!(filter_qa_requirements(&["git+https://example.com/x@v1".to_string()]),
+            vec!["git+https://example.com/x@v1".to_string()]);
+    }
+
+    #[test]
+    fn dep_names_lists_family_first_then_base_qa_filtered() {
+        let bd = std::env::temp_dir().join(format!("_depnames_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bd);
+        std::fs::create_dir_all(&bd).unwrap();
+        let basep = bd.join("base.txt");
+        // base toolchain incl. a git-URL (gftools) and QA tools (diffenator2/fontprimer) that must be dropped
+        std::fs::write(&basep, "fonttools==4.61.1\ngftools @ git+https://github.com/googlefonts/gftools@main\ndiffenator2>=0.2.5\nfontprimer @ git+https://github.com/simoncozens/fontprimer\n# comment\n").unwrap();
+        let vm = VenvManager::new(&bd, &["python3".to_string()], Some(basep), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        // family pins fontmake (distinctive) and re-pins fonttools (dedup → kept once, family-first)
+        let names = vm.dep_names("fontmake==3.11\nfonttools==4.60\nfontbakery\n");
+        assert_eq!(names, vec!["fontmake".to_string(), "fonttools".to_string(), "gftools".to_string()],
+            "family first (fontmake, fonttools), then base (gftools from the URL); QA tools + comments dropped");
+        let _ = std::fs::remove_dir_all(&bd);
     }
 
     #[test]
