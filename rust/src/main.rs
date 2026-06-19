@@ -498,6 +498,11 @@ BUILD:
   --orchestrator <auto|builder3|builder2>  default auto: prefer gftools-builder3 (Rust), fall back
                                 per family to builder2+fontc, then builder2+fontmake. builder3/
                                 builder2 force that orchestrator only (builder3 = no Python fallback).
+  --python-policy <off|selective|on>  Rust-only build mode (default on). off = no Python anywhere:
+                                force builder3+fontc (no builder2), skip cohort venvs, refuse Python
+                                pre-build rules (shell pre-build still runs). selective = off except
+                                families on the per-family allow-list. Aliases: --no-python (=off),
+                                --python (=on). Live-editable in the config tab.
   --fontc-bin <PATH>            explicit fontc binary (default: auto — the provisioned pin, else detected)
   --builder3-bin <PATH>         explicit gftools-builder3 binary (default: auto, like fontc)
   --no-toolchain-provision      don't cargo-install missing pinned tools (fontc/builder3); detection only.

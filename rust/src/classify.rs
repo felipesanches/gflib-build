@@ -20,6 +20,12 @@ pub fn is_transient_clone_error(err: &str) -> bool {
 /// Map a failure message to a short CAUSE + an actionable HINT (verbatim from Python).
 pub fn categorize_failure(error: &str) -> (&'static str, &'static str) {
     let low = error.to_lowercase();
+    if low.contains("needs python pre-build") {
+        return (
+            "needs Python pre-build",
+            "the Rust-only policy refused a Python pre-build step — authorize Python for this family/dependency, or port the pre-build to shell or Rust",
+        );
+    }
     if low.contains("could not launch builder") || low.contains("no such file or directory: 'fontmake'") {
         return (
             "build launcher error",

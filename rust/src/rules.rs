@@ -49,6 +49,50 @@ fn is_qa_command(cmd: &str) -> bool {
     c.contains("fontbakery") || c.contains("fontspector")
 }
 
+/// If a pre-build command would invoke Python — a Python interpreter, pip, a `*.py` script, or a known
+/// Python-based font tool — return the offending token, so the Rust-only policy (python_policy=off /
+/// unauthorized) can refuse it with a clear cause instead of silently running Python. The command string
+/// is split into segments on the shell separators `; | &` (handling both `a && b` AND glued `a&&b`); in
+/// each segment only the COMMAND token is inspected — the first token after skipping leading `VAR=val`
+/// assignments and `env`/`sudo`/`nice`/`exec`/`time`/`command`/`xargs` wrappers — so a
+/// `cp scripts/gen.py out/` argument is NOT flagged but `python3 gen.py` is.
+///
+/// Conservative by design (we err toward refusing), but it is a STATIC heuristic, not a shell parser:
+/// Python hidden inside a subshell `$(…)`, backticks, a `bash -c '…'` / `sh -c '…'` string, a variable
+/// (`$PY`), or a called shell script (`sh build.sh`) is NOT detected. Callers log the decision so the
+/// analysis round can audit it; the eventual fix for those cases is to port the pre-build to shell/Rust.
+pub fn rule_needs_python(cmd: &str) -> Option<String> {
+    const PY_TOOLS: &[&str] = &[
+        "fontmake", "fonttools", "ttx", "ufo2ft", "cu2qu",
+        "psautohint", "glyphs2ufo", "statmake", "afdko", "makeotf", "buildmasterotfs",
+    ];
+    let looks_python = |tok: &str| -> bool {
+        let base = tok.rsplit('/').next().unwrap_or(tok).to_lowercase();
+        base == "python" || base == "python2" || base.starts_with("python3")
+            || matches!(base.as_str(), "pip" | "pip2" | "pip3" | "pipx")
+            || base == "gftools" || base.starts_with("gftools-")
+            || base.ends_with(".py")
+            || PY_TOOLS.contains(&base.as_str())
+    };
+    // a run of ; | & delimits command segments; the command is the first real token of each segment
+    for seg in cmd.split(|c| c == ';' || c == '|' || c == '&') {
+        for tok in seg.split_whitespace() {
+            // skip a leading `VAR=val` env assignment or a wrapper command — the real command is ahead
+            let is_assign = tok.contains('=') && !tok.starts_with('-') && !tok.contains('/');
+            let is_wrapper = matches!(tok, "env" | "sudo" | "nice" | "exec" | "time" | "command" | "xargs" | "then" | "do" | "!");
+            if is_assign || is_wrapper {
+                continue;
+            }
+            // the first real command token of this segment decides it
+            if looks_python(tok) {
+                return Some(tok.to_string());
+            }
+            break;
+        }
+    }
+    None
+}
+
 /// Run a family's pre-build commands. Ok(()) on success; Err(msg) on the first failing command. A
 /// non-zero exit fails the family with a clear `pre-build` error (so it isn't silently mis-built).
 pub fn run_pre_build(
@@ -124,6 +168,28 @@ fn log_line(log_path: &Path, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rule_needs_python_flags_python_commands_only() {
+        // genuine Python invocations (command position) → flagged with the offending token
+        assert_eq!(rule_needs_python("python3 scripts/build.py").as_deref(), Some("python3"));
+        assert_eq!(rule_needs_python("./gen.py --out x").as_deref(), Some("./gen.py"));
+        assert_eq!(rule_needs_python("pip install foo").as_deref(), Some("pip"));
+        assert_eq!(rule_needs_python("gftools-add-ds-subsets sources/x.glyphs").as_deref(), Some("gftools-add-ds-subsets"));
+        assert_eq!(rule_needs_python("fontmake -g x.glyphs").as_deref(), Some("fontmake"));
+        // a Python command later in a chain (after a separator) is still caught
+        assert_eq!(rule_needs_python("mkdir build && python3 gen.py").as_deref(), Some("python3"));
+        // …even when the separator is GLUED to adjacent tokens (no surrounding whitespace)
+        assert_eq!(rule_needs_python("mkdir x&&python3 gen.py").as_deref(), Some("python3"));
+        assert_eq!(rule_needs_python("cat a|python3 -").as_deref(), Some("python3"));
+        // a VAR=val prefix / wrapper doesn't hide the real command
+        assert_eq!(rule_needs_python("FOO=1 python3 gen.py").as_deref(), Some("python3"));
+        assert_eq!(rule_needs_python("env python3 gen.py").as_deref(), Some("python3"));
+        // pure-shell rules are allowed (no false positives)
+        assert_eq!(rule_needs_python("cp scripts/gen.py sources/"), None); // .py is an ARGUMENT, not the command
+        assert_eq!(rule_needs_python("set -o pipefail && cp a b"), None);  // "pipefail" must not match "pip"
+        assert_eq!(rule_needs_python("mkdir -p out && sed -i s/a/b/ x.fea"), None);
+        assert_eq!(rule_needs_python("make sources"), None);              // shell-ish; not flagged (logged for audit)
+    }
     #[test]
     fn loads_rules_and_runs_a_pre_build() {
         let dir = std::env::temp_dir().join(format!("_rules_{}", std::process::id()));

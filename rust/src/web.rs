@@ -361,6 +361,7 @@ const SCHEMA=[
  {k:'build_dir',l:'build output dir',t:'path',live:false},
  {k:'backend',l:'build backend',t:'choice',live:true},
  {k:'orchestrator',l:'orchestrator',t:'choice',live:true},
+ {k:'python_policy',l:'python policy (off=Rust-only)',t:'choice',live:true},
  {k:'fontc_bin',l:'fontc binary (override)',t:'path',live:false},
  {k:'auto_provision',l:'auto-provision pinned toolchain',t:'bool',live:false},
  {k:'jobs',l:'parallel jobs',t:'step',live:true},
@@ -627,16 +628,16 @@ function showIf(k,cf){const s=x=>(cf[x]==null?'':''+cf[x]);
  if(k=='auto_provision')return !s('fontc_bin');
  if(k=='compare')return s('source')=='metadata';
  return true}
-const CHOICES={source:['metadata','archive'],backend:['auto','fontc','fontmake','both'],orchestrator:['auto','builder3','builder2']};
+const CHOICES={source:['metadata','archive'],backend:['auto','fontc','fontmake','both'],orchestrator:['auto','builder3','builder2'],python_policy:['off','selective','on']};
 // the keys the daemon actually honours live (same set as the TUI's cfg_apply_live) → editable form controls
-const LIVE_APPLY={backend:1,orchestrator:1,jobs:1,percent:1,compare:1,build_debs:1,manage_venvs:1};
+const LIVE_APPLY={backend:1,orchestrator:1,python_policy:1,jobs:1,percent:1,compare:1,build_debs:1,manage_venvs:1};
 // settings read once at launch (paths / worklist source / toolchain / startup re-queue behaviours):
 // editable, but the edit is recorded and applied on the next daemon restart (↻), never mid-run.
 const RESTART_KEYS={source:1,google_fonts:1,archive:1,build_dir:1,fontc_bin:1,auto_provision:1,auto_upgrade:1,retry_failed:1,fontspector_qa:1};
 // logical groupings for the config panel (related settings under one sub-header)
 const GROUPS=[
  {t:'Sources & paths', k:['source','google_fonts','archive','build_dir']},
- {t:'Build engine',    k:['backend','orchestrator','fontc_bin','auto_provision','manage_venvs','jobs','timeout']},
+ {t:'Build engine',    k:['backend','orchestrator','python_policy','fontc_bin','auto_provision','manage_venvs','jobs','timeout']},
  {t:'Scope',           k:['percent','retry_failed','auto_upgrade','populate_archive']},
  {t:'QA & packaging',  k:['compare','fontspector_qa','build_debs']},
 ];

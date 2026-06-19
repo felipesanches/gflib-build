@@ -61,6 +61,7 @@ pub struct Shared {
     pub percent: f64,
     pub backend: String,
     pub orchestrator: String, // SETTING (live): auto | builder3 | builder2 — drives attempt_chain
+    pub python_policy: String, // SETTING (live): off | selective | on — Rust-only build mode (no Python when off)
     pub compare: bool,
     pub cver_cache: HashMap<(String, String), String>,
     pub bver_cache: HashMap<(String, String), String>,
@@ -413,6 +414,7 @@ impl Orchestrator {
             percent: cfg.percent,
             backend: cfg.backend.clone(),
             orchestrator: cfg.orchestrator.clone(),
+            python_policy: cfg.python_policy.clone(),
             compare: cfg.compare,
             cver_cache: HashMap::new(),
             bver_cache: HashMap::new(),
@@ -1155,14 +1157,41 @@ impl Orchestrator {
     /// The per-family (orchestrator, compiler) attempt chain, from the live backend setting and
     /// the resolved toolchain. builder3 is ALWAYS preferred when available (it runs fontc
     /// in-process); each later pair is the graceful fallback for the one before it.
-    fn attempt_pairs(&self, have_fontc: bool, have_builder3: bool) -> Vec<(&'static str, &'static str)> {
+    fn attempt_pairs(&self, have_fontc: bool, have_builder3: bool, py_allowed: bool) -> Vec<(&'static str, &'static str)> {
         // both the backend AND the orchestrator are live (editable via the config tab): orchestrator
         // = builder3 forces the pure-fontc path with NO builder2/fontmake fallback.
-        let (backend, orchestrator) = {
+        // When Python is NOT allowed for this family (python_policy=off, or selective+unauthorized) the
+        // chain is FORCED to the pure-Rust path (builder3+fontc) regardless of the live backend/orchestrator
+        // — builder2 is Python. If builder3 is unavailable this yields an empty chain → a clean failure.
+        let (backend, orchestrator) = if py_allowed {
             let sh = self.shared.lock().unwrap();
             (sh.backend.clone(), sh.orchestrator.clone())
+        } else {
+            ("fontc".to_string(), "builder3".to_string())
         };
         attempt_chain(&backend, &orchestrator, have_fontc, have_builder3)
+    }
+
+    /// The live Python policy (off | selective | on). `on` = today's full pipeline; `off` = strict
+    /// Rust-only; `selective` = off except for families authorized via the allow-list (T2).
+    fn python_policy(&self) -> String {
+        self.shared.lock().unwrap().python_policy.clone()
+    }
+
+    /// Whether THIS family may use Python (builder2, cohort venvs, Python pre-build) under the live policy.
+    fn python_allowed(&self, slug: &str) -> bool {
+        match self.python_policy().as_str() {
+            "off" => false,
+            "selective" => self.python_authorized(slug),
+            _ => true, // "on" (and any unrecognized value) → full pipeline, preserving prior behaviour
+        }
+    }
+
+    /// Per-family Python authorization for `selective` mode. T2 will back this with a persisted
+    /// allow-list (by slug and by declared dependency); until then nothing is authorized, so
+    /// `selective` behaves like `off`.
+    fn python_authorized(&self, _slug: &str) -> bool {
+        false
     }
 
     /// MOCKUP build: no clone/venv/compile — a brief fake "compile", then replay the family's recorded
@@ -1258,11 +1287,17 @@ impl Orchestrator {
             }
         }
 
+        // Python policy (T1): may THIS family touch Python at all? When not (python_policy=off, or
+        // selective+unauthorized) the family takes the strict Rust-only path — no cohort venv, no
+        // builder2, and Python pre-build rules are refused below. Computed once and threaded through.
+        let py_allowed = self.python_allowed(slug);
+
         // Cohort venv (R2): read the family's requirements read-only from the mirror, create/reuse the
         // shared cohort venv, and build with ITS python. A venv failure (broken deps) fails the family
         // with the cohort error (self-heal will rebuild it on the next start). Without --manage-venvs,
-        // every family builds with the single --build-python.
-        let python = if let Some(v) = self.venvs.as_ref().filter(|_| self.manage_venvs.load(Ordering::Relaxed)) {
+        // every family builds with the single --build-python. Under the Rust-only policy no venv is
+        // created at all — builder3 needs no Python, so we skip straight to build-python (which it ignores).
+        let python = if let Some(v) = self.venvs.as_ref().filter(|_| py_allowed && self.manage_venvs.load(Ordering::Relaxed)) {
             let req = venv::read_requirements_from_mirror(&mirror, &fam.commit);
             self.set_result(slug, |r| r.note = "resolving deps".into()); // checking for a cached cohort venv
             // in multi-Python mode, the commit year picks the starting ladder rung (skip too-new interpreters)
@@ -1329,7 +1364,7 @@ impl Orchestrator {
         // --backend both (fontc_crater-style): build with BOTH compilers into separate dirs and
         // compare their outputs — under builder2 on both sides, so the comparison isolates the
         // COMPILER axis (builder3-vs-builder2 equivalence is a separate, future comparison).
-        if self.shared.lock().unwrap().backend == "both" {
+        if py_allowed && self.shared.lock().unwrap().backend == "both" {
             let bver = self.builder_version("builder2", &python, None);
             self.build_both(slug, &fam, &work, &out_dir, &mirror, &python, "builder2", &bver, &log_path, fontc_bin.as_deref());
             cleanup(&work, self.cfg.keep_work);
@@ -1343,7 +1378,27 @@ impl Orchestrator {
         let live_orchestrator = self.shared.lock().unwrap().orchestrator.clone();
         let tc_sig = crate::toolchain::run_sig(
             &live_orchestrator, fontc_bin.is_some(), builder3_bin.is_some());
-        let mut pairs = self.attempt_pairs(fontc_bin.is_some(), builder3_bin.is_some());
+        let mut pairs = self.attempt_pairs(fontc_bin.is_some(), builder3_bin.is_some(), py_allowed);
+
+        // Rust-only policy: a family whose pre-build needs Python cannot build without it (shell pre-build
+        // is fine). Decide this BEFORE stashing/extracting, naming the offending rule so the analysis round
+        // can attribute it (and the classifier decision is auditable in the log). For an auto-upgrade probe
+        // we must NOT destroy the prior success (an upgrade never costs a success) — keep it instead.
+        if !py_allowed {
+            if let Some((tok, cmd)) = self.build_rules.get(slug)
+                .and_then(|cmds| cmds.iter().find_map(|c| crate::rules::rule_needs_python(c).map(|t| (t, c.clone()))))
+            {
+                let msg = format!("needs Python pre-build: rule uses '{}' ({})", tok, cmd);
+                log_line(&log_path, &msg);
+                match &upgrade_prior {
+                    Some(prior) => self.restore_prior(slug, prior, &tc_sig, "needs Python pre-build — kept prior success"),
+                    None => self.fail(slug, "needs Python pre-build", &msg),
+                }
+                cleanup(&work, self.cfg.keep_work);
+                return;
+            }
+        }
+
         let mut stash: Option<PathBuf> = None;
         if let Some(prior) = &upgrade_prior {
             // already attempted under EXACTLY these capabilities? nothing new to learn — quick
@@ -1367,11 +1422,14 @@ impl Orchestrator {
             stash = stash_variant_outputs(&self.cfg.build_dir, &out_dir, &logname, prior);
         }
         if pairs.is_empty() {
-            // report the LIVE backend+orchestrator (what attempt_pairs actually used), not the launch cfg —
-            // e.g. a live switch to orchestrator=builder3 with builder3 unavailable lands here.
-            let (backend, orchestrator) = {
+            // report the chain attempt_pairs ACTUALLY used: under the Rust-only policy that's the forced
+            // builder3+fontc (not the live backend/orchestrator), so the message isn't misleading; e.g.
+            // python_policy=off with builder3 unavailable lands here.
+            let (backend, orchestrator) = if py_allowed {
                 let sh = self.shared.lock().unwrap();
                 (sh.backend.clone(), sh.orchestrator.clone())
+            } else {
+                ("fontc".to_string(), "builder3 (Rust-only: python_policy=off)".to_string())
             };
             self.fail(slug, "no usable backend", &format!(
                 "no orchestrator/compiler can run --backend {} (orchestrator={}, fontc {}, builder3 {})",
@@ -2318,6 +2376,12 @@ impl Orchestrator {
                 // builder3 = pure fontc, no builder2/fontmake fallback (see attempt_chain)
                 log.push(format!("orchestrator → {}", o));
             }
+            if let Some(p) = &set.python_policy {
+                sh.python_policy = p.clone();
+                persist.insert("python_policy".into(), serde_json::json!(p));
+                // off = Rust-only (no builder2, no venv, no Python pre-build); applies to subsequent builds
+                log.push(format!("python policy → {}", p));
+            }
             if let Some(c) = set.compare {
                 sh.compare = c;
                 persist.insert("compare".into(), serde_json::json!(c));
@@ -2759,6 +2823,10 @@ impl Orchestrator {
         if !sh.orchestrator.is_empty() {
             v.push("--orchestrator".into());
             v.push(sh.orchestrator.clone().into());
+        }
+        if !sh.python_policy.is_empty() {
+            v.push("--python-policy".into());
+            v.push(sh.python_policy.clone().into());
         }
         // jobs as-is (0 = inspect-only; preserve it rather than forcing a build)
         v.push("--jobs".into());
@@ -3358,6 +3426,7 @@ impl Orchestrator {
                 c.insert("percent".into(), serde_json::json!(sh.percent));
                 c.insert("backend".into(), serde_json::json!(sh.backend));
                 c.insert("orchestrator".into(), serde_json::json!(sh.orchestrator));
+                c.insert("python_policy".into(), serde_json::json!(sh.python_policy));
                 c.insert("compare".into(), serde_json::json!(sh.compare));
                 c.insert("manage_venvs".into(), serde_json::json!(self.manage_venvs.load(Ordering::Relaxed)));
                 c

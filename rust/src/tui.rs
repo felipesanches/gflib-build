@@ -57,6 +57,7 @@ fn sev_rank(s: &str) -> u8 {
 const SOURCE_CHOICES: [&str; 2] = ["metadata", "archive"];
 const BACKEND_CHOICES: [&str; 4] = ["auto", "fontc", "fontmake", "both"];
 const ORCHESTRATOR_CHOICES: [&str; 3] = ["auto", "builder3", "builder2"];
+const PYTHON_POLICY_CHOICES: [&str; 3] = ["off", "selective", "on"];
 
 // ---- the unified Configuration tab: a full schema editor used for BOTH live editing and first-run
 // setup — a faithful port of CONFIG_SCHEMA + the _cfg_* helpers from the original Python tool. ----
@@ -91,6 +92,7 @@ fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
         // Build engine
         ("backend", "build backend", CfgKind::Choice(&BACKEND_CHOICES), true),
         ("orchestrator", "orchestrator", CfgKind::Choice(&ORCHESTRATOR_CHOICES), true),
+        ("python_policy", "python policy (off=Rust-only)", CfgKind::Choice(&PYTHON_POLICY_CHOICES), true),
         ("fontc_bin", "fontc binary (override)", CfgKind::Path, false),
         ("auto_provision", "auto-provision pinned toolchain", CfgKind::Bool, false),
         ("manage_venvs", "cohort venvs", CfgKind::Bool, true),
@@ -112,7 +114,7 @@ fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
 fn cfg_group(key: &str) -> &'static str {
     match key {
         "source" | "google_fonts" | "archive" | "build_dir" => "Sources & paths",
-        "backend" | "orchestrator" | "fontc_bin" | "auto_provision" | "manage_venvs" | "jobs" | "timeout" => "Build engine",
+        "backend" | "orchestrator" | "python_policy" | "fontc_bin" | "auto_provision" | "manage_venvs" | "jobs" | "timeout" => "Build engine",
         "percent" | "retry_failed" | "auto_upgrade" | "populate_archive" => "Scope",
         "compare" | "fontspector_qa" | "build_debs" => "QA & packaging",
         _ => "Other",
@@ -294,7 +296,7 @@ fn cfg_actions(setup: bool) -> &'static [&'static str] {
 /// also gates which non-live fields are editable on a running build: editable ⇔ appliable-live OR
 /// persistable, so the UI never invites an edit that 'apply' would silently drop.
 const TUI_PERSIST: &[&str] = &[
-    "source", "backend", "orchestrator", "jobs", "percent", "compare", "manage_venvs", "fontspector_qa", "build_debs",
+    "source", "backend", "orchestrator", "python_policy", "jobs", "percent", "compare", "manage_venvs", "fontspector_qa", "build_debs",
 ];
 
 fn cfg_persistable(key: &str) -> bool {
@@ -334,6 +336,11 @@ fn cfg_apply_live(fields: &[CfgField], snap: &Snapshot, src: &dyn Source) -> Str
     if changed("orchestrator") {
         if let Some(o) = new.get("orchestrator").and_then(|v| v.as_str()) {
             set.orchestrator = Some(o.to_string()); // builder3 = pure fontc, no builder2/fontmake fallback
+        }
+    }
+    if changed("python_policy") {
+        if let Some(p) = new.get("python_policy").and_then(|v| v.as_str()) {
+            set.python_policy = Some(p.to_string()); // off = Rust-only (live)
         }
     }
     if changed("jobs") {
