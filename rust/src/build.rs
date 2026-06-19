@@ -4101,7 +4101,22 @@ fn last_error_line(log_path: &Path) -> String {
     let is_wrapper = |s: &str| {
         s.starts_with("FAILED:") || s.starts_with("ninja:") || s.starts_with("Command failed")
             || s.starts_with("Cleaning up") || s.starts_with("Done cleaning")
+            || s.starts_with("note: run with") || s.starts_with("note: ") || s == "stack backtrace:"
     };
+    // pass 0a: a Rust PANIC — return the panic MESSAGE (the diagnostic line), not the trailing
+    // "note: run with `RUST_BACKTRACE`" or a backtrace frame. Matches fontc/builder3 internal bugs.
+    for ln in txt.lines().rev() {
+        let s = ln.trim();
+        if let Some(i) = s.find("panicked at ") {
+            let msg = s[i..].trim();
+            if !msg.is_empty() {
+                return clip(msg);
+            }
+        }
+        if s.contains("internal error: entered unreachable") {
+            return clip(s);
+        }
+    }
     // pass 0: a launcher/exec failure — the builder or compiler binary is missing or not runnable
     // (e.g. "taskset: failed to execute …/gftools-builder: No such file or directory"). This means the
     // build never started, so it IS the cause; surface it ahead of everything (it carries no keyword

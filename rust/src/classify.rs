@@ -187,6 +187,70 @@ pub fn categorize_failure(error: &str) -> (&'static str, &'static str) {
             "the build config (config.yaml / recipe) is missing a required key (e.g. 'sources') — the recipe is malformed or incomplete",
         );
     }
+    // ---- gftools-builder3 build failures, split out of the generic "builder3 error" from real R0 data
+    // (python_policy=off ran the whole library through builder3; these are the dominant Rust-only causes) ----
+    // a fontc/builder3 PANIC (internal bug, not a source problem) — surface distinctly so it becomes an
+    // upstream fontc issue. (Checked first: a panic can co-occur with build-operation context.)
+    if low.contains("internal error: entered unreachable")
+        || low.contains("rust_backtrace")
+        || low.contains("panicked at")
+    {
+        return (
+            "builder3: internal panic",
+            "fontc/gftools-builder3 panicked (an internal bug, not a source problem) — capture the family and report it upstream; a different fontc may fix it",
+        );
+    }
+    // the config selects a recipe provider builder3 doesn't implement (e.g. fontprimer, a Python proofing
+    // recipe). MUST precede the generic "could not parse config" bucket — the message contains both.
+    if low.contains("recipeprovider") && (low.contains("unknown variant") || low.contains("unknown recipe")) {
+        return (
+            "builder3: unsupported recipe provider",
+            "the build config selects a recipe provider gftools-builder3 doesn't implement (e.g. fontprimer) — needs a config fix, or Python (builder2) for that recipe",
+        );
+    }
+    // a designspace the Rust source loader can't parse (e.g. an unsupported conditionset)
+    if low.contains("parsing designspace") || (low.contains("designspace") && low.contains("conditionset")) {
+        return (
+            "builder3: designspace parse error",
+            "gftools-builder3's source loader couldn't parse the designspace (e.g. an unsupported conditionset) — a builder3 gap; builder2/fontmake may build it",
+        );
+    }
+    // a source file type builder3 has no loader for (.glyphs/.ufo variants etc.)
+    if low.contains("wrong convertor for file") || low.contains("unknown file type for file") {
+        return (
+            "builder3: unsupported source format",
+            "gftools-builder3 has no loader for this source file type (wrong/unknown convertor) — a builder3 source-format gap; builder2/fontmake may handle it",
+        );
+    }
+    // the build config won't parse against builder3's schema (an unsupported/older config shape)
+    if low.contains("could not parse config") || low.contains("did not match any variant") || low.contains("data did not match") {
+        return (
+            "builder3: unparseable build config",
+            "gftools-builder3 couldn't parse the build config against its schema (an unsupported/older config shape) — needs a config fix or an override config.yaml",
+        );
+    }
+    // a build operation referenced a file that isn't there (missing source / un-generated intermediate) —
+    // often the symptom of a skipped Python pre-build step under python_policy=off
+    if low.contains("while building") && low.contains("no such file or directory") {
+        return (
+            "builder3: missing source file",
+            "a build operation referenced a file that doesn't exist (a missing source or un-generated intermediate) — often a skipped Python pre-build step; check the recipe",
+        );
+    }
+    // fontc requires identical per-master feature (.fea) files
+    if low.contains("feature files are non-identical") {
+        return (
+            "builder3: per-master feature mismatch",
+            "the masters' feature (.fea) files are non-identical, which fontc requires to match — reconcile the per-master features upstream",
+        );
+    }
+    // a builder3 build-step failure with no more specific cause above (still better than a bare "builder3 error")
+    if low.contains("while building") || low.contains("recipe is not valid") {
+        return (
+            "builder3: build operation failed",
+            "a gftools-builder3 build operation failed with no more specific cause — open the family log",
+        );
+    }
     // builder3 orchestrator-level error with NO more specific cause above — the last-resort builder3 bucket
     // (must come AFTER the specific fontc/source buckets: every builder3 attempt error is "builder3:"-prefixed,
     // so checking this first would shadow them — especially in orchestrator=builder3 mode where it's the ONLY
@@ -269,6 +333,17 @@ mod tests {
         assert_eq!(categorize_failure(
             "taskset: failed to execute /data/tools/builder3-cf74f20a99/bin/gftools-builder: No such file or directory").0,
             "builder binary missing");
+        // ---- the new builder3 R0 buckets (split out of the generic "builder3 error") ----
+        assert_eq!(categorize_failure("builder3: recipe is not valid: failed to load source sources/X.glyphs: wrong convertor for file \"sources/X.glyphs\"").0, "builder3: unsupported source format");
+        assert_eq!(categorize_failure("builder3: recipe is not valid: could not parse config file sources/config.yaml: recipeprovider: unknown variant `fontprimer`, expected ...").0, "builder3: unsupported recipe provider");
+        assert_eq!(categorize_failure("builder3: recipe is not valid: could not parse config file __gflib_override_config.yaml: recipe.fonts[0]: data did not match any variant").0, "builder3: unparseable build config");
+        assert_eq!(categorize_failure("builder3: operation X while building [..] from [..]: no such file or directory (os error 2)").0, "builder3: missing source file");
+        assert_eq!(categorize_failure("builder3: internal error: entered unreachable code: stat table has no axis values subtable").0, "builder3: internal panic");
+        assert_eq!(categorize_failure("builder3: note: run with `RUST_BACKTRACE=1`\nbuilder3: thread 'main' panicked at src/x.rs:9: boom").0, "builder3: internal panic");
+        assert_eq!(categorize_failure("builder3: recipe is not valid: failed to load source sources/x.designspace: error parsing designspace file: missing field `conditionset`").0, "builder3: designspace parse error");
+        assert_eq!(categorize_failure("builder3: operation X while building [..] from [masters/a]: feature files are non-identical: masters/b").0, "builder3: per-master feature mismatch");
+        // a still-generic builder3 error keeps the catch-all
+        assert_eq!(categorize_failure("builder3: some brand new orchestrator hiccup").0, "builder3 error");
         // …but a fontc error about a missing SOURCE file is NOT the launcher bucket
         assert_ne!(categorize_failure("no such file or directory: sources/Foo.glif").0, "builder binary missing");
     }
