@@ -1004,7 +1004,7 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                 ]
             }).collect();
             vec![SectionR {
-                title: "Reset — delete a portion of the build system  (D = delete the selected row · ENTER = details · items in use by a running build are kept · archive & results are never touched)".into(),
+                title: "Reset — delete a portion of the build system  (D = delete the selected row · ENTER = details · items in use by a running build are kept · the bare git archive is never touched · deleting fonts re-queues those families so the progress bar regresses)".into(),
                 dview: "reset", rows, keys: snap.reset_portions.iter().map(|p| p.key.clone()).collect(),
             }]
         }
@@ -1941,7 +1941,12 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
                 o.push(format!(" reset: {}", p.label));
                 o.push(format!("   on disk now: {}", crate::util::human(p.bytes)));
                 o.push(format!("   {}", p.hint));
-                o.push("   the repo archive, google/fonts clone and build RESULTS are never touched".into());
+                if p.key.starts_with("fonts-") {
+                    o.push("   the bare git archive is never touched; deleting these fonts re-queues".into());
+                    o.push("   those families (build RESULTS reset to queued → the progress bar regresses)".into());
+                } else {
+                    o.push("   the repo archive, google/fonts clone and build RESULTS are never touched".into());
+                }
                 o.push(String::new());
                 o.push("   ▶ press D to DELETE now — items in use by a running build are kept, the rest are deleted".into());
             }

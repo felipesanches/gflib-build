@@ -1599,8 +1599,10 @@ impl Orchestrator {
 
     /// The reset tab's deletable portions with live sizes. Everything is under the build dir
     /// (plus the provisioned toolchain under data-dir); the repo archive and google/fonts clone
-    /// are NEVER part of any portion. Build RESULTS (state.json) are kept by every portion —
-    /// deleting binaries leaves families 'built (fonts discarded)', same as --discard-fonts.
+    /// are NEVER part of any portion — the bare git archive can never be deleted from here.
+    /// The font-binary portions CASCADE: deleting a family's fonts also deletes its build log and
+    /// resets its result to queued, so the progress bar regresses (see spawn_reset_portion). The
+    /// other portions keep build results untouched.
     fn compute_reset_portions(&self) -> Vec<crate::model::ResetPortion> {
         use crate::model::ResetPortion;
         let bd = &self.cfg.build_dir;
@@ -1629,9 +1631,9 @@ impl Orchestrator {
         };
         vec![
             p("fonts-fontc", "font binaries built by fontc", fontc_bytes,
-              "deletes out/ fonts of fontc-built families (incl. builder3); results stay 'built' — use retrigger/rebuild to rebuild"),
+              "deletes out/ fonts of fontc-built families (incl. builder3) + their build logs, and re-queues them — the progress bar regresses (pause first if you don't want them rebuilt)"),
             p("fonts-fontmake", "font binaries built by fontmake", fontmake_bytes,
-              "deletes out/ fonts of fontmake-built families; results stay 'built' — use retrigger/rebuild to rebuild"),
+              "deletes out/ fonts of fontmake-built families + their build logs, and re-queues them — the progress bar regresses (pause first if you don't want them rebuilt)"),
             p("variants", "superseded upgrade binaries (variants/)", dir_size(&bd.join("variants")),
               "older rungs' binaries kept by successful auto-upgrades, for output comparison"),
             p("debs", ".deb packages + packaging trees", dir_size(&bd.join("packaging")),
@@ -1661,17 +1663,20 @@ impl Orchestrator {
             me.shared.lock().unwrap().reset_notes.remove(&key); // fresh attempt → clear any old outcome
             let bd = me.cfg.build_dir.clone();
 
-            // what's actively in use right now — never deleted out from under a running build
-            let (building_lognames, in_use_cohorts, n_building, built_by_backend) = {
+            // what's actively in use right now — never deleted out from under a running build.
+            // `built_trips` is (slug, logname, backend) for every built family, captured up front:
+            // select_font_targets only needs (logname, backend), but the cascade below also needs the
+            // slug to reset that family's result so the progress bar regresses.
+            let (building_lognames, in_use_cohorts, n_building, built_trips) = {
                 let sh = me.shared.lock().unwrap();
                 let building: HashSet<String> = sh.results.values()
                     .filter(|r| r.status == "building").map(|r| slug_to_logname(&r.slug)).collect();
                 let cohorts: HashSet<String> = sh.results.values()
                     .filter(|r| r.status == "building" && !r.cohort.is_empty())
                     .map(|r| r.cohort.clone()).collect();
-                let by_backend: Vec<(String, String)> = sh.results.values().filter(|r| r.status == "built")
-                    .map(|r| (slug_to_logname(&r.slug), r.backend.clone())).collect();
-                (building, cohorts, sh.results.values().filter(|r| r.status == "building").count(), by_backend)
+                let trips: Vec<(String, String, String)> = sh.results.values().filter(|r| r.status == "built")
+                    .map(|r| (r.slug.clone(), slug_to_logname(&r.slug), r.backend.clone())).collect();
+                (building, cohorts, sh.results.values().filter(|r| r.status == "building").count(), trips)
             };
 
             // gather the concrete paths to delete for this portion, already excluding in-use items
@@ -1691,7 +1696,9 @@ impl Orchestrator {
             match key.as_str() {
                 "fonts-fontc" | "fonts-fontmake" => {
                     let compiler = key.trim_start_matches("fonts-");
-                    let (t, s) = select_font_targets(&bd.join("out"), &built_by_backend, compiler, &building_lognames);
+                    let lb: Vec<(String, String)> = built_trips.iter()
+                        .map(|(_, logname, backend)| (logname.clone(), backend.clone())).collect();
+                    let (t, s) = select_font_targets(&bd.join("out"), &lb, compiler, &building_lognames);
                     targets = t; skipped += s;
                 }
                 "variants" => per_family_dir(&bd.join("variants"), ""),
@@ -1767,10 +1774,52 @@ impl Orchestrator {
                 }
             }
 
+            let mut requeued = 0usize;
             match key.as_str() {
                 "debs" => me.shared.lock().unwrap().packaged.clear(),
                 "venvs" => me.shared.lock().unwrap().cached_cohorts.retain(|c| in_use_cohorts.contains(c)),
                 "logs" => { let _ = std::fs::create_dir_all(bd.join("logs")); } // every build needs logs/
+                // In --dry-run the control watcher is live and the mockup marks families "built", so a
+                // reset click here would otherwise re-queue mockup results and (via save_state) clobber the
+                // real session's state.json — every persistence site in this file is dry-run-guarded for
+                // exactly that reason. Skip the whole cascade in dry-run; it falls through to the no-op arm.
+                "fonts-fontc" | "fonts-fontmake" if !me.cfg.dry_run => {
+                    // Cascade: a family this deletion left with NO fonts is no longer "built", so reset
+                    // it to queued (built↓, queued↑). The progress-bar denominator is built+failed+
+                    // queued+building, so it's preserved — the bar visibly REGRESSES rather than the
+                    // family silently dropping off the worklist. We also delete the family's per-family
+                    // build log and clear its packaged marker (so the rebuild re-packages). A re-queued
+                    // family rebuilds on the running pool unless the daemon is paused. A 'both'-backend
+                    // family is reset only once BOTH compiler halves are gone — this click may have
+                    // removed only one. The bare git archive is never a target, so it can't be touched.
+                    let compiler = key.trim_start_matches("fonts-");
+                    let other = if compiler == "fontc" { "fontmake" } else { "fontc" };
+                    let out_root = bd.join("out");
+                    let logs_dir = bd.join("logs");
+                    // (slug, logname) of families left with NO fonts by this deletion (checked AFTER it ran)
+                    let to_requeue = families_to_requeue(&built_trips, compiler, &building_lognames,
+                        |logname| dir_size(&out_root.join(logname).join(other)) > 0);
+                    let mut sh = me.shared.lock().unwrap();
+                    for (slug, logname) in &to_requeue {
+                        {
+                            // act only on a still-live "built" result (a build could have raced in)
+                            let Some(r) = sh.results.get_mut(slug) else { continue };
+                            if r.status != "built" { continue; }
+                            r.status = "queued".into();
+                            r.queued_kind = "rebuild".into();
+                            r.error.clear();
+                        }
+                        requeued += 1;
+                        sh.packaged.remove(slug);
+                        if !sh.queue.contains(slug) { sh.queue.push_back(slug.clone()); }
+                        let _ = std::fs::remove_file(logs_dir.join(format!("{}.log", logname)));
+                    }
+                    drop(sh);
+                    if requeued > 0 {
+                        me.save_state();      // persist the regression so a restart agrees
+                        me.cond.notify_all(); // wake the pool to rebuild (a no-op while paused)
+                    }
+                }
                 _ => {}
             }
 
@@ -1779,11 +1828,15 @@ impl Orchestrator {
             let mut sh = me.shared.lock().unwrap();
             sh.reset_progress.remove(&key);
             sh.reset_portions = portions;
-            let msg = if skipped > 0 {
+            let mut msg = if skipped > 0 {
                 format!("✓ freed {} (kept {} in use)", crate::util::human(freed), skipped)
             } else {
                 format!("✓ freed {}", crate::util::human(freed))
             };
+            if requeued > 0 {
+                msg.push_str(&format!(" · re-queued {} famil{} (progress regressed)",
+                    requeued, if requeued == 1 { "y" } else { "ies" }));
+            }
             sh.reset_notes.insert(key.clone(), (msg.clone(), now)); // lingers ~6 s
             sh.control_log.push(format!("reset {}: {}", key, msg));
         });
@@ -3216,8 +3269,10 @@ fn remove_tree_progress(dir: &Path, freed: &mut u64, cb: &mut dyn FnMut(u64)) {
 
 /// Reset-tab: the out/ font dirs to delete for one COMPILER (`fontc`/`fontmake`) — a plain
 /// family's whole out/<logname>, a both-mode family's matching-compiler subdir — skipping any
-/// family currently building. Pure (returns the path list + #skipped) so it's unit-tested; the
-/// caller deletes the paths with progress. Results/state are untouched (same as --discard-fonts).
+/// family currently building. Pure (returns the path list + #skipped) so it's unit-tested. The path
+/// selection is the same as --discard-fonts, but the caller then CASCADES — see spawn_reset_portion /
+/// families_to_requeue — re-queueing every family it left with no fonts (the result reset lives there,
+/// not here), so this is no longer result-preserving like --discard-fonts.
 fn select_font_targets(out_root: &Path, built: &[(String, String)], compiler: &str,
                        building: &HashSet<String>) -> (Vec<PathBuf>, usize) {
     let mut targets = Vec::new();
@@ -3228,6 +3283,35 @@ fn select_font_targets(out_root: &Path, built: &[(String, String)], compiler: &s
         else if backend == "both" { targets.push(out_root.join(logname).join(compiler)); }
     }
     (targets, skipped)
+}
+
+/// After a `fonts-<compiler>` deletion, decide which built families are left with NO fonts (fully
+/// un-built) — the cascade re-queues exactly these so the progress bar regresses. `built` is
+/// (slug, logname, backend) for the families that were built; `building` are lognames whose fonts
+/// were skipped (still building) and so are never reset. A family whose backend IS this compiler had
+/// its whole out/<logname> deleted → fully un-built. A `both`-backend family had only one half
+/// deleted, so it's fully un-built only when the OTHER compiler's half is also gone, decided by
+/// `other_half_present(logname)` (queried AFTER the delete). Other backends aren't part of this
+/// portion. Returns (slug, logname) pairs.
+fn families_to_requeue(
+    built: &[(String, String, String)],
+    compiler: &str,
+    building: &HashSet<String>,
+    mut other_half_present: impl FnMut(&str) -> bool,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (slug, logname, backend) in built {
+        if building.contains(logname) { continue; }
+        let fully_unbuilt = if backend == compiler {
+            true
+        } else if backend == "both" {
+            !other_half_present(logname)
+        } else {
+            false
+        };
+        if fully_unbuilt { out.push((slug.clone(), logname.clone())); }
+    }
+    out
 }
 
 /// Undo `stash_variant_outputs` after a declined upgrade: the kept binaries go back to being the
@@ -3938,6 +4022,31 @@ mod tests {
         assert_eq!(s2, 1);
         assert!(!t2.iter().any(|p| p.ends_with("ofl__a")), "building family not targeted");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cascade_requeues_only_fully_unbuilt_families() {
+        // (slug, logname, backend): a fontc-only, a fontmake-only, a 'both', and one currently building
+        let built = vec![
+            ("ofl/a".to_string(), "ofl__a".to_string(), "fontc".to_string()),
+            ("ofl/b".to_string(), "ofl__b".to_string(), "fontmake".to_string()),
+            ("ofl/c".to_string(), "ofl__c".to_string(), "both".to_string()),
+            ("ofl/d".to_string(), "ofl__d".to_string(), "fontc".to_string()),
+        ];
+        let building: HashSet<String> = std::iter::once("ofl__d".to_string()).collect();
+
+        // delete fontc fonts: 'a' (fontc) is fully un-built; 'b' (fontmake) untouched; 'd' is building
+        // → skipped; 'c' (both) keeps its fontmake half (present) so it's NOT yet fully un-built.
+        let r = families_to_requeue(&built, "fontc", &building, |logname| logname == "ofl__c");
+        assert_eq!(r, vec![("ofl/a".to_string(), "ofl__a".to_string())]);
+
+        // now delete fontmake fonts: 'b' is fully un-built, and 'c' (both) has lost its fontc half too
+        // (other_half_present=false for everyone) → 'c' is now fully un-built and re-queued as well.
+        let r2 = families_to_requeue(&built, "fontmake", &HashSet::new(), |_| false);
+        assert_eq!(r2, vec![
+            ("ofl/b".to_string(), "ofl__b".to_string()),
+            ("ofl/c".to_string(), "ofl__c".to_string()),
+        ]);
     }
 
     #[test]

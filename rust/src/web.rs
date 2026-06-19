@@ -384,7 +384,7 @@ function resetPortion(key,label,bytes){
 }
 function resetView(){
  const ps=snap.reset_portions||[];
- let h='<div class="sec">Reset — delete a portion of the build system  <span class="muted">(items in use by a running build are kept · archive & results are never touched)</span></div>';
+ let h='<div class="sec">Reset — delete a portion of the build system  <span class="muted">(items in use by a running build are kept · the bare git archive is never touched · deleting fonts re-queues those families so the progress bar regresses)</span></div>';
  if(!ps.length)return h+'<div class="ln muted">(sizes are being measured — they refresh every ~30 s)</div>';
  h+=ps.map(p=>{
   if(p.deleting){
