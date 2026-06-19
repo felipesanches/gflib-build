@@ -2168,6 +2168,15 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
             if let Some(fc) = snap.fail_categories.get(sel) {
                 o.push(format!("Failure cause: {}", fc.cat));
                 o.push(format!("families affected: {}", fc.count));
+                if !fc.subcauses.is_empty() {
+                    o.push(String::new());
+                    o.push("sub-cause breakdown:".into());
+                    let mut subs: Vec<(&String, &usize)> = fc.subcauses.iter().collect();
+                    subs.sort_by(|a, b| b.1.cmp(a.1));
+                    for (k, n) in subs {
+                        o.push(format!("  {:>5}  {}", n, k));
+                    }
+                }
                 o.push(String::new());
                 o.push("affected families:".into());
                 if fc.families.is_empty() {

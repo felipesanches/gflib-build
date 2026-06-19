@@ -147,6 +147,9 @@ pub struct FailCategory {
     #[serde(default)] pub count: usize,
     #[serde(default)] pub hint: String,
     #[serde(default)] pub families: Vec<String>,
+    // finer sub-cause breakdown within this category (e.g. source: .glyphs → 451) — the per-iteration
+    // detailed chart, computed automatically from classify::subclassify_failure
+    #[serde(default)] pub subcauses: BTreeMap<String, usize>,
 }
 
 /// One lintian finding tag grouped across packages (the packaging analogue of FailCategory).

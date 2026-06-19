@@ -3174,7 +3174,7 @@ impl Orchestrator {
         let mut queued_list = Vec::new();
         let mut fails = Vec::new();
         let mut built = Vec::new();
-        let mut fail_cat: BTreeMap<String, (usize, Vec<String>, &'static str)> = BTreeMap::new();
+        let mut fail_cat: BTreeMap<String, (usize, Vec<String>, &'static str, BTreeMap<String, usize>)> = BTreeMap::new();
 
         for r in sh.results.values() {
             match r.status.as_str() {
@@ -3257,10 +3257,13 @@ impl Orchestrator {
                         .unwrap_or_default(),
                 });
                 let (cause, hint) = crate::classify::categorize_failure(&r.error);
-                let ent = fail_cat.entry(cause.to_string()).or_insert((0, Vec::new(), hint));
+                let ent = fail_cat.entry(cause.to_string()).or_insert((0, Vec::new(), hint, BTreeMap::new()));
                 ent.0 += 1;
                 if ent.1.len() < 40 {
                     ent.1.push(r.slug.clone());
+                }
+                if let Some(sub) = crate::classify::subclassify_failure(&r.error) {
+                    *ent.3.entry(sub).or_insert(0) += 1;
                 }
             }
         }
@@ -3274,11 +3277,12 @@ impl Orchestrator {
         let fail_categories = {
             let mut v: Vec<FailCategory> = fail_cat
                 .into_iter()
-                .map(|(cat, (count, families, hint))| FailCategory {
+                .map(|(cat, (count, families, hint, subcauses))| FailCategory {
                     hint: hint.to_string(),
                     cat,
                     count,
                     families,
+                    subcauses,
                 })
                 .collect();
             v.sort_by(|a, b| b.count.cmp(&a.count));

@@ -267,6 +267,61 @@ pub fn categorize_failure(error: &str) -> (&'static str, &'static str) {
     ("other", "open the family log for details")
 }
 
+/// Extract the substring between `a` and the next `b` after it (None if not found).
+fn between<'a>(s: &'a str, a: &str, b: &str) -> Option<&'a str> {
+    let i = s.find(a)? + a.len();
+    let rest = &s[i..];
+    let j = rest.find(b)?;
+    Some(&rest[..j])
+}
+
+/// A finer sub-cause WITHIN a category, for the per-iteration detailed breakdown (the dashboard tallies
+/// these per cause). Data-driven keys: the source file type, the recipe operation, the offending config
+/// source, the recipe provider, the pre-build tool, the missing designspace field. None when there is no
+/// finer signal (the category itself is the whole story). Branch order mirrors `categorize_failure` where
+/// messages overlap (e.g. a fontprimer error contains both "recipeprovider" and "could not parse config").
+pub fn subclassify_failure(error: &str) -> Option<String> {
+    let low = error.to_lowercase();
+    // source file type (e.g. ".glyphs", ".vfb") from `for file "…ext"`
+    if low.contains("wrong convertor for file") || low.contains("unknown file type for file") {
+        if let Some(q) = between(error, "for file \"", "\"") {
+            let base = q.rsplit('/').next().unwrap_or(q);
+            let ext = base.rsplit('.').next().unwrap_or("");
+            return Some(if ext.is_empty() { "source: (no ext)".into() } else { format!("source: .{}", ext.to_lowercase()) });
+        }
+    }
+    // a recipe provider builder3 doesn't implement (must precede the config-parse branch — same message)
+    if low.contains("recipeprovider") {
+        if let Some(p) = between(&low, "unknown variant `", "`").or_else(|| between(&low, "unknown variant '", "'")) {
+            return Some(format!("provider: {}", p));
+        }
+    }
+    // a designspace field the loader doesn't support
+    if low.contains("missing field") {
+        if let Some(f) = between(error, "missing field `", "`") {
+            return Some(format!("missing field: {}", f));
+        }
+    }
+    // which config failed to parse, and why
+    if low.contains("could not parse config") || low.contains("did not match any variant") || low.contains("data did not match") {
+        let src = if error.contains("__gflib_override_config") { "override config" } else { "family config" };
+        let why = if low.contains("untagged enum step") { "unknown recipe Step" } else { "schema mismatch" };
+        return Some(format!("{}: {}", src, why));
+    }
+    // the recipe operation that failed (ToBytes / Fontc / Autohint / …)
+    if let Some(op) = between(error, "operation '", "'") {
+        return Some(format!("op: {}", op));
+    }
+    // the tool a refused Python pre-build invokes
+    if low.contains("needs python pre-build") {
+        if let Some(t) = between(error, "rule uses '", "'") {
+            let base = t.split_whitespace().next().unwrap_or(t).rsplit('/').next().unwrap_or(t);
+            return Some(format!("tool: {}", base));
+        }
+    }
+    None
+}
+
 /// Causes a fresh attempt can plausibly clear — re-attempted automatically on the next build (the
 /// self-heal set). Causes needing human action outside the tool (missing -dev lib, unreachable repo,
 /// genuine build error) are deliberately excluded; `--retry-failed` re-attempts even those.
@@ -344,6 +399,19 @@ mod tests {
         assert_eq!(categorize_failure("builder3: operation X while building [..] from [masters/a]: feature files are non-identical: masters/b").0, "builder3: per-master feature mismatch");
         // a still-generic builder3 error keeps the catch-all
         assert_eq!(categorize_failure("builder3: some brand new orchestrator hiccup").0, "builder3 error");
+    }
+    #[test]
+    fn subclassify_extracts_the_fine_sub_cause() {
+        let sc = |e: &str| subclassify_failure(e);
+        assert_eq!(sc("builder3: Recipe is not valid: Failed to load source ABeeZee.glyphs: Wrong convertor for file \"ABeeZee.glyphs\"").as_deref(), Some("source: .glyphs"));
+        assert_eq!(sc("builder3: Failed to load source X.vfb: Wrong convertor for file \"sources/X.vfb\"").as_deref(), Some("source: .vfb"));
+        assert_eq!(sc("builder3: operation 'ToBytes' while building [..]: boom").as_deref(), Some("op: ToBytes"));
+        // a fontprimer error contains BOTH "recipeprovider" and "could not parse config" → provider wins
+        assert_eq!(sc("builder3: Could not parse config file sources/config.yaml: recipeprovider: unknown variant `fontprimer`").as_deref(), Some("provider: fontprimer"));
+        assert_eq!(sc("builder3: Could not parse config file __gflib_override_config.yaml: data did not match any variant of untagged enum Step").as_deref(), Some("override config: unknown recipe Step"));
+        assert_eq!(sc("needs Python pre-build: rule uses 'glyphs2ufo' (glyphs2ufo sources/X.glyphspackage)").as_deref(), Some("tool: glyphs2ufo"));
+        assert_eq!(sc("builder3: error parsing designspace file: missing field `conditionset`").as_deref(), Some("missing field: conditionset"));
+        assert_eq!(sc("builder3: some brand new orchestrator hiccup"), None);
         // …but a fontc error about a missing SOURCE file is NOT the launcher bucket
         assert_ne!(categorize_failure("no such file or directory: sources/Foo.glif").0, "builder binary missing");
     }

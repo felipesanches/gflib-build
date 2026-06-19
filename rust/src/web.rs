@@ -847,7 +847,10 @@ function openDetail(kind,id){
   const why={retry:'Re-attempt after a previous build FAILURE (its cause may now be fixable).',rebuild:'Rebuild of a family that already built successfully (forced by --rebuild or [R]).'}[q.kind]||'A fresh target — this family has never been built.';
   lines=['kind: '+q.kind,'',why];
  } else if(kind=='failcat'){const c=findBy(snap.fail_categories,'cat',id);if(!c)return;title='Failure cause: '+c.cat;
-  lines=['families affected: '+c.count,'','affected families:'];(c.families&&c.families.length?c.families:['(none)']).forEach(s=>lines.push('  '+s));lines.push('','what to do:','  '+(c.hint||''));
+  lines=['families affected: '+c.count];
+  const subs=Object.entries(c.subcauses||{}).sort((a,b)=>b[1]-a[1]);
+  if(subs.length){lines.push('','sub-cause breakdown:');subs.forEach(kv=>lines.push('  '+Rp(kv[1],5)+'  '+kv[0]));}
+  lines.push('','affected families:');(c.families&&c.families.length?c.families:['(none)']).forEach(s=>lines.push('  '+s));lines.push('','what to do:','  '+(c.hint||''));
  } else if(kind=='lintcat'){const c=(snap.lint_categories||[]).find(x=>x.severity+':'+x.tag==id);if(!c)return;title='lintian '+(c.severity=='E'?'error':'warning')+': '+c.tag;
   lines=['severity: '+(c.severity=='E'?'ERROR':'warning'),'packages affected: '+c.count,'lintian tag docs: https://lintian.debian.org/tags/'+c.tag,'','affected packages:'];(c.families&&c.families.length?c.families:['(none)']).forEach(s=>lines.push('  '+s));
  } else if(kind=='history'){const h=findBy(snap.failure_history,'slug',id);if(!h)return;slug=id;title='Failed (history): '+h.slug;
