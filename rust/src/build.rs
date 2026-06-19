@@ -1093,7 +1093,7 @@ impl Orchestrator {
             }
         }
         preclean_outputs(work);
-        let (cfg_path, _label) = match resolve_config(self.cfg.google_fonts.as_deref(), fam, work) {
+        let (cfg_path, _label) = match resolve_config(self.cfg.google_fonts.as_deref(), fam, work, "builder2") {
             Ok(v) => v,
             Err(e) => return (false, e, BTreeMap::new(), 0),
         };
@@ -1546,7 +1546,7 @@ impl Orchestrator {
                 self.set_result(slug, |r| r.note = String::new());
             }
             preclean_outputs(&work);
-            let (cfg_path, label) = match self.timed(slug, "config", || resolve_config(self.cfg.google_fonts.as_deref(), &fam, &work)) {
+            let (cfg_path, label) = match self.timed(slug, "config", || resolve_config(self.cfg.google_fonts.as_deref(), &fam, &work, builder)) {
                 Ok(v) => v,
                 Err(e) => {
                     last_err = e;
@@ -3727,15 +3727,100 @@ fn preclean_outputs(work: &Path) {
     }
 }
 
+/// Translate a *gflib-build-authored* builder2-dialect override into a builder3-valid provider config.
+///
+/// Our single-master "instantiateUfo bypass" overrides are written as an explicit builder2 `recipe:`
+/// (`source:` + `operation: buildTTF`/`fix` steps). gftools-builder3 cannot parse those: its `Step`
+/// enum has no `buildTTF` operation, and explicit `source:` steps are unimplemented — builder3 is
+/// provider-driven (`sources:` + flags; the googlefonts provider synthesizes the recipe). The bypass is
+/// also *unnecessary* in builder3 (it filters variable fonts to `masters >= 2` and builds statics per
+/// instance via fontc, with no Python `instantiateUfo` step). So for a builder3 build we regenerate the
+/// equivalent provider config.
+///
+/// Returns `Some(yaml)` only when the input carries [`OVERRIDE_MARKER`] (so we never rewrite a natural
+/// upstream config) AND has an explicit `recipe:` we can translate; otherwise `None` (stage verbatim).
+/// Source paths are kept verbatim — builder3 chdir's to the config dir (the work root, where the staged
+/// config lives) and loads each source path as-given, so the `sources/` prefix must be preserved.
+fn translate_override_for_builder3(yaml_text: &str) -> Option<String> {
+    if !yaml_text.contains(OVERRIDE_MARKER) {
+        return None; // not ours — never rewrite an upstream config
+    }
+    let root: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml_text).ok()?;
+    let map = root.as_mapping()?;
+    let recipe = map.get("recipe")?.as_mapping()?; // no explicit recipe -> already provider-style
+
+    let mut sources: Vec<String> = Vec::new();
+    let mut operations: Vec<String> = Vec::new();
+    let mut variable = false;
+    let mut webfont = false;
+    for (target, steps) in recipe.iter() {
+        if let Some(name) = target.as_str() {
+            if name.contains('[') {
+                variable = true; // a variable-font filename (e.g. Foo[wght].ttf)
+            }
+            if name.ends_with(".woff2") {
+                webfont = true;
+            }
+        }
+        let Some(steps) = steps.as_sequence() else { continue };
+        for step in steps {
+            let Some(step) = step.as_mapping() else { continue };
+            if let Some(src) = step.get("source").and_then(|v| v.as_str()) {
+                if !sources.iter().any(|s| s == src) {
+                    sources.push(src.to_string());
+                }
+            }
+            if let Some(op) = step.get("operation").and_then(|v| v.as_str()) {
+                operations.push(op.to_string());
+            }
+        }
+    }
+    if sources.is_empty() {
+        return None; // nothing we can faithfully translate — let the original fail loudly
+    }
+    if operations.iter().any(|o| o == "compress") {
+        webfont = true;
+    }
+
+    let family_name = map.get("familyName").and_then(|v| v.as_str());
+    let mut out = String::new();
+    out.push_str("# gflib-build override (builder3-normalized): provider-driven config translated from a\n");
+    out.push_str("# builder2 explicit recipe (single-master instantiateUfo bypass, unnecessary in builder3).\n");
+    if let Some(fam) = family_name {
+        out.push_str(&format!("familyName: {}\n", fam));
+    }
+    out.push_str("sources:\n");
+    for s in &sources {
+        out.push_str(&format!("  - {}\n", s));
+    }
+    out.push_str(&format!("buildVariable: {}\n", variable));
+    out.push_str(&format!("buildWebfont: {}\n", webfont));
+    Some(out)
+}
+
 /// Resolve the gftools-builder config: a google/fonts override, else the in-repo config_yaml, else
-/// an auto-discovered candidate. Returns (config_path, label).
-fn resolve_config(google_fonts: Option<&Path>, fam: &Family, work: &Path) -> Result<(PathBuf, String), String> {
+/// an auto-discovered candidate. Returns (config_path, label). For a builder3 build, a gflib-build
+/// builder2-dialect override is translated to a builder3-valid provider config as it is staged.
+fn resolve_config(google_fonts: Option<&Path>, fam: &Family, work: &Path, builder: &str) -> Result<(PathBuf, String), String> {
     if let Some(gf) = google_fonts {
         let override_cfg = gf.join(&fam.slug).join("config.yaml");
         if override_cfg.is_file() {
             let dest = work.join("__gflib_override_config.yaml");
-            std::fs::copy(&override_cfg, &dest).map_err(|e| format!("stage override config: {}", e))?;
-            return Ok((dest, format!("override:{}/config.yaml", fam.slug)));
+            let translated = if builder == "builder3" {
+                std::fs::read_to_string(&override_cfg).ok().and_then(|t| translate_override_for_builder3(&t))
+            } else {
+                None
+            };
+            match translated {
+                Some(text) => {
+                    std::fs::write(&dest, text).map_err(|e| format!("stage override config: {}", e))?;
+                    return Ok((dest, format!("override:{}/config.yaml (builder3-normalized)", fam.slug)));
+                }
+                None => {
+                    std::fs::copy(&override_cfg, &dest).map_err(|e| format!("stage override config: {}", e))?;
+                    return Ok((dest, format!("override:{}/config.yaml", fam.slug)));
+                }
+            }
         }
     }
     if !fam.config_yaml.is_empty() {
@@ -4657,6 +4742,73 @@ mod tests {
         );
         // nothing available: fontmake-only (the guaranteed floor)
         assert_eq!(attempt_chain("auto", "auto", false, false), vec![("builder2", "fontmake")]);
+    }
+
+    #[test]
+    fn translate_kosugi_override_to_builder3_provider() {
+        // The real apache/kosugi override: builder2 explicit recipe, single source, buildTTF + fix.
+        let src = "\
+# gflib-build override: bypass gftools-builder's broken instantiateUfo step.
+# apache/kosugi is single-master (glyphs, 1 source file(s)); fontmake -i emits nothing to interpolate.
+
+recipe:
+  fonts/ttf/Kosugi-Regular.ttf:
+    - source: sources/Kosugi.glyphs
+    - operation: buildTTF
+    - operation: fix
+";
+        let out = translate_override_for_builder3(src).expect("should translate");
+        // marker preserved (config-watcher / retry-override recognition), source path kept verbatim,
+        // single-master static => no variable, no webfont.
+        assert!(out.contains(OVERRIDE_MARKER), "marker must survive: {out}");
+        assert!(out.contains("sources:\n  - sources/Kosugi.glyphs\n"), "verbatim source: {out}");
+        assert!(out.contains("buildVariable: false"), "{out}");
+        assert!(out.contains("buildWebfont: false"), "{out}");
+        assert!(!out.contains("recipe:"), "explicit recipe must be gone: {out}");
+        assert!(!out.contains("buildTTF"), "no builder2 op names: {out}");
+        // and the result must parse as YAML (the whole point — builder3 can read it)
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).expect("valid YAML");
+        assert!(v.get("sources").and_then(|s| s.as_sequence()).map(|s| s.len()) == Some(1));
+    }
+
+    #[test]
+    fn translate_skips_non_gflib_and_provider_style() {
+        // No OVERRIDE_MARKER -> never rewrite an upstream config, even if it has a builder2 recipe.
+        let upstream = "recipe:\n  fonts/ttf/X.ttf:\n    - source: sources/X.glyphs\n    - operation: buildTTF\n";
+        assert!(translate_override_for_builder3(upstream).is_none());
+        // Ours, but already provider-style (no explicit recipe) -> leave verbatim (builder3-compatible).
+        let provider = "# gflib-build override\nsources:\n  - sources/X.glyphs\nbuildVariable: false\n";
+        assert!(translate_override_for_builder3(provider).is_none());
+        // Ours, explicit recipe but no source step we can lift -> None (fail loudly, don't fake it).
+        let no_src = "# gflib-build override\nrecipe:\n  fonts/ttf/X.ttf:\n    - operation: fix\n";
+        assert!(translate_override_for_builder3(no_src).is_none());
+    }
+
+    #[test]
+    fn translate_detects_variable_webfont_and_dedupes_sources() {
+        let src = "\
+# gflib-build override: VF + webfonts from two sources.
+familyName: Foo
+recipe:
+  fonts/variable/Foo[wght].ttf:
+    - source: sources/Foo.glyphs
+    - operation: buildTTF
+  webfonts/Foo[wght].woff2:
+    - source: sources/Foo.glyphs
+    - operation: compress
+  fonts/ttf/Foo-Italic.ttf:
+    - source: sources/Foo-Italic.glyphs
+    - operation: buildTTF
+";
+        let out = translate_override_for_builder3(src).expect("should translate");
+        assert!(out.contains("familyName: Foo"), "{out}");
+        assert!(out.contains("buildVariable: true"), "bracket target => variable: {out}");
+        assert!(out.contains("buildWebfont: true"), "compress/.woff2 => webfont: {out}");
+        // both distinct sources collected once each, in first-seen order
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).expect("valid YAML");
+        let srcs: Vec<String> = v.get("sources").unwrap().as_sequence().unwrap().iter()
+            .map(|s| s.as_str().unwrap().to_string()).collect();
+        assert_eq!(srcs, vec!["sources/Foo.glyphs", "sources/Foo-Italic.glyphs"]);
     }
 
     #[test]
