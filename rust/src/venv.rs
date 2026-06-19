@@ -202,7 +202,13 @@ pub fn apply_pin_overrides(lines: &[String]) -> (Vec<String>, Vec<String>) {
 /// drag in. diffenator2/fontprimer pin protobuf<=3.20.3, which is mutually exclusive with a recent
 /// gftools (git main) that needs protobuf>=6.33 — keeping them made every fresh venv install fail with
 /// ResolutionImpossible. drawbot-skia is their rendering backend (proof images), build-irrelevant too.
-const QA_PKGS: [&str; 5] = ["fontbakery", "fontspector", "diffenator2", "fontprimer", "drawbot-skia"];
+const QA_PKGS: [&str; 7] = [
+    "fontbakery", "fontspector",
+    // the diffing / proofing cluster — visual QA, never used to BUILD a font. fontdiffenator + gfdiffbrowsers
+    // are the OLDER diffenator family (alegreya pulls them, dragging in an unbuildable Pillow==7.2.0 sdist
+    // and an off-PyPI fontdiffenator → ResolutionImpossible); diffenator2/fontprimer are the newer ones.
+    "diffenator2", "fontprimer", "drawbot-skia", "fontdiffenator", "gfdiffbrowsers",
+];
 
 /// True for a package that is QA-only (build-irrelevant) and should be dropped from a cohort.
 pub fn is_qa_pkg(pkg: &str) -> bool {
@@ -365,6 +371,52 @@ pub fn parse_unsatisfiable(text: &str) -> HashSet<String> {
         }
     }
     bad
+}
+
+/// Distill a failed pip-install log to the ONE most relevant line, for the error shown at the top of the
+/// failure detail (so the user doesn't have to read the whole install log). Priority: a wheel BUILD
+/// failure (which package + its terminating Python exception) > an unsatisfiable requirement > a resolver
+/// conflict > the last generic `ERROR:` line. Returns None if nothing diagnostic is found.
+pub fn summarize_pip_failure(log: &str) -> Option<String> {
+    let lines: Vec<&str> = log.lines().map(|l| l.trim()).collect();
+    // 1) a wheel BUILD failure — name the package and its deepest Python exception
+    let mut failed_pkg: Option<String> = None;
+    for t in &lines {
+        if let Some(rest) = t.strip_prefix("ERROR: Failed to build '") {
+            if let Some(name) = rest.split('\'').next() {
+                failed_pkg = Some(name.to_string());
+            }
+        } else if let Some(rest) = t.strip_prefix("ERROR: Failed building wheel for ") {
+            failed_pkg = Some(rest.trim().trim_end_matches(['.', ':']).to_string());
+        }
+    }
+    if let Some(pkg) = failed_pkg {
+        // the deepest Python exception in the build output (e.g. "KeyError: '__version__'") — a line
+        // with "<Name>Error: " / "<Name>Exception: ", NOT pip's own upper-case "ERROR:" lines
+        let exc = lines.iter().rev()
+            .find(|t| (t.contains("Error: ") || t.contains("Exception: ")) && !t.starts_with("ERROR"))
+            .map(|t| t.chars().take(120).collect::<String>());
+        return Some(match exc {
+            Some(e) => format!("couldn't build {}'s wheel — {}", pkg, e),
+            None => format!("couldn't build {}'s wheel from source", pkg),
+        });
+    }
+    // 2) an unsatisfiable requirement (e.g. a yanked/removed package)
+    for t in &lines {
+        if let Some(rest) = t.strip_prefix("ERROR: No matching distribution found for ") {
+            return Some(format!("{} has no installable version on PyPI", rest.trim()));
+        }
+        if let Some(rest) = t.strip_prefix("ERROR: Could not find a version that satisfies the requirement ") {
+            let name = rest.split_whitespace().next().unwrap_or(rest);
+            return Some(format!("no version of {} on PyPI satisfies the pin", name));
+        }
+    }
+    // 3) a resolver conflict
+    if log.contains("ResolutionImpossible") || log.contains("conflicting dependencies") {
+        return Some("incompatible dependency versions (ResolutionImpossible)".into());
+    }
+    // 4) the last generic pip ERROR line
+    lines.iter().rev().find(|t| t.starts_with("ERROR: ")).map(|t| t.chars().take(120).collect())
 }
 
 /// Packages whose wheel BUILD failed (an sdist that won't compile here). Relaxing their pin lets pip
@@ -1134,21 +1186,50 @@ impl VenvManager {
                 }
                 let note = if relax.is_empty() { String::new() } else {
                     let mut r: Vec<_> = relax.iter().cloned().collect(); r.sort();
-                    format!(" after auto-relaxing {:?}", r)
+                    format!(" (relaxed {:?})", r)
                 };
-                return (String::new(), format!("pip install failed{} (see venvs/{}.install.log)", note, key));
+                // lead with the distilled cause (e.g. "couldn't build Pillow's wheel — KeyError: …")
+                let head = std::fs::read_to_string(&log).ok().and_then(|t| summarize_pip_failure(&t))
+                    .unwrap_or_else(|| "pip install failed".into());
+                return (String::new(), format!("{}{} (see venvs/{}.install.log)", head, note, key));
             }
             for c in &conflicts { conflict_relax.insert(c.clone()); }
             for r in new_relax { relax.insert(r); }
         }
         let mut r: Vec<_> = relax.iter().cloned().collect(); r.sort();
-        (String::new(), format!("pip install failed even after auto-relaxing {:?} (see venvs/{}.install.log)", r, key))
+        let head = std::fs::read_to_string(&log).ok().and_then(|t| summarize_pip_failure(&t))
+            .unwrap_or_else(|| "pip install failed".into());
+        (String::new(), format!("{} even after relaxing {:?} (see venvs/{}.install.log)", head, r, key))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn summarize_pip_failure_highlights_the_key_cause() {
+        // a wheel BUILD failure → the package + its deepest exception (the alegreya/Pillow case)
+        let log = "Collecting Pillow==7.2.0\n  Downloading Pillow-7.2.0.tar.gz\n\
+                   error: subprocess-exited-with-error\n      File \"<string>\", line 27, in get_version\n\
+                   KeyError: '__version__'\n      [end of output]\n\
+                   ERROR: Failed to build 'Pillow' when getting requirements to build wheel\n";
+        assert_eq!(summarize_pip_failure(log).as_deref(),
+            Some("couldn't build Pillow's wheel — KeyError: '__version__'"));
+        // an unsatisfiable / off-PyPI requirement
+        assert_eq!(summarize_pip_failure("ERROR: No matching distribution found for fontdiffenator\n").as_deref(),
+            Some("fontdiffenator has no installable version on PyPI"));
+        // a resolver conflict
+        assert!(summarize_pip_failure("ERROR: ResolutionImpossible: ...\n").unwrap().contains("incompatible"));
+        // nothing diagnostic
+        assert_eq!(summarize_pip_failure("Collecting fonttools\nSuccessfully installed fonttools\n"), None);
+    }
+    #[test]
+    fn qa_filter_drops_the_older_diffenator_family() {
+        // fontdiffenator (off-PyPI) + gfdiffbrowsers are QA/diff tools — dropped so they don't block the venv
+        let lines: Vec<String> = ["fontmake>=2.4", "fontdiffenator", "gfdiffbrowsers", "gftools>=0.9.23"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(filter_qa_requirements(&lines), vec!["fontmake>=2.4", "gftools>=0.9.23"]);
+    }
     #[test]
     fn parse_failed_wheel_builds_extracts_pkgs() {
         // explicit summary forms pip prints when a wheel BUILD fails

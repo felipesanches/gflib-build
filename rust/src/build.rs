@@ -1277,6 +1277,16 @@ impl Orchestrator {
                 self.set_result(slug, |r| r.note = note);
             }));
             if !verr.is_empty() {
+                // The build never reached the per-family build step, so logs/<fam>.log is empty
+                // ("(no log yet)"). The real story is in the COHORT install log — copy it into this
+                // family's log so the detail view's log-tail shows what actually failed at pip-install.
+                let install_log = self.cfg.build_dir.join("venvs").join(format!("{}.install.log", cohort));
+                if let Ok(content) = std::fs::read_to_string(&install_log) {
+                    let _ = std::fs::write(&log_path, format!(
+                        "(venv install failed — the per-family build never ran. Below is the cohort install \
+                         log: venvs/{}.install.log)\n\n{}",
+                        cohort, content));
+                }
                 let msg = format!("venv: {}", verr);
                 let (cause, _) = crate::classify::categorize_failure(&msg);
                 self.fail(slug, cause, &msg);
