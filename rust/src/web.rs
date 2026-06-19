@@ -360,7 +360,7 @@ const SCHEMA=[
  {k:'archive',l:'repo archive',t:'path',live:false},
  {k:'build_dir',l:'build output dir',t:'path',live:false},
  {k:'backend',l:'build backend',t:'choice',live:true},
- {k:'orchestrator',l:'orchestrator',t:'choice',live:false},
+ {k:'orchestrator',l:'orchestrator',t:'choice',live:true},
  {k:'fontc_bin',l:'fontc binary (override)',t:'path',live:false},
  {k:'auto_provision',l:'auto-provision pinned toolchain',t:'bool',live:false},
  {k:'jobs',l:'parallel jobs',t:'step',live:true},
@@ -621,7 +621,7 @@ function showIf(k,cf){const s=x=>(cf[x]==null?'':''+cf[x]);
  return true}
 const CHOICES={source:['metadata','archive'],backend:['auto','fontc','fontmake','both'],orchestrator:['auto','builder3','builder2']};
 // the keys the daemon actually honours live (same set as the TUI's cfg_apply_live) → editable form controls
-const LIVE_APPLY={backend:1,jobs:1,percent:1,compare:1,build_debs:1};
+const LIVE_APPLY={backend:1,orchestrator:1,jobs:1,percent:1,compare:1,build_debs:1};
 // logical groupings for the config panel (related settings under one sub-header)
 const GROUPS=[
  {t:'Sources & paths', k:['source','google_fonts','archive','build_dir']},

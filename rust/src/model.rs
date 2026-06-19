@@ -422,6 +422,7 @@ pub struct ControlSet {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub paused: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub orchestrator: Option<String>, // auto|builder3|builder2 (live)
     #[serde(default, skip_serializing_if = "Option::is_none")] pub compare: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_all: Option<bool>,

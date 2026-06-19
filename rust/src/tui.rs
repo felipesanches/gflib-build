@@ -90,7 +90,7 @@ fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
         ("build_dir", "build output dir", CfgKind::Path, false),
         // Build engine
         ("backend", "build backend", CfgKind::Choice(&BACKEND_CHOICES), true),
-        ("orchestrator", "orchestrator", CfgKind::Choice(&ORCHESTRATOR_CHOICES), false),
+        ("orchestrator", "orchestrator", CfgKind::Choice(&ORCHESTRATOR_CHOICES), true),
         ("fontc_bin", "fontc binary (override)", CfgKind::Path, false),
         ("auto_provision", "auto-provision pinned toolchain", CfgKind::Bool, false),
         ("manage_venvs", "cohort venvs", CfgKind::Bool, false),
@@ -294,7 +294,7 @@ fn cfg_actions(setup: bool) -> &'static [&'static str] {
 /// also gates which non-live fields are editable on a running build: editable ⇔ appliable-live OR
 /// persistable, so the UI never invites an edit that 'apply' would silently drop.
 const TUI_PERSIST: &[&str] = &[
-    "source", "backend", "jobs", "percent", "compare", "manage_venvs", "fontspector_qa", "build_debs",
+    "source", "backend", "orchestrator", "jobs", "percent", "compare", "manage_venvs", "fontspector_qa", "build_debs",
 ];
 
 fn cfg_persistable(key: &str) -> bool {
@@ -318,6 +318,11 @@ fn cfg_apply_live(fields: &[CfgField], snap: &Snapshot, src: &dyn Source) -> Str
     if changed("backend") {
         if let Some(b) = new.get("backend").and_then(|v| v.as_str()) {
             set.backend = Some(b.to_string());
+        }
+    }
+    if changed("orchestrator") {
+        if let Some(o) = new.get("orchestrator").and_then(|v| v.as_str()) {
+            set.orchestrator = Some(o.to_string()); // builder3 = pure fontc, no builder2/fontmake fallback
         }
     }
     if changed("jobs") {

@@ -60,6 +60,7 @@ pub struct Shared {
     pub jobs: usize,
     pub percent: f64,
     pub backend: String,
+    pub orchestrator: String, // SETTING (live): auto | builder3 | builder2 — drives attempt_chain
     pub compare: bool,
     pub cver_cache: HashMap<(String, String), String>,
     pub bver_cache: HashMap<(String, String), String>,
@@ -388,6 +389,7 @@ impl Orchestrator {
             jobs,
             percent: cfg.percent,
             backend: cfg.backend.clone(),
+            orchestrator: cfg.orchestrator.clone(),
             compare: cfg.compare,
             cver_cache: HashMap::new(),
             bver_cache: HashMap::new(),
@@ -1121,8 +1123,13 @@ impl Orchestrator {
     /// the resolved toolchain. builder3 is ALWAYS preferred when available (it runs fontc
     /// in-process); each later pair is the graceful fallback for the one before it.
     fn attempt_pairs(&self, have_fontc: bool, have_builder3: bool) -> Vec<(&'static str, &'static str)> {
-        let backend = self.shared.lock().unwrap().backend.clone(); // live (editable via config tab)
-        attempt_chain(&backend, &self.cfg.orchestrator, have_fontc, have_builder3)
+        // both the backend AND the orchestrator are live (editable via the config tab): orchestrator
+        // = builder3 forces the pure-fontc path with NO builder2/fontmake fallback.
+        let (backend, orchestrator) = {
+            let sh = self.shared.lock().unwrap();
+            (sh.backend.clone(), sh.orchestrator.clone())
+        };
+        attempt_chain(&backend, &orchestrator, have_fontc, have_builder3)
     }
 
     /// MOCKUP build: no clone/venv/compile — a brief fake "compile", then replay the family's recorded
@@ -1273,9 +1280,12 @@ impl Orchestrator {
         }
 
         // the stamp records what was actually REACHABLE for this attempt (pins + availability),
-        // so a result produced during a degraded run re-arms once the missing tool provisions
+        // so a result produced during a degraded run re-arms once the missing tool provisions. Use the
+        // LIVE orchestrator (what attempt_pairs actually uses) so the stamp matches the real attempt chain
+        // after a live orchestrator change — not the stale launch cfg.
+        let live_orchestrator = self.shared.lock().unwrap().orchestrator.clone();
         let tc_sig = crate::toolchain::run_sig(
-            &self.cfg.orchestrator, fontc_bin.is_some(), builder3_bin.is_some());
+            &live_orchestrator, fontc_bin.is_some(), builder3_bin.is_some());
         let mut pairs = self.attempt_pairs(fontc_bin.is_some(), builder3_bin.is_some());
         let mut stash: Option<PathBuf> = None;
         if let Some(prior) = &upgrade_prior {
@@ -1300,10 +1310,15 @@ impl Orchestrator {
             stash = stash_variant_outputs(&self.cfg.build_dir, &out_dir, &logname, prior);
         }
         if pairs.is_empty() {
-            let backend = self.shared.lock().unwrap().backend.clone();
+            // report the LIVE backend+orchestrator (what attempt_pairs actually used), not the launch cfg —
+            // e.g. a live switch to orchestrator=builder3 with builder3 unavailable lands here.
+            let (backend, orchestrator) = {
+                let sh = self.shared.lock().unwrap();
+                (sh.backend.clone(), sh.orchestrator.clone())
+            };
             self.fail(slug, "no usable backend", &format!(
                 "no orchestrator/compiler can run --backend {} (orchestrator={}, fontc {}, builder3 {})",
-                backend, self.cfg.orchestrator,
+                backend, orchestrator,
                 if fontc_bin.is_some() { "ok" } else { "unavailable" },
                 if builder3_bin.is_some() { "ok" } else { "unavailable" },
             ));
@@ -2055,6 +2070,12 @@ impl Orchestrator {
                 persist.insert("backend".into(), serde_json::json!(b));
                 log.push(format!("backend → {}", b));
             }
+            if let Some(o) = &set.orchestrator {
+                sh.orchestrator = o.clone();
+                persist.insert("orchestrator".into(), serde_json::json!(o));
+                // builder3 = pure fontc, no builder2/fontmake fallback (see attempt_chain)
+                log.push(format!("orchestrator → {}", o));
+            }
             if let Some(c) = set.compare {
                 sh.compare = c;
                 persist.insert("compare".into(), serde_json::json!(c));
@@ -2449,6 +2470,10 @@ impl Orchestrator {
         if !sh.backend.is_empty() {
             v.push("--backend".into());
             v.push(sh.backend.clone().into());
+        }
+        if !sh.orchestrator.is_empty() {
+            v.push("--orchestrator".into());
+            v.push(sh.orchestrator.clone().into());
         }
         // jobs as-is (0 = inspect-only; preserve it rather than forcing a build)
         v.push("--jobs".into());
@@ -3018,6 +3043,7 @@ impl Orchestrator {
                 c.insert("jobs".into(), serde_json::json!(sh.jobs));
                 c.insert("percent".into(), serde_json::json!(sh.percent));
                 c.insert("backend".into(), serde_json::json!(sh.backend));
+                c.insert("orchestrator".into(), serde_json::json!(sh.orchestrator));
                 c.insert("compare".into(), serde_json::json!(sh.compare));
                 c
             },
@@ -3681,19 +3707,51 @@ fn run_builder(
 
 fn last_error_line(log_path: &Path) -> String {
     let txt = std::fs::read_to_string(log_path).unwrap_or_default();
+    let clip = |s: &str| -> String { s.chars().take(200).collect() };
+    // A generic ninja/jobrunner wrapper line ("FAILED: [code=1] /tmp/…", "ninja: build stopped",
+    // "Command failed:") carries NO cause — the real reason is the compiler/preprocessor error above
+    // it. Skip wrappers so the recorded error (what the failure classifier sees) is actually diagnostic.
+    let is_wrapper = |s: &str| {
+        s.starts_with("FAILED:") || s.starts_with("ninja:") || s.starts_with("Command failed")
+            || s.starts_with("Cleaning up") || s.starts_with("Done cleaning")
+    };
+    // pass 1: the actual fontc error message, or builder3's cyclic-graph report (most diagnostic)
+    for ln in txt.lines().rev() {
+        let s = ln.trim();
+        if let Some(i) = s.find("fontc ERROR]") {
+            let msg = s[i + "fontc ERROR]".len()..].trim();
+            if !msg.is_empty() {
+                return clip(msg);
+            }
+        }
+        if s.contains("CYCLE DETECTED") || s.contains("Not a valid DAG") {
+            return "cyclic dependency graph (subset inclusion) — not a valid DAG".into();
+        }
+    }
+    // pass 2: a Python exception WITH a message ("fontTools…GlifLibError: …", "KeyError: …", …)
+    for ln in txt.lines().rev() {
+        let s = ln.trim();
+        if !is_wrapper(s) && (s.contains("Error:") || s.contains("Exception:")) {
+            return clip(s);
+        }
+    }
+    // pass 3: the original keyword fallback, but never the bare ninja wrapper
     for ln in txt.lines().rev() {
         let s = ln.trim();
         if !s.is_empty()
+            && !is_wrapper(s)
             && ["Error", "error", "Exception", "Traceback", "FAILED", "assert"]
                 .iter()
                 .any(|k| s.contains(k))
         {
-            return s.chars().take(200).collect();
+            return clip(s);
         }
     }
     txt.lines()
-        .last()
-        .map(|l| l.trim().chars().take(200).collect())
+        .rev()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .map(clip)
         .unwrap_or_else(|| "exit non-zero".into())
 }
 
