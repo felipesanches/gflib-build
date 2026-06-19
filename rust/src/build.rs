@@ -1579,7 +1579,12 @@ impl Orchestrator {
     fn spawn_control_watcher(self: &Arc<Self>) {
         let me = Arc::clone(self);
         thread::spawn(move || {
-            let mut last = 0u64;
+            // Seed from the CURRENT on-disk seq so a pre-existing control.json is NOT replayed at startup.
+            // control.json is never cleared and seq grows monotonically; a startup replay would re-run the
+            // last one-shot control (e.g. a reset_portion) and clobber freshly-resolved CLI/config settings.
+            // Live state already survives a UI restart via live_overrides_argv, and durably via state.json /
+            // gflib-build.config — nothing depends on replaying the last control. Only act on FUTURE bumps.
+            let mut last = persist::read_control(&me.cfg.build_dir).map(|c| c.seq).unwrap_or(0);
             while !me.stop.load(Ordering::Relaxed) {
                 if let Some(ctl) = persist::read_control(&me.cfg.build_dir) {
                     if ctl.seq != last {
@@ -1985,7 +1990,9 @@ impl Orchestrator {
     pub fn apply_live(self: &Arc<Self>, set: &ControlSet) {
         let mut log = Vec::new();
         let mut new_jobs = None;
-        let mut persist_build_debs = None;
+        // Every live-editable setting changed here is persisted to gflib-build.config so the choice
+        // survives a daemon reload — user choices are permanent, not silently reverted to launch defaults.
+        let mut persist: std::collections::BTreeMap<String, serde_json::Value> = std::collections::BTreeMap::new();
         {
             let mut sh = self.shared.lock().unwrap();
             if let Some(j) = set.jobs {
@@ -1993,12 +2000,17 @@ impl Orchestrator {
                 sh.jobs = j;
                 self.job_limit.store(j, Ordering::Relaxed); // regulator reads this lock-free
                 new_jobs = Some(j);
+                persist.insert("jobs".into(), serde_json::json!(j));
                 log.push(format!("jobs → {}", j));
             }
             if let Some(p) = set.percent {
                 let np = p.clamp(0.0, 100.0);
                 let old = sh.percent;
                 sh.percent = np;
+                // percent is deliberately NOT persisted/forwarded across a reload: it controls worklist
+                // MEMBERSHIP (live edits only ADD families, never remove), so re-sampling at a lowered
+                // percent on restart would drop — and erase the state.json results of — families the live
+                // session already admitted. It stays a per-session setting.
                 // R6: raising the percent live enqueues the families newly included in the even
                 // sample (fetch + cohort + build them) — the running pool picks them up on notify.
                 let mut added = 0;
@@ -2040,15 +2052,17 @@ impl Orchestrator {
             }
             if let Some(b) = &set.backend {
                 sh.backend = b.clone();
+                persist.insert("backend".into(), serde_json::json!(b));
                 log.push(format!("backend → {}", b));
             }
             if let Some(c) = set.compare {
                 sh.compare = c;
+                persist.insert("compare".into(), serde_json::json!(c));
                 log.push(format!("compare → {}", if c { "on" } else { "off" }));
             }
             if let Some(b) = set.build_debs {
                 sh.build_debs = b;
-                persist_build_debs = Some(b);
+                persist.insert("build_debs".into(), serde_json::json!(b));
                 log.push(format!("build .deb packages → {}", if b { "on" } else { "off" }));
             }
             if let Some(retry) = &set.retry {
@@ -2112,7 +2126,7 @@ impl Orchestrator {
                 sh.packaged.clear();
                 if !sh.build_debs {
                     sh.build_debs = true;
-                    persist_build_debs = Some(true);
+                    persist.insert("build_debs".into(), serde_json::json!(true));
                 }
                 log.push(format!("repackage all — cleared {} packaged markers; the worker will rebuild every .deb", n));
             }
@@ -2129,12 +2143,12 @@ impl Orchestrator {
         // builds unfrozen, freezing the newest excess when jobs was lowered and thawing the oldest when
         // it was raised. (regulate() takes only the `running` lock, never `sh`, so this is deadlock-free.)
         self.regulate();
-        // persist a live build_debs toggle so the next run / a bare `--export-deb` agrees on disk
-        if let Some(b) = persist_build_debs {
+        // persist every live setting the user just changed (backend/jobs/compare/build_debs) so the next
+        // run — or a daemon reload — agrees on disk instead of reverting to launch defaults. NEVER in
+        // dry-run: the mockup promises "nothing written to disk", and self.cfg.data_dir is the REAL dir.
+        if !persist.is_empty() && !self.cfg.dry_run {
             let path = self.cfg.data_dir.join("gflib-build.config");
-            let mut m = std::collections::BTreeMap::new();
-            m.insert("build_debs".to_string(), serde_json::json!(b));
-            let _ = crate::config::save_config_map(&path, &m);
+            let _ = crate::config::save_config_map(&path, &persist);
         }
         if let Some(j) = new_jobs {
             self.ensure_workers(j);
@@ -2422,6 +2436,28 @@ impl Orchestrator {
         self.restart_requested.store(true, Ordering::SeqCst);
         crate::daemon::request_sigterm(); // run_daemon's loop polls this → clean finalize + re-spawn
         self.cond.notify_all();
+    }
+
+    /// The live-editable settings as CLI flags, to APPEND on a UI "Restart" re-exec. The restart re-passes
+    /// the original argv verbatim, so a launch-time `--backend auto` / `--jobs 10` would otherwise override
+    /// the user's later UI choices (and the persisted config). The parser is last-wins, so appending the
+    /// CURRENT values makes the fresh daemon come up exactly as the UI shows it — user choices are permanent.
+    pub fn live_overrides_argv(&self) -> Vec<std::ffi::OsString> {
+        use std::ffi::OsString;
+        let sh = self.shared.lock().unwrap();
+        let mut v: Vec<OsString> = Vec::new();
+        if !sh.backend.is_empty() {
+            v.push("--backend".into());
+            v.push(sh.backend.clone().into());
+        }
+        // jobs as-is (0 = inspect-only; preserve it rather than forcing a build)
+        v.push("--jobs".into());
+        v.push(sh.jobs.to_string().into());
+        // NOTE: --percent is intentionally omitted — re-narrowing the sample on restart would drop families
+        // (and their state.json results) the live session already admitted. percent stays per-session.
+        v.push(if sh.compare { "--compare" } else { "--no-compare" }.into());
+        v.push(if sh.build_debs { "--build-debs" } else { "--no-build-debs" }.into());
+        v
     }
 
     /// Send `sig` to every in-flight builder process group regardless of freeze state — used to reap

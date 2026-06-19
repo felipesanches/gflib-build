@@ -119,7 +119,10 @@ pub fn respawn_if_requested(orch: &Arc<Orchestrator>) {
         return;
     }
     if let Ok(exe) = std::env::current_exe() {
-        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        // append the live-editable settings LAST so the user's current UI choices win over the
+        // (stale) launch flags re-passed in argv — otherwise a restart silently reverts them.
+        args.extend(orch.live_overrides_argv());
         match std::process::Command::new(&exe).args(&args).spawn() {
             Ok(_) => eprintln!("gflib-build: restart — re-launched a fresh daemon"),
             Err(e) => eprintln!("gflib-build: restart re-launch failed: {} (re-run manually)", e),
