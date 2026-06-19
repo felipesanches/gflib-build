@@ -20,6 +20,9 @@ pub struct Config {
     // Python pre-build) | selective (off except families authorized via the per-family allow-list, T2) |
     // on (full pipeline available to all — the default, today's behaviour)
     pub python_policy: String,
+    // Pre-upgrade format-2 .glyphs sources to format 3 before a builder3 build (babelfont-rs returns
+    // WrongConvertor for format 2). On by default — the on-the-fly stand-in for the upstream babelfont fix.
+    pub upgrade_glyphs2: bool,
     pub fontc_bin: Option<String>,    // explicit override; None = resolve/provision automatically
     pub builder3_bin: Option<String>, // explicit override; None = resolve/provision automatically
     pub auto_provision: bool,  // cargo-install the pinned fontc/builder3 when absent (default on)
@@ -80,6 +83,7 @@ impl Default for Config {
             backend: "auto".into(),
             orchestrator: "auto".into(),
             python_policy: "on".into(), // default: today's full pipeline; set "off" for the Rust-only baseline
+            upgrade_glyphs2: true, // auto-convert format-2 .glyphs to 3 on the fly for builder3
             fontc_bin: None,
             builder3_bin: None,
             auto_provision: true,
@@ -203,6 +207,8 @@ pub fn parse(args: &[String]) -> Parsed {
             "--python-policy" => cfg.python_policy = next(&mut i, a), // off | selective | on
             "--no-python" => cfg.python_policy = "off".into(),        // alias: strict Rust-only
             "--python" => cfg.python_policy = "on".into(),            // alias: full pipeline
+            "--upgrade-glyphs2" => cfg.upgrade_glyphs2 = true,         // pre-upgrade .glyphs v2→v3 (builder3)
+            "--no-upgrade-glyphs2" => cfg.upgrade_glyphs2 = false,
             "--fontc-bin" => cfg.fontc_bin = Some(next(&mut i, a)),
             "--builder3-bin" => cfg.builder3_bin = Some(next(&mut i, a)),
             "--cpu-slices" => cfg.cpu_slices = true,
@@ -298,6 +304,7 @@ fn merge_persisted(cfg: &mut Config, loaded: &BTreeMap<String, serde_json::Value
             "backend" => if let Some(x) = s(v) { cfg.backend = x },
             "orchestrator" => if let Some(x) = s(v) { cfg.orchestrator = x },
             "python_policy" => if let Some(x) = s(v) { cfg.python_policy = x },
+            "upgrade_glyphs2" => if let Some(x) = v.as_bool() { cfg.upgrade_glyphs2 = x },
             "auto_provision" => if let Some(x) = v.as_bool() { cfg.auto_provision = x },
             "auto_upgrade" => if let Some(x) = v.as_bool() { cfg.auto_upgrade = x },
             "fontc_bin" => cfg.fontc_bin = s(v),
@@ -331,6 +338,7 @@ pub fn save_config(cfg: &Config) {
     m.insert("backend".into(), json!(cfg.backend));
     m.insert("orchestrator".into(), json!(cfg.orchestrator));
     m.insert("python_policy".into(), json!(cfg.python_policy));
+    m.insert("upgrade_glyphs2".into(), json!(cfg.upgrade_glyphs2));
     m.insert("auto_provision".into(), json!(cfg.auto_provision));
     m.insert("auto_upgrade".into(), json!(cfg.auto_upgrade));
     m.insert("fontc_bin".into(), json!(cfg.fontc_bin));
@@ -406,6 +414,7 @@ pub fn config_map(cfg: &Config) -> BTreeMap<String, serde_json::Value> {
     m.insert("backend".into(), json!(cfg.backend));
     m.insert("orchestrator".into(), json!(cfg.orchestrator));
     m.insert("python_policy".into(), json!(cfg.python_policy));
+    m.insert("upgrade_glyphs2".into(), json!(cfg.upgrade_glyphs2));
     m.insert("fontc_bin".into(), json!(cfg.fontc_bin.as_ref().map(|p| disp_path(p)).unwrap_or_default()));
     m.insert("auto_provision".into(), json!(cfg.auto_provision));
     m.insert("auto_upgrade".into(), json!(cfg.auto_upgrade));
