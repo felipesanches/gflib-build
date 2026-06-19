@@ -1608,16 +1608,24 @@ impl Orchestrator {
     fn compute_reset_portions(&self) -> Vec<crate::model::ResetPortion> {
         use crate::model::ResetPortion;
         let bd = &self.cfg.build_dir;
-        // per-compiler font sizes need the slug→backend map
-        let by_backend: Vec<(String, String)> = {
+        // (logname, backend) for the families each font portion resets: BUILT (binaries to delete) and
+        // FAILED (re-queued + their logs deleted, so the bar's red segment regresses too).
+        let (by_backend, failed_by_backend): (Vec<(String, String)>, Vec<(String, String)>) = {
             let sh = self.shared.lock().unwrap();
-            sh.results.values().filter(|r| r.status == "built")
-                .map(|r| (slug_to_logname(&r.slug), r.backend.clone())).collect()
+            let built = sh.results.values().filter(|r| r.status == "built")
+                .map(|r| (slug_to_logname(&r.slug), r.backend.clone())).collect();
+            let failed = sh.results.values().filter(|r| r.status == "failed")
+                .map(|r| (slug_to_logname(&r.slug), r.backend.clone())).collect();
+            (built, failed)
         };
         let out_root = bd.join("out");
         let logs_root = bd.join("logs");
-        let log_bytes = |logname: &str|
-            std::fs::metadata(logs_root.join(format!("{}.log", logname))).map(|m| m.len()).unwrap_or(0);
+        // a family's logs = the live log AND its archived failure copy (logs/failed/) — the cascade deletes both
+        let log_bytes = |logname: &str| {
+            let live = std::fs::metadata(logs_root.join(format!("{}.log", logname))).map(|m| m.len()).unwrap_or(0);
+            let arch = std::fs::metadata(logs_root.join("failed").join(format!("{}.log", logname))).map(|m| m.len()).unwrap_or(0);
+            live + arch
+        };
         // Per-compiler footprint = the out/ binaries PLUS the per-family build logs the cascade would
         // delete. `reset_any` tracks whether the portion would re-queue at least one family — so the
         // button stays actionable when only logs (or only the 'built' result) remain after the binaries
@@ -1649,6 +1657,16 @@ impl Orchestrator {
                 _ => {}
             }
         }
+        // FAILED families are ALSO reset by the matching font button (re-queued + logs deleted), so the
+        // red "failed" bar segment regresses too. A backend-less failure (no compiler chosen yet) is
+        // reachable from EITHER button. Count their logs so the button is sized and stays actionable when
+        // only failures remain (no binaries, no built results).
+        for (logname, backend) in &failed_by_backend {
+            let lb = log_bytes(logname);
+            let b = backend.as_str();
+            if b == "fontc" || b == "both" || b.is_empty() { fontc_bytes += lb; fontc_reset_any = true; }
+            if b == "fontmake" || b == "both" || b.is_empty() { fontmake_bytes += lb; fontmake_reset_any = true; }
+        }
         let p = |key: &str, label: &str, bytes: u64, hint: &str| ResetPortion {
             key: key.into(), label: label.into(), bytes, hint: hint.into(),
             actionable: bytes > 0, ..Default::default() // most portions: clickable iff there's something on disk
@@ -1656,10 +1674,10 @@ impl Orchestrator {
         vec![
             ResetPortion { actionable: fontc_bytes > 0 || fontc_reset_any,
               ..p("fonts-fontc", "font binaries built by fontc", fontc_bytes,
-              "deletes out/ fonts of fontc-built families (incl. builder3) + their build logs, and re-queues them — the progress bar regresses (pause first if you don't want them rebuilt)") },
+              "deletes fontc-built fonts (incl. builder3) + the logs of fontc-built AND fontc-failed families, re-queuing them all — both the built and the red failed bar segments regress (pause first if you don't want them rebuilt)") },
             ResetPortion { actionable: fontmake_bytes > 0 || fontmake_reset_any,
               ..p("fonts-fontmake", "font binaries built by fontmake", fontmake_bytes,
-              "deletes out/ fonts of fontmake-built families + their build logs, and re-queues them — the progress bar regresses (pause first if you don't want them rebuilt)") },
+              "deletes fontmake-built fonts + the logs of fontmake-built AND fontmake-failed families, re-queuing them all — both the built and the red failed bar segments regress (pause first if you don't want them rebuilt)") },
             p("variants", "superseded upgrade binaries (variants/)", dir_size(&bd.join("variants")),
               "older rungs' binaries kept by successful auto-upgrades, for output comparison"),
             p("debs", ".deb packages + packaging trees", dir_size(&bd.join("packaging")),
@@ -1810,27 +1828,41 @@ impl Orchestrator {
                 // real session's state.json — every persistence site in this file is dry-run-guarded for
                 // exactly that reason. Skip the whole cascade in dry-run; it falls through to the no-op arm.
                 "fonts-fontc" | "fonts-fontmake" if !me.cfg.dry_run => {
-                    // Cascade: a family this deletion left with NO fonts is no longer "built", so reset
-                    // it to queued (built↓, queued↑). The progress-bar denominator is built+failed+
-                    // queued+building, so it's preserved — the bar visibly REGRESSES rather than the
-                    // family silently dropping off the worklist. We also delete the family's per-family
-                    // build log and clear its packaged marker (so the rebuild re-packages). A re-queued
-                    // family rebuilds on the running pool unless the daemon is paused. A 'both'-backend
-                    // family is reset only once BOTH compiler halves are gone — this click may have
-                    // removed only one. The bare git archive is never a target, so it can't be touched.
+                    // Cascade: reset this compiler's families to queued and delete their logs, so the bar
+                    // regresses. Two groups: (1) BUILT families this deletion left with NO fonts (built↓,
+                    // queued↑); (2) FAILED families of this backend (failed↓, queued↑) — their logs are the
+                    // only thing the binary delete couldn't touch (a failed build has no fonts). The
+                    // denominator (built+failed+queued+building) is preserved, so the bar visibly REGRESSES
+                    // rather than families silently dropping off the worklist. We also clear the packaged
+                    // marker (so a rebuild re-packages). Re-queued families rebuild on the running pool
+                    // unless the daemon is paused. A 'both'-backend BUILT family is reset only once BOTH
+                    // compiler halves are gone — this click may have removed only one. The bare git archive
+                    // is never a target, so it can't be touched.
                     let compiler = key.trim_start_matches("fonts-");
                     let other = if compiler == "fontc" { "fontmake" } else { "fontc" };
                     let out_root = bd.join("out");
                     let logs_dir = bd.join("logs");
-                    // (slug, logname) of families left with NO fonts by this deletion (checked AFTER it ran)
-                    let to_requeue = families_to_requeue(&built_trips, compiler, &building_lognames,
+                    let failed_dir = logs_dir.join("failed");
+                    // BUILT families left with NO fonts by this deletion (checked AFTER it ran) ...
+                    let mut victims = families_to_requeue(&built_trips, compiler, &building_lognames,
                         |logname| dir_size(&out_root.join(logname).join(other)) > 0);
                     let mut sh = me.shared.lock().unwrap();
-                    for (slug, logname) in &to_requeue {
+                    // ... PLUS every FAILED family of this backend — and backend-less failures, reachable from
+                    // either button. Re-queue them and delete their logs too, so the red "failed" segment
+                    // regresses as well (a failed build has no binaries, so the binary delete above skips it).
+                    for r in sh.results.values() {
+                        if r.status == "failed" {
+                            let b = r.backend.as_str();
+                            if b == compiler || b == "both" || b.is_empty() {
+                                victims.push((r.slug.clone(), slug_to_logname(&r.slug)));
+                            }
+                        }
+                    }
+                    for (slug, logname) in &victims {
                         {
-                            // act only on a still-live "built" result (a build could have raced in)
+                            // act only on a still-live built/failed result (a build could have raced in)
                             let Some(r) = sh.results.get_mut(slug) else { continue };
-                            if r.status != "built" { continue; }
+                            if r.status != "built" && r.status != "failed" { continue; }
                             r.status = "queued".into();
                             r.queued_kind = "rebuild".into();
                             r.error.clear();
@@ -1838,9 +1870,11 @@ impl Orchestrator {
                         requeued += 1;
                         sh.packaged.remove(slug);
                         if !sh.queue.contains(slug) { sh.queue.push_back(slug.clone()); }
-                        let lp = logs_dir.join(format!("{}.log", logname));
-                        if let Ok(m) = std::fs::metadata(&lp) { freed += m.len(); } // count the log we delete
-                        let _ = std::fs::remove_file(&lp);
+                        // delete the live log AND its archived failure copy, counting both toward freed
+                        for lp in [logs_dir.join(format!("{}.log", logname)), failed_dir.join(format!("{}.log", logname))] {
+                            if let Ok(m) = std::fs::metadata(&lp) { freed += m.len(); }
+                            let _ = std::fs::remove_file(&lp);
+                        }
                     }
                     drop(sh);
                     if requeued > 0 {
