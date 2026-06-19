@@ -167,6 +167,79 @@ pub fn provisioned_bin(tools_root: &Path, spec: &ToolSpec) -> PathBuf {
     tools_root.join(format!("{}-{}", spec.name, spec.pin)).join("bin").join(spec.bin_name)
 }
 
+/// The repository directory name implied by a git URL, e.g. ".../simoncozens/gftools-builder3(.git)"
+/// → "gftools-builder3". Lets us look for a checkout WITHOUT hardcoding any repo name or path.
+fn git_url_repo_name(url: &str) -> String {
+    url.trim_end_matches('/').rsplit('/').next().unwrap_or("").trim_end_matches(".git").to_string()
+}
+
+/// Already-built binaries to try BEFORE cargo-installing — a pin-matched local checkout makes the
+/// toolchain "just work" with zero provisioning (and sidesteps a flaky install, e.g. an MSRV gap like
+/// builder3's rustc>=1.92). No paths or repo names are hardcoded: the checkout dir name is DERIVED from
+/// the pinned source (git URL basename, or the crate name), and it's searched for under the data dir and
+/// a few of its ancestors (so a sibling-of-the-repo or vendored-under-data-dir checkout is both found),
+/// at `target/release/<bin>`. (`tools_root` is `<data-dir>/tools`.) Each hit is rev/version-verified by
+/// [`local_build_matches_pin`] before use.
+pub fn local_build_candidates(spec: &ToolSpec, tools_root: &Path) -> Vec<PathBuf> {
+    // candidate checkout directory names, derived from the pin source (never hardcoded)
+    let names: Vec<String> = match &spec.install {
+        InstallSource::Git { url, .. } => vec![git_url_repo_name(url)],
+        InstallSource::Registry { krate, git_fallback, .. } => {
+            let mut v = vec![krate.to_string()];
+            if let Some((url, _)) = git_fallback {
+                let n = git_url_repo_name(url);
+                if !n.is_empty() && n != *krate {
+                    v.push(n);
+                }
+            }
+            v
+        }
+    };
+    let rel = Path::new("target").join("release").join(spec.bin_name);
+    let mut out = Vec::new();
+    let mut root = tools_root.parent(); // start at <data-dir>, then walk up its ancestors
+    for _ in 0..4 {
+        if let Some(r) = root {
+            for name in &names {
+                out.push(r.join(name).join(&rel));
+            }
+            root = r.parent();
+        }
+    }
+    out
+}
+
+/// Verify a local pre-built binary actually IS the pinned version, so a checkout at the wrong rev/version
+/// can never be silently used: a Git pin by the checkout's `HEAD` (== the exact rev), a Registry pin by
+/// the binary's own `--version` output. Conservative — any uncertainty returns false (fall through to
+/// provisioning).
+pub fn local_build_matches_pin(spec: &ToolSpec, bin: &Path) -> bool {
+    match &spec.install {
+        InstallSource::Git { rev, .. } => {
+            // bin = <checkout>/target/release/<bin> → the checkout dir is three parents up
+            let dir = match bin.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+                Some(d) => d,
+                None => return false,
+            };
+            match Command::new("git").arg("-C").arg(dir).args(["rev-parse", "HEAD"]).output() {
+                Ok(o) => {
+                    let head = String::from_utf8_lossy(&o.stdout);
+                    let head = head.trim();
+                    head == rev.as_str() || head.starts_with(&spec.pin)
+                }
+                Err(_) => false,
+            }
+        }
+        InstallSource::Registry { version, .. } => match Command::new(bin).arg("--version").output() {
+            Ok(o) => {
+                let txt = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+                txt.contains(version.as_str())
+            }
+            Err(_) => false,
+        },
+    }
+}
+
 /// The toolchain signature stamped on every completed build attempt (Res.upgrade_attempted): the
 /// pins + the orchestrator preference + which tools were actually AVAILABLE for the attempt.
 /// Availability is part of the signature on purpose: a family built during a degraded run (e.g.
@@ -255,6 +328,14 @@ pub fn ensure_tool(
     let pin_bin = provisioned_bin(tools_root, spec);
     if pin_bin.is_file() {
         return ToolStatus::Ready { path: pin_bin.to_string_lossy().into_owned(), source: "provisioned" };
+    }
+    // 2b. an already-built, pin-matched local checkout — zero provisioning, and it survives a flaky
+    // cargo install (e.g. the builder3 rustc>=1.92 MSRV gap). Verified against the pin so a wrong
+    // rev/version is never silently used.
+    for cand in local_build_candidates(spec, tools_root) {
+        if is_executable(&cand) && local_build_matches_pin(spec, &cand) {
+            return ToolStatus::Ready { path: cand.to_string_lossy().into_owned(), source: "checkout" };
+        }
     }
     // 3. provision the pin
     if auto_provision {
@@ -508,6 +589,28 @@ fn is_builder3_binary(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_url_repo_name_strips_path_and_git_suffix() {
+        assert_eq!(git_url_repo_name("https://github.com/simoncozens/gftools-builder3"), "gftools-builder3");
+        assert_eq!(git_url_repo_name("https://github.com/googlefonts/fontc.git"), "fontc");
+        assert_eq!(git_url_repo_name("git@github.com:owner/repo.git/"), "repo");
+    }
+
+    #[test]
+    fn local_build_candidates_derives_names_and_searches_ancestors() {
+        // tools_root = <data-dir>/tools ; a builder3 checkout is a sibling of the repo, found by walking up
+        let tools = Path::new("/w/proj/gflib-build/gflib-data/tools");
+        let cands = local_build_candidates(&builder3_spec(), tools);
+        // name DERIVED from the git URL (not hardcoded), at target/release/<bin>, somewhere up the tree
+        assert!(cands.iter().any(|p| p.ends_with("gftools-builder3/target/release/gftools-builder")),
+            "expected a derived gftools-builder3 candidate, got {:?}", cands);
+        assert!(cands.iter().any(|p| p == Path::new("/w/gftools-builder3/target/release/gftools-builder")),
+            "expected the sibling-of-repo candidate at the workspace root, got {:?}", cands);
+        // fontc (registry) derives from the crate name + the git_fallback URL
+        let fc = local_build_candidates(&fontc_spec(), tools);
+        assert!(fc.iter().any(|p| p.ends_with("fontc/target/release/fontc")), "got {:?}", fc);
+    }
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("gflib-toolchain-{}-{}", tag, std::process::id()));
