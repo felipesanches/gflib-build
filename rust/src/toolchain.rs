@@ -13,6 +13,8 @@
 //! Resolution order per tool (first hit wins):
 //!   1. the explicit CLI/config override (--fontc-bin / --builder3-bin) — always wins;
 //!   2. the provisioned pin at <data-dir>/tools/<name>-<pin>/bin/<bin> (cached install);
+//!   2b. a pin-MATCHED local checkout build (rev/version-verified) — zero-provision, and survives a
+//!      flaky cargo install; a wrong rev/version is rejected, so it never shadows the pin;
 //!   3. auto-provision the pin (default on; --no-toolchain-provision disables);
 //!   4. a detected binary (PATH / sibling checkouts) — fallback only, so a stale local build
 //!      never silently shadows the pin.
@@ -49,7 +51,7 @@ pub const BUILDER3_PKG: &str = "gftools-builder";
 pub enum ToolStatus {
     /// Resolution has not finished yet (workers wait on the gate).
     Pending,
-    /// Usable binary. `source` is one of "flag" | "provisioned" | "detected".
+    /// Usable binary. `source` is one of "flag" | "provisioned" | "checkout" | "detected".
     Ready { path: String, source: &'static str },
     /// Nothing usable and provisioning failed/disabled — the chain degrades past this tool.
     Unavailable(String),
@@ -167,6 +169,15 @@ pub fn provisioned_bin(tools_root: &Path, spec: &ToolSpec) -> PathBuf {
     tools_root.join(format!("{}-{}", spec.name, spec.pin)).join("bin").join(spec.bin_name)
 }
 
+/// True if a `--version` output names `version` as a whole TOKEN (optionally `v`-prefixed) rather than a
+/// substring — so "fontc 10.6.0" and "fontc 0.6.0-pre" do NOT match the pin "0.6.0" (which a bare
+/// `contains` would wrongly accept, silently using a wrong-version build).
+fn version_token_matches(output: &str, version: &str) -> bool {
+    output
+        .split(|c: char| c.is_whitespace())
+        .any(|tok| tok == version || tok.trim_start_matches('v') == version)
+}
+
 /// The repository directory name implied by a git URL, e.g. ".../simoncozens/gftools-builder3(.git)"
 /// → "gftools-builder3". Lets us look for a checkout WITHOUT hardcoding any repo name or path.
 fn git_url_repo_name(url: &str) -> String {
@@ -197,7 +208,10 @@ pub fn local_build_candidates(spec: &ToolSpec, tools_root: &Path) -> Vec<PathBuf
     };
     let rel = Path::new("target").join("release").join(spec.bin_name);
     let mut out = Vec::new();
-    let mut root = tools_root.parent(); // start at <data-dir>, then walk up its ancestors
+    // absolutize first: under the shipped default the data dir is RELATIVE ("gflib-data"), whose
+    // .parent() chain runs out in one step — so a sibling-of-the-repo checkout would never be reached.
+    let abs: PathBuf = std::path::absolute(tools_root).unwrap_or_else(|_| tools_root.to_path_buf());
+    let mut root = abs.parent(); // start at <data-dir>, then walk up its ancestors
     for _ in 0..4 {
         if let Some(r) = root {
             for name in &names {
@@ -209,10 +223,49 @@ pub fn local_build_candidates(spec: &ToolSpec, tools_root: &Path) -> Vec<PathBuf
     out
 }
 
+/// Run a short, UNTRUSTED probe (a discovered binary's `--version`, a `git` query) with stdin closed
+/// and a hard deadline, returning combined stdout+stderr ONLY on a clean exit — so a hanging or
+/// stdin-blocked candidate can never wedge toolchain resolution. None on spawn failure, timeout, or a
+/// non-zero exit. (Probe output is tiny, so reading after exit can't deadlock the pipe.)
+fn probe_output(mut cmd: Command, secs: u64) -> Option<String> {
+    use std::io::Read;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().ok()?;
+    let t0 = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if t0.elapsed() > Duration::from_secs(secs) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut out = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_string(&mut out);
+    }
+    if let Some(mut s) = child.stderr.take() {
+        let _ = s.read_to_string(&mut out);
+    }
+    Some(out)
+}
+
 /// Verify a local pre-built binary actually IS the pinned version, so a checkout at the wrong rev/version
-/// can never be silently used: a Git pin by the checkout's `HEAD` (== the exact rev), a Registry pin by
-/// the binary's own `--version` output. Conservative — any uncertainty returns false (fall through to
-/// provisioning).
+/// can never be silently used. Git pin: the candidate must be its OWN repo root (guards against reporting
+/// an *enclosing* repo's HEAD) AND its `HEAD` == the exact rev. Registry pin: the binary's `--version`
+/// must contain the version as a whole TOKEN (not a substring — "fontc 10.6.0"/"0.6.0-pre" must NOT match
+/// "0.6.0"). All probes are bounded ([`probe_output`]). Conservative — any uncertainty returns false.
 pub fn local_build_matches_pin(spec: &ToolSpec, bin: &Path) -> bool {
     match &spec.install {
         InstallSource::Git { rev, .. } => {
@@ -221,22 +274,40 @@ pub fn local_build_matches_pin(spec: &ToolSpec, bin: &Path) -> bool {
                 Some(d) => d,
                 None => return false,
             };
-            match Command::new("git").arg("-C").arg(dir).args(["rev-parse", "HEAD"]).output() {
-                Ok(o) => {
-                    let head = String::from_utf8_lossy(&o.stdout);
-                    let head = head.trim();
-                    head == rev.as_str() || head.starts_with(&spec.pin)
+            // the candidate must be its OWN git repo root — else `rev-parse HEAD` would report an
+            // enclosing repo's HEAD and could false-match the pin
+            let mut top = Command::new("git");
+            top.arg("-C").arg(dir).args(["rev-parse", "--show-toplevel"]);
+            let toplevel = match probe_output(top, 10) {
+                Some(t) => t.trim().to_string(),
+                None => return false,
+            };
+            let is_own_root = std::fs::canonicalize(dir)
+                .ok()
+                .zip(std::fs::canonicalize(&toplevel).ok())
+                .map(|(a, b)| a == b)
+                .unwrap_or(false);
+            if !is_own_root {
+                return false;
+            }
+            let mut head = Command::new("git");
+            head.arg("-C").arg(dir).args(["rev-parse", "HEAD"]);
+            match probe_output(head, 10) {
+                Some(h) => {
+                    let h = h.trim();
+                    h == rev.as_str() || h.starts_with(&spec.pin)
                 }
-                Err(_) => false,
+                None => false,
             }
         }
-        InstallSource::Registry { version, .. } => match Command::new(bin).arg("--version").output() {
-            Ok(o) => {
-                let txt = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-                txt.contains(version.as_str())
+        InstallSource::Registry { version, .. } => {
+            let mut cmd = Command::new(bin);
+            cmd.arg("--version");
+            match probe_output(cmd, 10) {
+                Some(txt) => version_token_matches(&txt, version),
+                None => false,
             }
-            Err(_) => false,
-        },
+        }
     }
 }
 
@@ -589,6 +660,19 @@ fn is_builder3_binary(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_token_matches_is_exact_not_substring() {
+        // the real fontc line matches the pin
+        assert!(version_token_matches("fontc 0.6.0", "0.6.0"));
+        assert!(version_token_matches("fontc 0.6.0 (abc123 2026-01-01)", "0.6.0"));
+        assert!(version_token_matches("fontc v0.6.0", "0.6.0")); // tolerate a v-prefix
+        // the silent-wrong-build vectors the reviewer found must NOT match
+        assert!(!version_token_matches("fontc 10.6.0", "0.6.0"));   // substring of a bigger major
+        assert!(!version_token_matches("fontc 0.6.0-pre", "0.6.0")); // pre-release ≠ release
+        assert!(!version_token_matches("fontc 0.6.01", "0.6.0"));
+        assert!(!version_token_matches("fontc 0.16.0", "0.6.0"));
+    }
 
     #[test]
     fn git_url_repo_name_strips_path_and_git_suffix() {
