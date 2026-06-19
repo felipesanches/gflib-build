@@ -900,10 +900,11 @@ function openLintian(slug){
 }
 function hlLint(t){return t.split('\n').map(l=>{const c=l[0]=='E'?'r':l[0]=='W'?'y':(l[0]=='I'||l[0]=='P')?'c':'gr';return '<span class="'+c+'">'+E(l)+'</span>'}).join('\n')}
 function showDetail(title,lines,slug){
- // T2: under a Rust-only policy, offer to authorize Python for THIS family (and re-queue it) — the
- // one-family probe of the selective re-enablement loop. Shows ✓ when already authorized.
+ // T2: under SELECTIVE policy, offer to authorize Python for THIS family (and re-queue it) — the
+ // one-family probe of the re-enablement loop. Shows ✓ when already authorized. Only under 'selective':
+ // under 'off' the allow-list is ignored, so authorizing+rebuilding would just fail Rust-only again.
  let act='';
- if(slug&&(snap.config||{}).python_policy&&(snap.config||{}).python_policy!='on'){
+ if(slug&&(snap.config||{}).python_policy=='selective'){
   act=(snap.python_authorized_families||[]).indexOf(slug)>=0
    ? ' &nbsp;<span class="g">✓ Python authorized</span>'
    : ' &nbsp;<button class="rb" onclick="ctl({python_authorize:{families:[\''+E(slug)+'\']}});closeDetail()" title="authorize Python (builder2 / cohort venv / Python pre-build) for this family under selective policy, and re-queue it to rebuild">⚙ enable Python + rebuild</button>';

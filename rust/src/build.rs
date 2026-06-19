@@ -475,7 +475,13 @@ impl Orchestrator {
             std::fs::read_to_string(&p)
                 .ok()
                 .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                .map(|v| PyAuth { families: strs(v.get("families")), deps: strs(v.get("deps")) })
+                .map(|v| PyAuth {
+                    families: strs(v.get("families")),
+                    // normalize on load too, so a file written before dep-normalization still matches
+                    deps: strs(v.get("deps")).into_iter()
+                        .filter_map(|p| { let n = venv::req_pkg_name(&p); if n.is_empty() { None } else { Some(n) } })
+                        .collect(),
+                })
                 .unwrap_or_default()
         };
         let venvs = Some(VenvManager::new(&cfg.build_dir, &cfg.pythons, cfg.base_requirements.clone(), abort_builds.clone()));
@@ -1217,16 +1223,19 @@ impl Orchestrator {
         match self.python_policy().as_str() {
             "off" => false,
             "selective" => {
-                let (slug_ok, deps) = {
+                // clone the (small) deps set only when actually needed — after the cheap slug/empty checks
+                let deps = {
                     let a = self.python_auth.lock().unwrap();
-                    (a.families.contains(slug), a.deps.clone())
+                    if a.families.contains(slug) {
+                        return true;
+                    }
+                    if a.deps.is_empty() {
+                        return false;
+                    }
+                    a.deps.clone()
                 };
-                if slug_ok {
-                    return true;
-                }
-                if deps.is_empty() {
-                    return false;
-                }
+                // stored deps are normalized through req_pkg_name (lowercased) on the way in, so this
+                // compares like-for-like against the family's declared package names
                 let req = venv::read_requirements_from_mirror(mirror, commit);
                 req.lines().any(|l| {
                     let n = venv::req_pkg_name(l);
@@ -1250,7 +1259,11 @@ impl Orchestrator {
         deps.sort();
         let v = serde_json::json!({ "families": fams, "deps": deps });
         let p = self.cfg.build_dir.join("python-authorized.json");
-        let _ = std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap_or_default());
+        if let Err(e) = std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap_or_default()) {
+            // lock-free (daemon.log): surface it so an authorization isn't silently lost on restart,
+            // and so this is safe to call regardless of whether a caller holds `shared`
+            eprintln!("gflib-build: could not persist python authorization to {}: {}", p.display(), e);
+        }
     }
 
     /// MOCKUP build: no clone/venv/compile — a brief fake "compile", then replay the family's recorded
@@ -2235,6 +2248,9 @@ impl Orchestrator {
             sh.qa_done.clear();
             sh.qa_queue.clear();
             sh.fontspector = None;
+            // "delete everything" wipes python-authorized.json from disk — clear the in-memory T2 allow-list
+            // too, so a fresh selective run starts clean instead of silently keeping stale authorizations.
+            { let mut a = self.python_auth.lock().unwrap(); a.families.clear(); a.deps.clear(); }
         }
         // 5) wipe disk (off-lock — can be many GB). `total` freezes the live progress bar's denominator.
         let total = dir_size(&bd).saturating_add(dir_size(&tools));
@@ -2367,6 +2383,7 @@ impl Orchestrator {
         // Every live-editable setting changed here is persisted to gflib-build.config so the choice
         // survives a daemon reload — user choices are permanent, not silently reverted to launch defaults.
         let mut persist: std::collections::BTreeMap<String, serde_json::Value> = std::collections::BTreeMap::new();
+        let mut save_pyauth = false; // T2: persist the allow-list AFTER releasing `shared` (no I/O under the lock)
         {
             let mut sh = self.shared.lock().unwrap();
             if let Some(j) = set.jobs {
@@ -2504,15 +2521,23 @@ impl Orchestrator {
                 {
                     let mut a = self.python_auth.lock().unwrap();
                     for f in &d.families { a.families.insert(f.clone()); }
-                    for p in &d.deps { a.deps.insert(p.clone()); }
+                    // normalize dep names exactly as req_pkg_name does for the requirements side
+                    // (lowercase), so authorizing "Pillow"/"NumPy" actually matches a real requirement
+                    for p in &d.deps {
+                        let n = crate::venv::req_pkg_name(p);
+                        if !n.is_empty() { a.deps.insert(n); }
+                    }
                 }
-                self.save_python_auth();
+                save_pyauth = true;
                 for slug in &d.families {
                     if let Some(r) = sh.results.get_mut(slug) {
-                        r.status = "queued".into();
-                        r.queued_kind = "retry".into();
-                        r.error.clear();
-                        sh.queue.push_front(slug.clone());
+                        // don't enqueue a duplicate for a family already building or queued
+                        if r.status != "building" && r.status != "queued" {
+                            r.status = "queued".into();
+                            r.queued_kind = "retry".into();
+                            r.error.clear();
+                            sh.queue.push_front(slug.clone());
+                        }
                     }
                 }
                 log.push(format!("python authorized (selective): +{} families, +{} deps", d.families.len(), d.deps.len()));
@@ -2524,9 +2549,12 @@ impl Orchestrator {
                 {
                     let mut a = self.python_auth.lock().unwrap();
                     for f in &d.families { a.families.remove(f); }
-                    for p in &d.deps { a.deps.remove(p); }
+                    for p in &d.deps {
+                        let n = crate::venv::req_pkg_name(p);
+                        if !n.is_empty() { a.deps.remove(&n); }
+                    }
                 }
-                self.save_python_auth();
+                save_pyauth = true;
                 log.push(format!("python authorization revoked: -{} families, -{} deps", d.families.len(), d.deps.len()));
             }
             if let Some(retry) = &set.retry {
@@ -2613,6 +2641,11 @@ impl Orchestrator {
         if !persist.is_empty() && !self.cfg.dry_run {
             let path = self.cfg.data_dir.join("gflib-build.config");
             let _ = crate::config::save_config_map(&path, &persist);
+        }
+        // T2 allow-list persisted here too — AFTER releasing `shared`, so the disk write never blocks
+        // other threads that need the central lock (matches the save_config_map deferral above).
+        if save_pyauth {
+            self.save_python_auth();
         }
         if let Some(j) = new_jobs {
             self.ensure_workers(j);
