@@ -367,7 +367,7 @@ const SCHEMA=[
  {k:'percent',l:'percent of library',t:'step',live:true},
  {k:'timeout',l:'per-build timeout (0=off)',t:'step',live:true},
  {k:'populate_archive',l:'populate archive (fetch repos)',t:'bool',live:true},
- {k:'manage_venvs',l:'cohort venvs',t:'bool',live:false},
+ {k:'manage_venvs',l:'cohort venvs',t:'bool',live:true},
  {k:'retry_failed',l:'retry ALL failed (incl. genuine errors)',t:'bool',live:false},
  {k:'auto_upgrade',l:'auto-upgrade built families (better backend)',t:'bool',live:false},
  {k:'compare',l:'compare to shipped',t:'bool',live:true},
@@ -382,7 +382,7 @@ function Rp(s,n){return (''+s).padStart(n)}
 function trunc(s,n){s=(s==null?'':''+s);return s.length>n?s.slice(0,n-1)+'…':s}
 function prov(x){const c=x.compiler_version||x.backend||'';return c+(x.builder_version?' · '+x.builder_version:'')}
 function ctl(set){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({set:set})});
- for(const k in set)if(LIVE_APPLY[k])OPT[k]={v:set[k],base:(snap.config||{})[k]}; // show live-widget edits instantly
+ for(const k in set)if(LIVE_APPLY[k]||RESTART_KEYS[k])OPT[k]={v:set[k],base:(snap.config||{})[k]}; // show live + restart-pending edits instantly (restart ones persist until the daemon restarts and the snapshot moves)
  bump()}
 // --- reset tab: granular deletion of build-system portions (mirrors the TUI's reset tab) ---
 function resetPortion(key,label,bytes){
@@ -629,7 +629,10 @@ function showIf(k,cf){const s=x=>(cf[x]==null?'':''+cf[x]);
  return true}
 const CHOICES={source:['metadata','archive'],backend:['auto','fontc','fontmake','both'],orchestrator:['auto','builder3','builder2']};
 // the keys the daemon actually honours live (same set as the TUI's cfg_apply_live) → editable form controls
-const LIVE_APPLY={backend:1,orchestrator:1,jobs:1,percent:1,compare:1,build_debs:1};
+const LIVE_APPLY={backend:1,orchestrator:1,jobs:1,percent:1,compare:1,build_debs:1,manage_venvs:1};
+// settings read once at launch (paths / worklist source / toolchain / startup re-queue behaviours):
+// editable, but the edit is recorded and applied on the next daemon restart (↻), never mid-run.
+const RESTART_KEYS={source:1,google_fonts:1,archive:1,build_dir:1,fontc_bin:1,auto_provision:1,auto_upgrade:1,retry_failed:1,fontspector_qa:1};
 // logical groupings for the config panel (related settings under one sub-header)
 const GROUPS=[
  {t:'Sources & paths', k:['source','google_fonts','archive','build_dir']},
@@ -640,21 +643,25 @@ const GROUPS=[
 // one form control per field: live → an editable widget that posts straight to control.json;
 // otherwise a real (greyed) widget that shows the current value but isn't editable on a running build.
 function cfgCell(f,cf){
- const v=cf[f.k], live=LIVE_APPLY[f.k];
- if(f.t=='bool') // a REAL checkbox (disabled+greyed when not live); its state alone conveys the value
-  return '<input type="checkbox"'+(v?' checked':'')+(live?' onchange="ctl({'+f.k+':this.checked})"':' disabled')+'>';
+ const v=cf[f.k], live=LIVE_APPLY[f.k], rst=RESTART_KEYS[f.k], edit=live||rst;
+ // restart-only settings stay editable but carry a ↻ marker: the edit applies on the next daemon restart
+ const tag=rst?' <span class="muted" title="takes effect on the next daemon restart">↻</span>':'';
+ if(f.t=='bool') // a REAL checkbox (disabled+greyed only if it's neither live nor restart-editable)
+  return '<input type="checkbox"'+(v?' checked':'')+(edit?' onchange="ctl({'+f.k+':this.checked})"':' disabled')+'>'+tag;
  if(f.t=='choice'){const ch=CHOICES[f.k]||[];
-  if(live)return '<select onchange="ctl({'+f.k+':this.value})">'+ch.map(o=>'<option'+(o==v?' selected':'')+'>'+E(o)+'</option>').join('')+'</select>';
+  if(edit)return '<select onchange="ctl({'+f.k+':this.value})">'+ch.map(o=>'<option'+(o==v?' selected':'')+'>'+E(o)+'</option>').join('')+'</select>'+tag;
   return '<span class="muted">'+E(ch.includes(v)?v:(ch[0]||''))+'</span>';}
- if(live&&f.t=='step')
-  return '<input type="number"'+(f.k=='percent'?' min="1" max="100"':(f.k=='jobs'?' min="0"':' min="1"'))+' value="'+E(v==null?'':v)+'" onchange="ctl({'+f.k+':+this.value})">';
+ if(edit&&f.t=='step')
+  return '<input type="number"'+(f.k=='percent'?' min="1" max="100"':(f.k=='jobs'?' min="0"':' min="1"'))+' value="'+E(v==null?'':v)+'" onchange="ctl({'+f.k+':+this.value})">'+tag;
+ if(edit&&(f.t=='path'||f.t=='text')) // restart-editable path/text → a real text input
+  return '<input type="text" size="34" value="'+E(v==null?'':v)+'" onchange="ctl({'+f.k+':this.value})">'+tag;
  return '<span class="muted">'+E(v==null?(f.k=='timeout'?'0':''):''+v)+'</span>';
 }
 function cfgView(){const base=snap.config||{},cf={};
  for(const k in base)cf[k]=base[k];
  for(const k in OPT)cf[k]=OPT[k].v; // prefer a just-entered value over the (briefly stale) server snapshot
  let h='<div class="sec">Configuration</div>';
- h+='<div class="ln muted">Editable controls apply live; greyed ones are set by CLI flags at launch.</div>';
+ h+='<div class="ln muted">Editable controls apply live; those marked ↻ are editable too but take effect on the next daemon restart.</div>';
  h+='<div class="ln"><button class="tbtn" onclick="if(confirm(\'Restart the daemon now? In-flight builds are interrupted and resume from saved state.\'))ctl({restart:true})">↻ Restart daemon</button></div>';
  GROUPS.forEach(g=>{
   const fs=SCHEMA.filter(f=>g.k.includes(f.k)&&showIf(f.k,cf));

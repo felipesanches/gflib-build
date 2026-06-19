@@ -232,6 +232,7 @@ pub fn parse(args: &[String]) -> Parsed {
             "--populate-archive" => cfg.populate_archive = true,
             "--no-populate-archive" => cfg.populate_archive = false,
             "--retry-failed" => cfg.retry_failed = true,
+            "--no-retry-failed" => cfg.retry_failed = false,
             "--rebuild" => cfg.rebuild = true,
             "--keep-work" => cfg.keep_work = true,
             "--keep-fonts" => cfg.keep_fonts = true,

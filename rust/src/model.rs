@@ -430,6 +430,19 @@ pub struct ControlSet {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub repackage_all: Option<bool>, // rebuild every .deb from existing fonts (apply packaging fixes + re-lint)
     #[serde(default, skip_serializing_if = "Option::is_none")] pub build_debs: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub restart: Option<bool>, // re-exec the daemon (apply startup-only settings)
+    // cohort venvs: a LIVE toggle (build_one consults it per build). off = build with the single build-python.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub manage_venvs: Option<bool>,
+    // restart-only settings (read once at launch): editing them records the choice; live_overrides_argv()
+    // re-emits it as a CLI flag on the next daemon restart, so the edit is applied then (not mid-run).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub auto_upgrade: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub fontspector_qa: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_failed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub auto_provision: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub google_fonts: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub archive: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub build_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub fontc_bin: Option<String>,
     // delete one resettable portion of the build system (reset tab): fonts-fontc | fonts-fontmake |
     // variants | debs | venvs | pip-cache | logs | work | fontspector | tools
     #[serde(default, skip_serializing_if = "Option::is_none")] pub reset_portion: Option<String>,
@@ -456,6 +469,23 @@ mod tests {
         assert_eq!(back.counts.built, 3);
         assert_eq!(back.builders.get("builder2").unwrap(), "gftools-builder2 0.9.74");
         assert_eq!(back.built_recent[0].builder_version, "gftools-builder2 0.9.74");
+    }
+    #[test]
+    fn controlset_deserializes_the_live_and_restart_settings() {
+        // exactly the JSON the web/TUI post via /api/control for the newly-editable config fields
+        let cs: ControlSet = serde_json::from_str(
+            r#"{"manage_venvs":false,"auto_provision":true,"fontspector_qa":false,
+                "source":"archive","build_dir":"/tmp/out","fontc_bin":"/usr/bin/fontc"}"#,
+        ).unwrap();
+        assert_eq!(cs.manage_venvs, Some(false));
+        assert_eq!(cs.auto_provision, Some(true));
+        assert_eq!(cs.fontspector_qa, Some(false));
+        assert_eq!(cs.source.as_deref(), Some("archive"));
+        assert_eq!(cs.build_dir.as_deref(), Some("/tmp/out"));
+        assert_eq!(cs.fontc_bin.as_deref(), Some("/usr/bin/fontc"));
+        // unmentioned settings stay None (a partial post never resets the others)
+        assert_eq!(cs.archive, None);
+        assert_eq!(cs.backend, None);
     }
     #[test]
     fn tolerates_partial_foreign_json() {

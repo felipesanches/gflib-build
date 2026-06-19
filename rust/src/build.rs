@@ -222,6 +222,11 @@ pub struct Orchestrator {
     pub running: Mutex<RunReg>,             // in-flight builder children + freeze state (freeze/thaw/kill)
     pub frozen: AtomicBool,                 // global pause SIGSTOPs ALL running builds; mirror of sh.paused
     pub job_limit: AtomicUsize,             // live jobs target; lock-free mirror of sh.jobs for the regulator
+    pub manage_venvs: AtomicBool,           // SETTING (live): build with cohort venvs (true) or the single build-python (false)
+    // Restart-only settings the user edited in the config tab (paths/source/toolchain/startup behaviours
+    // that are read once at launch). live_overrides_argv() re-emits these as CLI flags on a daemon restart
+    // so the edit survives — the same mechanism backend/orchestrator use, but with no live effect.
+    pub cfg_overrides: Mutex<std::collections::BTreeMap<String, serde_json::Value>>,
     pub crater: Option<crate::crater::CraterData>, // fontc_crater latest verdict (None = unavailable/disabled)
     pub crater_by_slug: BTreeMap<String, crate::crater::CraterStatus>, // family slug -> crater verdict
     pub toolchain: Arc<crate::toolchain::Toolchain>, // fontc + builder3 ready-gate (resolved at start())
@@ -440,11 +445,10 @@ impl Orchestrator {
             op_stats: HashMap::new(),
         };
         let abort_builds = Arc::new(AtomicBool::new(false));
-        let venvs = if cfg.manage_venvs {
-            Some(VenvManager::new(&cfg.build_dir, &cfg.pythons, cfg.base_requirements.clone(), abort_builds.clone()))
-        } else {
-            None
-        };
+        // Always construct the manager (cheap — cohort venvs are created lazily on first use) so cohort
+        // venvs can be toggled live: build_one consults `manage_venvs` per build, not the launch Option.
+        let manage_venvs0 = cfg.manage_venvs; // captured before `cfg` is moved into the struct below
+        let venvs = Some(VenvManager::new(&cfg.build_dir, &cfg.pythons, cfg.base_requirements.clone(), abort_builds.clone()));
         let build_rules = cfg
             .build_rules
             .as_ref()
@@ -471,6 +475,8 @@ impl Orchestrator {
             running: Mutex::new(RunReg::default()),
             frozen: AtomicBool::new(false),
             job_limit: AtomicUsize::new(jobs),
+            manage_venvs: AtomicBool::new(manage_venvs0),
+            cfg_overrides: Mutex::new(std::collections::BTreeMap::new()),
             crater,
             crater_by_slug,
             toolchain: Arc::new(crate::toolchain::Toolchain::default()),
@@ -498,7 +504,7 @@ impl Orchestrator {
         // Build the base cohort venv up front (on a background thread so it doesn't block startup) —
         // avoids a stampede where every base-cohort worker tries to create it at once. Workers that
         // reach a base-cohort family before it's ready just wait on the per-cohort lock (correct).
-        if self.venvs.is_some() {
+        if self.manage_venvs.load(Ordering::Relaxed) {
             let me = Arc::clone(self);
             thread::spawn(move || {
                 if let Some(v) = &me.venvs {
@@ -1256,7 +1262,7 @@ impl Orchestrator {
         // shared cohort venv, and build with ITS python. A venv failure (broken deps) fails the family
         // with the cohort error (self-heal will rebuild it on the next start). Without --manage-venvs,
         // every family builds with the single --build-python.
-        let python = if let Some(v) = &self.venvs {
+        let python = if let Some(v) = self.venvs.as_ref().filter(|_| self.manage_venvs.load(Ordering::Relaxed)) {
             let req = venv::read_requirements_from_mirror(&mirror, &fam.commit);
             self.set_result(slug, |r| r.note = "resolving deps".into()); // checking for a cached cohort venv
             // in multi-Python mode, the commit year picks the starting ladder rung (skip too-new interpreters)
@@ -2322,6 +2328,48 @@ impl Orchestrator {
                 persist.insert("build_debs".into(), serde_json::json!(b));
                 log.push(format!("build .deb packages → {}", if b { "on" } else { "off" }));
             }
+            // cohort venvs: a true LIVE toggle — build_one consults this per build, so turning it OFF
+            // immediately stops new venv creation (builds use the single build-python); turning it ON
+            // resumes per-cohort venvs (and pre-builds the base venv off-thread, mirroring startup).
+            if let Some(m) = set.manage_venvs {
+                self.manage_venvs.store(m, Ordering::Relaxed);
+                persist.insert("manage_venvs".into(), serde_json::json!(m));
+                if m {
+                    let me = Arc::clone(self);
+                    thread::spawn(move || { if let Some(v) = &me.venvs { let _ = v.ensure_base(); } });
+                }
+                log.push(format!("cohort venvs → {}", if m { "on (a per-cohort venv per build)" } else { "off (the single build-python)" }));
+            }
+            // Restart-only settings: read once at launch (paths / worklist source / toolchain / startup
+            // re-queue behaviours), so editing them can't take effect mid-run. Record the choice (and
+            // persist it) — live_overrides_argv() re-emits it as a CLI flag on the next daemon restart.
+            macro_rules! restart_bool {
+                ($field:ident, $key:literal, $label:literal) => {
+                    if let Some(b) = set.$field {
+                        self.cfg_overrides.lock().unwrap().insert($key.into(), serde_json::json!(b));
+                        persist.insert($key.into(), serde_json::json!(b));
+                        log.push(format!(concat!($label, " → {} (↻ restart to apply)"), if b { "on" } else { "off" }));
+                    }
+                };
+            }
+            macro_rules! restart_str {
+                ($field:ident, $key:literal, $label:literal) => {
+                    if let Some(s) = &set.$field {
+                        self.cfg_overrides.lock().unwrap().insert($key.into(), serde_json::json!(s));
+                        persist.insert($key.into(), serde_json::json!(s));
+                        log.push(format!(concat!($label, " → {} (↻ restart to apply)"), s));
+                    }
+                };
+            }
+            restart_bool!(auto_upgrade, "auto_upgrade", "auto-upgrade");
+            restart_bool!(fontspector_qa, "fontspector_qa", "fontspector QA");
+            restart_bool!(retry_failed, "retry_failed", "retry ALL failed");
+            restart_bool!(auto_provision, "auto_provision", "auto-provision toolchain");
+            restart_str!(source, "source", "worklist source");
+            restart_str!(google_fonts, "google_fonts", "google/fonts clone");
+            restart_str!(archive, "archive", "repo archive");
+            restart_str!(build_dir, "build_dir", "build output dir");
+            restart_str!(fontc_bin, "fontc_bin", "fontc binary");
             if let Some(retry) = &set.retry {
                 for slug in retry {
                     if let Some(r) = sh.results.get_mut(slug) {
@@ -2719,6 +2767,35 @@ impl Orchestrator {
         // (and their state.json results) the live session already admitted. percent stays per-session.
         v.push(if sh.compare { "--compare" } else { "--no-compare" }.into());
         v.push(if sh.build_debs { "--build-debs" } else { "--no-build-debs" }.into());
+        // cohort venvs (live) — its current atomic value
+        v.push(if self.manage_venvs.load(Ordering::Relaxed) { "--manage-venvs" } else { "--no-manage-venvs" }.into());
+        // restart-only settings the user edited in the config tab — re-emit them LAST so they win over the
+        // (stale) launch flags re-passed in argv, exactly like backend/orchestrator above.
+        for (k, val) in self.cfg_overrides.lock().unwrap().iter() {
+            let mut flag = |name: &str, on: bool, off: &str| {
+                v.push(if on { name } else { off }.to_string().into());
+            };
+            match k.as_str() {
+                "auto_upgrade" => flag("--auto-upgrade", val.as_bool() == Some(true), "--no-auto-upgrade"),
+                "fontspector_qa" => flag("--fontspector", val.as_bool() == Some(true), "--no-fontspector"),
+                "retry_failed" => flag("--retry-failed", val.as_bool() == Some(true), "--no-retry-failed"),
+                "auto_provision" => flag("--toolchain-provision", val.as_bool() == Some(true), "--no-toolchain-provision"),
+                "source" | "google_fonts" | "archive" | "build_dir" | "fontc_bin" => {
+                    if let Some(s) = val.as_str() {
+                        if !s.is_empty() {
+                            let opt = match k.as_str() {
+                                "source" => "--source", "google_fonts" => "--google-fonts",
+                                "archive" => "--archive", "build_dir" => "--build-dir",
+                                _ => "--fontc-bin",
+                            };
+                            v.push(opt.into());
+                            v.push(s.into());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         v
     }
 
@@ -3282,10 +3359,11 @@ impl Orchestrator {
                 c.insert("backend".into(), serde_json::json!(sh.backend));
                 c.insert("orchestrator".into(), serde_json::json!(sh.orchestrator));
                 c.insert("compare".into(), serde_json::json!(sh.compare));
+                c.insert("manage_venvs".into(), serde_json::json!(self.manage_venvs.load(Ordering::Relaxed)));
                 c
             },
             control_log: sh.control_log.clone(),
-            dep_relaxations: self.venvs.as_ref().map(|v| v.relaxations()).unwrap_or_default(),
+            dep_relaxations: self.venvs.as_ref().filter(|_| self.manage_venvs.load(Ordering::Relaxed)).map(|v| v.relaxations()).unwrap_or_default(),
             config_path: self.cfg.data_dir.join("gflib-build.config").to_string_lossy().to_string(),
             pre_build: false, // a live build is never the setup wizard
             fontspector: sh.fontspector.clone(), // live QA aggregate (async --fontspector orchestration)

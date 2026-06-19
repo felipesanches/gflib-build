@@ -93,7 +93,7 @@ fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
         ("orchestrator", "orchestrator", CfgKind::Choice(&ORCHESTRATOR_CHOICES), true),
         ("fontc_bin", "fontc binary (override)", CfgKind::Path, false),
         ("auto_provision", "auto-provision pinned toolchain", CfgKind::Bool, false),
-        ("manage_venvs", "cohort venvs", CfgKind::Bool, false),
+        ("manage_venvs", "cohort venvs", CfgKind::Bool, true),
         ("jobs", "parallel jobs", CfgKind::Step { step: 1.0, min: 0.0, max: 256.0 }, true), // 0 = drain (no new builds)
         ("timeout", "per-build timeout (0=off)", CfgKind::Step { step: 30.0, min: 0.0, max: 100000.0 }, true),
         // Scope
@@ -301,10 +301,21 @@ fn cfg_persistable(key: &str) -> bool {
     TUI_PERSIST.contains(&key)
 }
 
-/// A config field is editable when we're in the setup wizard, OR it applies live to a running build,
-/// OR it is a cwd-independent setting we can persist for the next run.
+/// Settings read once at launch (paths / worklist source / toolchain / startup re-queue behaviours):
+/// editable on a running build, but the edit is forwarded to the daemon and applied on its next restart
+/// (↻), never mid-run. Mirrors the web RESTART_KEYS set.
+const TUI_RESTART: &[&str] = &[
+    "source", "google_fonts", "archive", "build_dir", "fontc_bin",
+    "auto_provision", "auto_upgrade", "retry_failed", "fontspector_qa",
+];
+fn cfg_restart_editable(key: &str) -> bool {
+    TUI_RESTART.contains(&key)
+}
+
+/// A config field is editable when we're in the setup wizard, OR it applies live to a running build, OR
+/// it is a cwd-independent setting we can persist for the next run, OR it is a restart-applied setting.
 fn cfg_editable(setup: bool, f: &CfgField) -> bool {
-    setup || f.live || cfg_persistable(f.key)
+    setup || f.live || cfg_persistable(f.key) || cfg_restart_editable(f.key)
 }
 
 /// Live 'apply': forward the live-honoured keys (backend/jobs/percent/compare) to control.json AND
@@ -345,6 +356,27 @@ fn cfg_apply_live(fields: &[CfgField], snap: &Snapshot, src: &dyn Source) -> Str
             set.build_debs = Some(b); // live: starts/stops the auto-packaging worker
         }
     }
+    if changed("manage_venvs") {
+        if let Some(b) = new.get("manage_venvs").and_then(|v| v.as_bool()) {
+            set.manage_venvs = Some(b); // live: per-build python choice (cohort venv vs build-python)
+        }
+    }
+    // restart-only settings: forward the edited ones so the daemon records them for its next restart
+    macro_rules! fwd_bool { ($k:literal, $f:ident) => {
+        if changed($k) { if let Some(b) = new.get($k).and_then(|v| v.as_bool()) { set.$f = Some(b); } }
+    }; }
+    macro_rules! fwd_str { ($k:literal, $f:ident) => {
+        if changed($k) { if let Some(s) = new.get($k).and_then(|v| v.as_str()) { set.$f = Some(s.to_string()); } }
+    }; }
+    fwd_bool!("auto_upgrade", auto_upgrade);
+    fwd_bool!("fontspector_qa", fontspector_qa);
+    fwd_bool!("retry_failed", retry_failed);
+    fwd_bool!("auto_provision", auto_provision);
+    fwd_str!("source", source);
+    fwd_str!("google_fonts", google_fonts);
+    fwd_str!("archive", archive);
+    fwd_str!("build_dir", build_dir);
+    fwd_str!("fontc_bin", fontc_bin);
     src.control(&set);
     // persist the cwd-independent subset for the next run / --export-deb
     if snap.config_path.is_empty() {
@@ -1718,6 +1750,9 @@ fn render_config(scr: &mut Screen, snap: &Snapshot, ui: &Ui, top: u16, bottom: u
             let changed = vals.get(f.key) != cf.get(f.key);
             if f.live {
                 if changed { tag = "  *changed".into(); }
+            } else if cfg_restart_editable(f.key) {
+                // forwarded to the daemon; takes effect on its next restart (↻ Restart in the actions row)
+                tag = if changed { "  ↻ *restart".into() } else { "  ↻ restart".into() };
             } else if cfg_persistable(f.key) {
                 // saved to disk on apply; takes effect on the next run / --export-deb
                 tag = if changed { "  *next run".into() } else { "  (next run)".into() };
