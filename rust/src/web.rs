@@ -253,7 +253,6 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
  /* W5: responsive multi-pane (side-by-side panels on wide screens — used by the packaging tab) */
  .panes{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
  @media(max-width:900px){.panes{grid-template-columns:1fr}}
- .w5{font-size:11px}
  .g{color:var(--g)}.r{color:var(--r)}.c{color:var(--c)}.dc{color:var(--dc)}.y{color:var(--y)}.muted{color:var(--muted)}.dr{color:var(--dr)}.w{color:var(--w)}.gr{color:var(--gr)}.m{color:var(--m)}.o{color:var(--o)}.b{font-weight:600}
  .t{font-size:15px;color:var(--w);font-weight:600}
  .sub{color:var(--c)}
@@ -335,6 +334,11 @@ const PAGE: &str = r###"<!doctype html><html><head><meta charset="utf-8">
 <div id="detail"></div>
 <script>
 let snap={}, tab='overview';
+// Optimistic overrides for the live config widgets: a control's just-entered value is shown immediately
+// (no waiting for the control.json round-trip), keyed by field → {v:entered, base:value-before-the-edit}.
+// Each is dropped the moment the server snapshot moves off `base` (poll()), so a server-side clamp still
+// wins and nothing is pinned stale.
+let OPT={};
 // tab order MUST match the TUI's VIEWS
 const TABS=['config','overview','queue','cohorts','archive','built','packaging','tools','failures','stats','fontspector','crater','reset'];
 // colour a fontc_crater verdict token (magenta = fontc can't build it — the gold pairing on our built rows)
@@ -377,7 +381,9 @@ function L(s,n){s=(s==null?'':''+s);return s.length>n?s.slice(0,n):s.padEnd(n)}
 function Rp(s,n){return (''+s).padStart(n)}
 function trunc(s,n){s=(s==null?'':''+s);return s.length>n?s.slice(0,n-1)+'…':s}
 function prov(x){const c=x.compiler_version||x.backend||'';return c+(x.builder_version?' · '+x.builder_version:'')}
-function ctl(set){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({set:set})})}
+function ctl(set){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({set:set})});
+ for(const k in set)if(LIVE_APPLY[k])OPT[k]={v:set[k],base:(snap.config||{})[k]}; // show live-widget edits instantly
+ bump()}
 // --- reset tab: granular deletion of build-system portions (mirrors the TUI's reset tab) ---
 function resetPortion(key,label,bytes){
  ctl({reset_portion:key}); // fires immediately; the row reports progress + '✓ freed X'
@@ -405,7 +411,19 @@ function resetView(){
  return h;
 }
 function setTab(t){tab=t;location.hash=t;render()}
-async function poll(){try{snap=await (await fetch('/api/status')).json()}catch(e){}sample();render();checkNotify()}
+async function poll(){
+ if(polling)return; // never overlap requests — this is the self-throttle that keeps polling from flooding the daemon
+ polling=true;let txt='';
+ // bound the request: a hung fetch (stale socket after suspend, half-open TCP) must never pin polling=true
+ // and wedge the loop — on abort the catch falls through to polling=false + schedulePoll() and we recover.
+ const ac=new AbortController(), tid=setTimeout(()=>ac.abort(), POLL_SLOW*3);
+ try{const r=await fetch('/api/status',{signal:ac.signal});txt=await r.text();snap=JSON.parse(txt)}catch(e){}
+ clearTimeout(tid);polling=false;
+ if(txt&&txt!==lastSig){lastSig=txt;idleStreak=0}else{idleStreak++} // a changed snapshot keeps us fast; a stable one eases off
+ for(const k in OPT)if((snap.config||{})[k]!==OPT[k].base)delete OPT[k]; // server moved off the pre-edit value → drop the override
+ try{sample();render();checkNotify()}catch(e){} // a render error must never break the self-rescheduling loop
+ schedulePoll();
+}
 
 // --- a row = {segs:[[text,class]…], rt?:retry-slug, det?:[kind,id], fc?:cause-to-filter-by} ---
 let DET=[], fsCause=null;
@@ -621,7 +639,9 @@ function cfgCell(f,cf){
   return '<input type="number"'+(f.k=='percent'?' min="1" max="100"':' min="1"')+' value="'+E(v==null?'':v)+'" onchange="ctl({'+f.k+':+this.value})">';
  return '<span class="muted">'+E(v==null?(f.k=='timeout'?'0':''):''+v)+'</span>';
 }
-function cfgView(){const cf=snap.config||{};
+function cfgView(){const base=snap.config||{},cf={};
+ for(const k in base)cf[k]=base[k];
+ for(const k in OPT)cf[k]=OPT[k].v; // prefer a just-entered value over the (briefly stale) server snapshot
  let h='<div class="sec">Configuration</div>';
  h+='<div class="ln muted">Editable controls apply live; greyed ones are set by CLI flags at launch.</div>';
  h+='<div class="ln"><button class="tbtn" onclick="if(confirm(\'Restart the daemon now? In-flight builds are interrupted and resume from saved state.\'))ctl({restart:true})">↻ Restart daemon</button></div>';
@@ -638,6 +658,15 @@ function cfgView(){const cf=snap.config||{};
  if(cl.length)h+='<div class="sec">applied live changes</div>'+cl.slice().reverse().map(l=>'<div class="ln g">'+E(l)+'</div>').join('');
  return h;
 }
+
+// Apply fresh HTML to a region, but YIELD to the user: if the focused element (a field being typed
+// in, or an OPEN <select>, which keeps focus while its list is dropped) lives inside this region, skip
+// the rebuild for this frame so a background sync never steals focus, snaps a combo-box shut, or
+// resets a half-entered value. It catches up on the next frame, once the interaction ends.
+function setHTML(id,html){const el=document.getElementById(id);if(!el)return;
+ const a=document.activeElement;
+ if(a&&el.contains(a)&&/^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName))return;
+ el.innerHTML=html;}
 
 function render(){
  const c=snap.counts||{};
@@ -656,28 +685,25 @@ function render(){
   const attLbl=(att>0||(c.queued||0)>0||(c.building||0)>0)?'<span class="right w">'+att+'/'+insc+' attempted ('+Math.floor(100*att/insc)+'%)</span>':'';
   hdr+='<div class="sub"> '+disk+'  free '+human(snap.disk_free)+attLbl+'</div>';
  }
- document.getElementById('hdr').innerHTML=hdr;
+ setHTML('hdr',hdr);
  // ---- progress bar (rows 2/3) ----
- document.getElementById('bar').innerHTML=pre?'':barHTML();
+ setHTML('bar',pre?'':barHTML());
  // ---- tabs (row 4) ----
- document.getElementById('tabs').innerHTML=TABS.map(t=>'<span class="tab'+(t==tab?' on':'')+'" onclick="setTab(\''+t+'\')">'+t+'</span>').join('');
- // ---- controls + W4 toolbar (filter on list tabs, export everywhere). Don't rebuild the bar while
- //      the user is typing in the filter (the 1.5s poll would otherwise steal focus) ----
- const fEl=document.getElementById('filter');
- if(!(fEl&&document.activeElement===fEl)){
+ setHTML('tabs',TABS.map(t=>'<span class="tab'+(t==tab?' on':'')+'" onclick="setTab(\''+t+'\')">'+t+'</span>').join(''));
+ // ---- controls + W4 toolbar (filter on list tabs, export everywhere). setHTML() yields while the
+ //      user is typing in the filter, so the live sync never steals focus from it. No refresh-rate
+ //      knob: the page refreshes automatically (see the W5 polling block). ----
+ {
   const listTab=['overview','queue','cohorts','built','failures','fontspector'].includes(tab);
-  const opt=(ms,lbl)=>'<option value="'+ms+'"'+(POLL_MS==ms?' selected':'')+'>'+lbl+'</option>';
   const notifyBtn=(window.Notification&&Notification.permission!='granted')?' <button class="tbtn" onclick="askNotify()" title="notify when the build completes">🔔 notify</button>':'';
-  document.getElementById('ctl').innerHTML=
+  setHTML('ctl',
     '<button title="pause scheduling AND freeze (SIGSTOP) running builds to free CPU/RAM" onclick="ctl({paused:true})"'+(snap.paused?' disabled':'')+'>pause</button> '+
     '<button title="thaw (SIGCONT) frozen builds and resume scheduling" onclick="ctl({paused:false})"'+(snap.paused?'':' disabled')+'>resume</button>'+
     ' <button class="tbtn" title="force-rebuild ALL config-fixed families now (failed families with a gflib-build override). Editing an override already auto-rebuilds it within seconds; this button forces the whole set immediately, even unchanged ones." onclick="if(confirm(\'Force-rebuild all failed families that have a gflib-build config override (the config-fixed set)?\'))ctl({retry_overrides:true})">↻ rebuild config-fixed</button>'+
     (listTab?' <input id="filter" placeholder="filter… (slug / cause)" oninput="setFilter(this.value)" value="'+E(FILTER)+'">':'')+
     ' <button class="tbtn" onclick="exportJSON()">⬇ JSON</button> <button class="tbtn" onclick="exportCSV()">⬇ CSV (built+failed)</button>'+
-    ' <button class="tbtn" onclick="poll()" title="refresh now">↻</button>'+
-    ' <select class="w5" onchange="setPoll(this.value)" title="auto-refresh interval">'+opt(1000,'1s')+opt(1500,'1.5s')+opt(3000,'3s')+opt(5000,'5s')+opt(0,'paused')+'</select>'+
     ' <button class="tbtn" onclick="toggleTheme()" title="light / dark">◐</button>'+notifyBtn+
-    '<span class="muted"> &nbsp; click a row for details</span>';
+    '<span class="muted"> &nbsp; click a row for details · updates live</span>');
  }
  // ---- pinned now-building (every tab) ----
  const bl=snap.building||[];let pin='';
@@ -689,7 +715,7 @@ function render(){
   const lbl=ps.length>1?(tot+' — '+ps.join(', ')):(''+tot);
   // show ALL in-flight families (no '+N more' cap) — flow them into columns so the pinned block stays compact
   pin='<div class="pin"><div class="sec">▶ Now building ('+lbl+')</div><div class="bgrid">'+bl.map(b=>R(buildingRow(b))).join('')+'</div></div>';}
- document.getElementById('pin').innerHTML=pin;
+ setHTML('pin',pin);
  // ---- body per tab: charts (web-only) first, then the same content as the TUI ----
  let body=charts(tab);
  if(tab=='config')body+=cfgView();
@@ -700,7 +726,7 @@ function render(){
  else if(tab=='reset')body+=resetView();
  else if(tab=='overview')body+=sections(tab).map(renderSec).join(''); // stacked, like the TUI: Pipeline on top, Recent failures below
  else{body+=(tab=='stats'?statsPrefix():'')+sections(tab).map(renderSec).join('');}
- document.getElementById('body').innerHTML=body;
+ setHTML('body',body);
 }
 
 function barHTML(){const c=snap.counts||{},ph=snap.phase;
@@ -1014,11 +1040,16 @@ function charts(t){
 addEventListener('hashchange',()=>{const t=location.hash.slice(1);if(TABS.includes(t)){tab=t;render()}});
 if(TABS.includes(location.hash.slice(1)))tab=location.hash.slice(1);
 
-// ---- W5: polling cadence + pause-when-hidden + theme + completion notification ----
-let POLL_MS=+(localStorage.getItem('gf_poll')||1500), timer=null, lastDone=false;
-function startPoll(){if(timer)clearInterval(timer);if(POLL_MS>0&&!document.hidden)timer=setInterval(poll,POLL_MS)}
-function setPoll(ms){POLL_MS=+ms;localStorage.setItem('gf_poll',POLL_MS);startPoll()}
-document.addEventListener('visibilitychange',()=>{if(document.hidden){if(timer){clearInterval(timer);timer=null}}else{poll();startPoll()}});
+// ---- W5: automatic adaptive polling. There is no user knob: the page refreshes fast enough to feel
+//      instantaneous, self-throttles so it can never flood the daemon (a new request starts only after
+//      the previous one returns — see poll()), eases off when nothing is changing, snaps back to fast
+//      on any change or user action, and parks entirely while the tab is hidden. ----
+const POLL_FAST=500, POLL_SLOW=2500, POLL_RAMP=4; // ms; POLL_RAMP = unchanged polls tolerated before easing off
+let pollTimer=null, polling=false, lastSig='', idleStreak=0, lastDone=false;
+function schedulePoll(ms){if(pollTimer)clearTimeout(pollTimer);if(document.hidden)return;
+ pollTimer=setTimeout(poll, ms!=null?ms:(idleStreak>POLL_RAMP?POLL_SLOW:POLL_FAST))}
+function bump(){idleStreak=0;schedulePoll(POLL_FAST)} // user acted → return to fast cadence so the change shows promptly
+document.addEventListener('visibilitychange',()=>{if(document.hidden){if(pollTimer){clearTimeout(pollTimer);pollTimer=null}}else{idleStreak=0;poll()}});
 function setTheme(t){document.body.dataset.theme=t;localStorage.setItem('gf_theme',t)}
 function toggleTheme(){setTheme(document.body.dataset.theme=='light'?'dark':'light')}
 function askNotify(){if(window.Notification)Notification.requestPermission().then(()=>render())}
@@ -1027,5 +1058,5 @@ function checkNotify(){const done=snap.done&&(snap.total||0)>0;
   const c=snap.counts||{};new Notification('gflib-build — build complete',{body:(c.built||0)+' built · '+(c.failed||0)+' failed · '+(c.skipped||0)+' skipped'});}
  lastDone=done;}
 setTheme(localStorage.getItem('gf_theme')||'dark');
-poll();startPoll();
+poll(); // schedules its own next run; the adaptive loop takes over from here
 </script></body></html>"###;

@@ -1592,7 +1592,9 @@ impl Orchestrator {
                         }
                     }
                 }
-                thread::sleep(Duration::from_millis(700));
+                // Poll control.json briskly so live controls (jobs/pause/backend, reset-tab deletes)
+                // apply with no perceptible lag — it's a tiny file, only acted on when its seq changes.
+                thread::sleep(Duration::from_millis(200));
             }
         });
     }
