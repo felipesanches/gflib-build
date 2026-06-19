@@ -1319,6 +1319,11 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
         put(scr, 1, 0, " configure your build below, then navigate to ▶ Start build", Color::Cyan, w);
     } else {
         put(scr, 0, w.saturating_sub(24), &format!("elapsed {}", hms(snap.elapsed)), Color::White, w);
+        if let Some(be) = snap.batch_elapsed {
+            // batch timer (RESET ALL → N-1): live "…" until N-1 reached, then "✓N-1" (frozen)
+            let tag = if snap.batch_complete { " \u{2713}N-1" } else { " \u{2026}" };
+            put(scr, 0, w.saturating_sub(46), &format!("batch {}{}", hms(be), tag), Color::Cyan, w);
+        }
         let bld = snap.disk_build_total;
         let arc = snap.disk_archive_total;
         // Always spell out both components — no ambiguous "(build dir)".

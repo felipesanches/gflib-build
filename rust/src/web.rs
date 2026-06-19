@@ -693,7 +693,7 @@ function render(){
  DET=[]; // reset the click-to-detail index map for this frame
  // ---- header (rows 0/1) ----
  let hdr='<div class="t"> Google Fonts library build'+(snap.paused?(snap.running_builds>0?' [PAUSED · '+snap.running_builds+(snap.running_builds==1?' build':' builds')+' frozen]':' [PAUSED]'):'')+
-   (pre?'<span class="right muted">first-time setup</span>':'<span class="right w">elapsed '+hms(snap.elapsed)+'</span>')+'</div>';
+   (pre?'<span class="right muted">first-time setup</span>':'<span class="right w">elapsed '+hms(snap.elapsed)+(snap.batch_elapsed!=null?'  ·  batch '+hms(snap.batch_elapsed)+(snap.batch_complete?' ✓ (N-1)':' …'):'')+'</span>')+'</div>';
  if(pre){hdr+='<div class="sub"> configure your build below, then navigate to ▶ Start build</div>';}
  else{
   const bld=snap.disk_build_total||0,arc=snap.disk_archive_total||0;

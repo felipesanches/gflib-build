@@ -336,6 +336,9 @@ pub struct DebTool {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     #[serde(default)] pub elapsed: f64,
+    // batch timer (RESET ALL → N-1 terminal): elapsed seconds, and whether N-1 has been reached (frozen)
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub batch_elapsed: Option<f64>,
+    #[serde(default)] pub batch_complete: bool,
     #[serde(default)] pub disk_used_delta: u64,
     #[serde(default)] pub disk_free: u64,
     #[serde(default)] pub disk_build_total: u64,

@@ -223,6 +223,10 @@ pub struct Orchestrator {
     pub running: Mutex<RunReg>,             // in-flight builder children + freeze state (freeze/thaw/kill)
     pub frozen: AtomicBool,                 // global pause SIGSTOPs ALL running builds; mirror of sh.paused
     pub job_limit: AtomicUsize,             // live jobs target; lock-free mirror of sh.jobs for the regulator
+    // Batch timer: wall-clock from "Delete everything!" (RESET ALL) to when N-1 families reach a terminal
+    // result — N-1, not N, so a single stuck family (e.g. an endless compile) can't hold the clock open.
+    pub batch_start: Mutex<Option<f64>>,
+    pub batch_done: Mutex<Option<f64>>,
     pub manage_venvs: AtomicBool,           // SETTING (live): build with cohort venvs (true) or the single build-python (false)
     // Restart-only settings the user edited in the config tab (paths/source/toolchain/startup behaviours
     // that are read once at launch). live_overrides_argv() re-emits these as CLI flags on a daemon restart
@@ -477,6 +481,8 @@ impl Orchestrator {
             running: Mutex::new(RunReg::default()),
             frozen: AtomicBool::new(false),
             job_limit: AtomicUsize::new(jobs),
+            batch_start: Mutex::new(None),
+            batch_done: Mutex::new(None),
             manage_venvs: AtomicBool::new(manage_venvs0),
             cfg_overrides: Mutex::new(std::collections::BTreeMap::new()),
             crater,
@@ -2106,6 +2112,10 @@ impl Orchestrator {
                 return;
             }
         }
+        // start the batch timer at RESET ALL activation (the user's chosen "start" point); cleared end
+        // is stamped in snapshot() when N-1 families reach a terminal result.
+        *self.batch_start.lock().unwrap() = Some(now());
+        *self.batch_done.lock().unwrap() = None;
         // 1) pause: the worker pool starts nothing new while paused (worker_loop's ready-gate checks it)
         {
             let mut sh = self.shared.lock().unwrap();
@@ -3352,8 +3362,23 @@ impl Orchestrator {
         // counts.built - lint_total: the build-results entries persist, so that stays 0 after a repackage
         // is requested even while the worker is rebuilding every .deb.)
         let pkg_pending = sh.results.values().filter(|r| r.status == "built" && !sh.packaged.contains(&r.slug)).count();
+        // batch timer: stamp completion the moment N-1 families reach a terminal result (built|failed),
+        // so a single stuck family can't hold the clock open; report elapsed (live, then frozen at N-1).
+        let n = sh.results.len();
+        let terminal = counts.built + counts.failed;
+        let batch_start = *self.batch_start.lock().unwrap();
+        let batch_done_val = {
+            let mut bd = self.batch_done.lock().unwrap();
+            if batch_start.is_some() && bd.is_none() && n >= 1 && terminal >= n - 1 {
+                *bd = Some(now());
+            }
+            *bd
+        };
+        let batch_elapsed = batch_start.map(|s| batch_done_val.unwrap_or_else(now) - s);
         Snapshot {
             elapsed: self.elapsed(),
+            batch_elapsed,
+            batch_complete: batch_done_val.is_some(),
             disk_used_delta: 0,
             disk_free: sh.disk_free,
             disk_build_total: sh.disk_build_total,
