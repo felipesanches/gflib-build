@@ -198,6 +198,15 @@ impl RunReg {
     }
 }
 
+/// T2 Python authorization allow-list for `python_policy=selective`: a family may use Python if its slug
+/// is in `families`, OR any package it declares is in `deps` (authorize a dependency → every family that
+/// needs it). Persisted to build_dir/python-authorized.json so a selective run survives a restart.
+#[derive(Default, Clone)]
+pub struct PyAuth {
+    pub families: std::collections::HashSet<String>,
+    pub deps: std::collections::HashSet<String>,
+}
+
 pub struct Orchestrator {
     pub cfg: Config,
     pub shared: Arc<Mutex<Shared>>,
@@ -227,6 +236,7 @@ pub struct Orchestrator {
     // result — N-1, not N, so a single stuck family (e.g. an endless compile) can't hold the clock open.
     pub batch_start: Mutex<Option<f64>>,
     pub batch_done: Mutex<Option<f64>>,
+    pub python_auth: Mutex<PyAuth>, // T2: per-family/per-dep Python allow-list for python_policy=selective
     pub manage_venvs: AtomicBool,           // SETTING (live): build with cohort venvs (true) or the single build-python (false)
     // Restart-only settings the user edited in the config tab (paths/source/toolchain/startup behaviours
     // that are read once at launch). live_overrides_argv() re-emits these as CLI flags on a daemon restart
@@ -454,6 +464,20 @@ impl Orchestrator {
         // Always construct the manager (cheap — cohort venvs are created lazily on first use) so cohort
         // venvs can be toggled live: build_one consults `manage_venvs` per build, not the launch Option.
         let manage_venvs0 = cfg.manage_venvs; // captured before `cfg` is moved into the struct below
+        // load the persisted T2 Python allow-list (before `cfg` is moved), so a selective run survives a restart
+        let python_auth0 = {
+            let p = cfg.build_dir.join("python-authorized.json");
+            let strs = |v: Option<&serde_json::Value>| -> std::collections::HashSet<String> {
+                v.and_then(|a| a.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .unwrap_or_default()
+            };
+            std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .map(|v| PyAuth { families: strs(v.get("families")), deps: strs(v.get("deps")) })
+                .unwrap_or_default()
+        };
         let venvs = Some(VenvManager::new(&cfg.build_dir, &cfg.pythons, cfg.base_requirements.clone(), abort_builds.clone()));
         let build_rules = cfg
             .build_rules
@@ -483,6 +507,7 @@ impl Orchestrator {
             job_limit: AtomicUsize::new(jobs),
             batch_start: Mutex::new(None),
             batch_done: Mutex::new(None),
+            python_auth: Mutex::new(python_auth0),
             manage_venvs: AtomicBool::new(manage_venvs0),
             cfg_overrides: Mutex::new(std::collections::BTreeMap::new()),
             crater,
@@ -1185,19 +1210,47 @@ impl Orchestrator {
     }
 
     /// Whether THIS family may use Python (builder2, cohort venvs, Python pre-build) under the live policy.
-    fn python_allowed(&self, slug: &str) -> bool {
+    /// `selective` consults the persisted allow-list (T2): the family's slug, OR any Python package it
+    /// declares being in the authorized-deps set (the dep check reads the family's requirements, so it's
+    /// only done when needed — selective + not already slug-authorized + some deps are authorized).
+    fn python_allowed(&self, slug: &str, mirror: &Path, commit: &str) -> bool {
         match self.python_policy().as_str() {
             "off" => false,
-            "selective" => self.python_authorized(slug),
+            "selective" => {
+                let (slug_ok, deps) = {
+                    let a = self.python_auth.lock().unwrap();
+                    (a.families.contains(slug), a.deps.clone())
+                };
+                if slug_ok {
+                    return true;
+                }
+                if deps.is_empty() {
+                    return false;
+                }
+                let req = venv::read_requirements_from_mirror(mirror, commit);
+                req.lines().any(|l| {
+                    let n = venv::req_pkg_name(l);
+                    !n.is_empty() && deps.contains(&n)
+                })
+            }
             _ => true, // "on" (and any unrecognized value) → full pipeline, preserving prior behaviour
         }
     }
 
-    /// Per-family Python authorization for `selective` mode. T2 will back this with a persisted
-    /// allow-list (by slug and by declared dependency); until then nothing is authorized, so
-    /// `selective` behaves like `off`.
-    fn python_authorized(&self, _slug: &str) -> bool {
-        false
+    /// Persist the Python authorization allow-list (T2) so a selective run survives a daemon restart.
+    fn save_python_auth(&self) {
+        if self.cfg.dry_run {
+            return;
+        }
+        let (mut fams, mut deps): (Vec<String>, Vec<String>) = {
+            let a = self.python_auth.lock().unwrap();
+            (a.families.iter().cloned().collect(), a.deps.iter().cloned().collect())
+        };
+        fams.sort();
+        deps.sort();
+        let v = serde_json::json!({ "families": fams, "deps": deps });
+        let p = self.cfg.build_dir.join("python-authorized.json");
+        let _ = std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap_or_default());
     }
 
     /// MOCKUP build: no clone/venv/compile — a brief fake "compile", then replay the family's recorded
@@ -1296,7 +1349,7 @@ impl Orchestrator {
         // Python policy (T1): may THIS family touch Python at all? When not (python_policy=off, or
         // selective+unauthorized) the family takes the strict Rust-only path — no cohort venv, no
         // builder2, and Python pre-build rules are refused below. Computed once and threaded through.
-        let py_allowed = self.python_allowed(slug);
+        let py_allowed = self.python_allowed(slug, &mirror, &fam.commit);
 
         // Cohort venv (R2): read the family's requirements read-only from the mirror, create/reuse the
         // shared cohort venv, and build with ITS python. A venv failure (broken deps) fails the family
@@ -2444,6 +2497,38 @@ impl Orchestrator {
             restart_str!(archive, "archive", "repo archive");
             restart_str!(build_dir, "build_dir", "build output dir");
             restart_str!(fontc_bin, "fontc_bin", "fontc binary");
+            // T2: grant Python authorization (python_policy=selective). Authorized FAMILIES are re-queued
+            // immediately (the one-family probe); an authorized DEP is stored — the library-wide expansion
+            // to "every family that declares it" is T4, so retrigger affected families for now.
+            if let Some(d) = &set.python_authorize {
+                {
+                    let mut a = self.python_auth.lock().unwrap();
+                    for f in &d.families { a.families.insert(f.clone()); }
+                    for p in &d.deps { a.deps.insert(p.clone()); }
+                }
+                self.save_python_auth();
+                for slug in &d.families {
+                    if let Some(r) = sh.results.get_mut(slug) {
+                        r.status = "queued".into();
+                        r.queued_kind = "retry".into();
+                        r.error.clear();
+                        sh.queue.push_front(slug.clone());
+                    }
+                }
+                log.push(format!("python authorized (selective): +{} families, +{} deps", d.families.len(), d.deps.len()));
+                if !d.deps.is_empty() {
+                    log.push("retrigger families to rebuild with the newly-authorized dep (library-wide expansion is T4)".into());
+                }
+            }
+            if let Some(d) = &set.python_revoke {
+                {
+                    let mut a = self.python_auth.lock().unwrap();
+                    for f in &d.families { a.families.remove(f); }
+                    for p in &d.deps { a.deps.remove(p); }
+                }
+                self.save_python_auth();
+                log.push(format!("python authorization revoked: -{} families, -{} deps", d.families.len(), d.deps.len()));
+            }
             if let Some(retry) = &set.retry {
                 for slug in retry {
                     if let Some(r) = sh.results.get_mut(slug) {
@@ -3375,10 +3460,20 @@ impl Orchestrator {
             *bd
         };
         let batch_elapsed = batch_start.map(|s| batch_done_val.unwrap_or_else(now) - s);
+        let (py_auth_families, py_auth_deps) = {
+            let a = self.python_auth.lock().unwrap();
+            let mut f: Vec<String> = a.families.iter().cloned().collect();
+            let mut d: Vec<String> = a.deps.iter().cloned().collect();
+            f.sort();
+            d.sort();
+            (f, d)
+        };
         Snapshot {
             elapsed: self.elapsed(),
             batch_elapsed,
             batch_complete: batch_done_val.is_some(),
+            python_authorized_families: py_auth_families,
+            python_authorized_deps: py_auth_deps,
             disk_used_delta: 0,
             disk_free: sh.disk_free,
             disk_build_total: sh.disk_build_total,

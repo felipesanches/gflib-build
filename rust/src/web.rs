@@ -900,7 +900,15 @@ function openLintian(slug){
 }
 function hlLint(t){return t.split('\n').map(l=>{const c=l[0]=='E'?'r':l[0]=='W'?'y':(l[0]=='I'||l[0]=='P')?'c':'gr';return '<span class="'+c+'">'+E(l)+'</span>'}).join('\n')}
 function showDetail(title,lines,slug){
- let h='<div class="dhead">'+E(title)+'<span class="dclose" onclick="closeDetail()">✕ close</span></div><pre class="dbody">'+lines.map(E).join('\n')+'</pre>';
+ // T2: under a Rust-only policy, offer to authorize Python for THIS family (and re-queue it) — the
+ // one-family probe of the selective re-enablement loop. Shows ✓ when already authorized.
+ let act='';
+ if(slug&&(snap.config||{}).python_policy&&(snap.config||{}).python_policy!='on'){
+  act=(snap.python_authorized_families||[]).indexOf(slug)>=0
+   ? ' &nbsp;<span class="g">✓ Python authorized</span>'
+   : ' &nbsp;<button class="rb" onclick="ctl({python_authorize:{families:[\''+E(slug)+'\']}});closeDetail()" title="authorize Python (builder2 / cohort venv / Python pre-build) for this family under selective policy, and re-queue it to rebuild">⚙ enable Python + rebuild</button>';
+ }
+ let h='<div class="dhead">'+E(title)+act+'<span class="dclose" onclick="closeDetail()">✕ close</span></div><pre class="dbody">'+lines.map(E).join('\n')+'</pre>';
  if(slug)h+='<div class="dlog"><div class="muted">log tail (last 200 lines):</div><pre id="dlogbody" class="dbody">loading…</pre></div>';
  const el=document.getElementById('detail');el.innerHTML=h;el.style.display='block';
  if(slug)fetch('/api/log?slug='+encodeURIComponent(slug)+'&n=200').then(r=>r.text()).then(t=>{const b=document.getElementById('dlogbody');if(b)b.innerHTML=hlLog(t)}).catch(()=>{});

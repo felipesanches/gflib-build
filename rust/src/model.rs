@@ -339,6 +339,9 @@ pub struct Snapshot {
     // batch timer (RESET ALL → N-1 terminal): elapsed seconds, and whether N-1 has been reached (frozen)
     #[serde(default, skip_serializing_if = "Option::is_none")] pub batch_elapsed: Option<f64>,
     #[serde(default)] pub batch_complete: bool,
+    // T2: the live Python authorization allow-list (python_policy=selective) — for the UI to show state
+    #[serde(default)] pub python_authorized_families: Vec<String>,
+    #[serde(default)] pub python_authorized_deps: Vec<String>,
     #[serde(default)] pub disk_used_delta: u64,
     #[serde(default)] pub disk_free: u64,
     #[serde(default)] pub disk_build_total: u64,
@@ -416,6 +419,13 @@ pub struct Control {
     #[serde(default)] pub set: ControlSet,
 }
 
+/// T2: a set of families and/or Python package names to grant or revoke Python authorization for.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PyAuthDelta {
+    #[serde(default)] pub families: Vec<String>,
+    #[serde(default)] pub deps: Vec<String>,
+}
+
 /// Only the keys actually being set are serialized (unset = omitted, never `null`) so a control.json
 /// the Rust UI writes is byte-identical to one the Python tool writes — a Python daemon reading it
 /// won't trip over a `null` percent/jobs.
@@ -447,6 +457,9 @@ pub struct ControlSet {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub archive: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub build_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub fontc_bin: Option<String>,
+    // T2: grant/revoke Python authorization (python_policy=selective) for specific families and/or deps
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub python_authorize: Option<PyAuthDelta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub python_revoke: Option<PyAuthDelta>,
     // delete one resettable portion of the build system (reset tab): fonts-fontc | fonts-fontmake |
     // variants | debs | venvs | pip-cache | logs | work | fontspector | tools
     #[serde(default, skip_serializing_if = "Option::is_none")] pub reset_portion: Option<String>,
@@ -490,6 +503,20 @@ mod tests {
         // unmentioned settings stay None (a partial post never resets the others)
         assert_eq!(cs.archive, None);
         assert_eq!(cs.backend, None);
+    }
+    #[test]
+    fn controlset_deserializes_t2_python_authorize() {
+        // exactly the JSON the web "enable Python + rebuild" button posts
+        let cs: ControlSet = serde_json::from_str(
+            r#"{"python_authorize":{"families":["ofl/foo"],"deps":["numpy"]}}"#,
+        ).unwrap();
+        let d = cs.python_authorize.expect("python_authorize present");
+        assert_eq!(d.families, vec!["ofl/foo".to_string()]);
+        assert_eq!(d.deps, vec!["numpy".to_string()]);
+        // a families-only authorize (the common one-family probe) leaves deps empty, revoke absent
+        let cs2: ControlSet = serde_json::from_str(r#"{"python_authorize":{"families":["ofl/bar"]}}"#).unwrap();
+        assert_eq!(cs2.python_authorize.unwrap().deps, Vec::<String>::new());
+        assert!(cs2.python_revoke.is_none());
     }
     #[test]
     fn tolerates_partial_foreign_json() {
