@@ -342,6 +342,7 @@ pub struct Snapshot {
     // batch timer (RESET ALL → N-1 terminal): elapsed seconds, and whether N-1 has been reached (frozen)
     #[serde(default, skip_serializing_if = "Option::is_none")] pub batch_elapsed: Option<f64>,
     #[serde(default)] pub batch_complete: bool,
+    #[serde(default)] pub batch_label: String, // what the batch timer is currently timing (e.g. "batch", "retry: <cause>")
     // T2: the live Python authorization allow-list (python_policy=selective) — for the UI to show state
     #[serde(default)] pub python_authorized_families: Vec<String>,
     #[serde(default)] pub python_authorized_deps: Vec<String>,
@@ -445,6 +446,7 @@ pub struct ControlSet {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_all: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_overrides: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_category: Option<String>, // re-queue ALL failed families in this failure category (categorize_failure cause)
     #[serde(default, skip_serializing_if = "Option::is_none")] pub repackage_all: Option<bool>, // rebuild every .deb from existing fonts (apply packaging fixes + re-lint)
     #[serde(default, skip_serializing_if = "Option::is_none")] pub build_debs: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub restart: Option<bool>, // re-exec the daemon (apply startup-only settings)
@@ -538,6 +540,15 @@ mod tests {
         assert_eq!(cs.jobs, Some(6));
         assert_eq!(cs.retry, Some(vec!["ofl/x".to_string()]));
         assert_eq!(cs.paused, Some(true));
+    }
+    #[test]
+    fn control_set_retry_category() {
+        // the "↻ retry all" category button (TUI r-key / web) posts exactly this
+        let cs: ControlSet = serde_json::from_str(r#"{"retry_category":"builder3: internal panic"}"#).unwrap();
+        assert_eq!(cs.retry_category.as_deref(), Some("builder3: internal panic"));
+        // omitted when unset (control.json stays byte-compatible)
+        let cs2 = ControlSet { retry_all: Some(true), ..Default::default() };
+        assert!(!serde_json::to_string(&cs2).unwrap().contains("retry_category"));
     }
     #[test]
     fn control_set_retry_overrides() {

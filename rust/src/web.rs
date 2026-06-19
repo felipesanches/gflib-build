@@ -448,6 +448,8 @@ function R(row){
  // the retry button sits right after the FIRST seg (the family slug), not at the end of the row
  let h='<div class="'+cls+'"'+oc+'>'+(row.segs[0]?sp(row.segs[0]):'');
  if(row.rt) h+='<button class="rb" onclick="event.stopPropagation();ctl({retry:[\''+E(row.rt)+'\']})" title="retry this family">↻ retry</button>';
+ // retry an ENTIRE failure category (server-side: every failed family with this cause, not just the listed ones); the batch timer measures it
+ if(row.rc) h+='<button class="rb" onclick="event.stopPropagation();if(confirm(\'Re-queue ALL failed families in category: '+E(row.rc)+' ?\\n\\nThe batch timer will measure this retry.\'))ctl({retry_category:\''+E(row.rc)+'\'})" title="re-queue every failed family in this category (timed by the batch timer)">↻ retry all</button>';
  // packaging actions: download the built .deb, and read the saved lintian report (lr=[slug,title,errClass])
  if(row.dl) h+='<a class="rb" href="'+E(row.dl)+'" download onclick="event.stopPropagation()" title="download the built .deb">⬇ .deb</a>';
  if(row.lr) h+='<button class="rb '+(row.lr[2]||'')+'" onclick="event.stopPropagation();openLintian(\''+E(row.lr[0])+'\')" title="'+E(row.lr[1])+'">▤ lintian</button>';
@@ -501,7 +503,7 @@ function debToolRow(t){const ok=!!t.present;
  return {segs:[[ok?'✓ ':'✗ ',ok?'g':'r'],[L(t.name,20)+' ','w'],[ok?(t.purpose||''):('MISSING — sudo apt install '+(t.provides||'')),ok?'gr':'y']]}}
 // clicking a cause FILTERS the families list below (and highlights the selected cause)
 function failcatRow(c){const sel=fsCause==c.cat;
- return {segs:[[(sel?'▸':' ')+Rp(c.count,3)+'  ','w'],[L(c.cat,24),sel?'y':'c'],[' '+(c.hint||''),'muted']],fc:c.cat}}
+ return {segs:[[(sel?'▸':' ')+Rp(c.count,3)+'  ','w'],[L(c.cat,24),sel?'y':'c'],[' '+(c.hint||''),'muted']],fc:c.cat,rc:c.cat}}
 function histRow(h){return {segs:[[L(h.cause,20)+' ','y'],[h.slug||'','gr']],rt:h.slug,det:['history',h.slug]}}
 function phaseRow(kv){return {segs:[[L(kv[0],12)+' '+hms(kv[1]),'gr']]}}
 function opRow(kv){const s=kv[1];return {segs:[[L(kv[0],10)+' total '+Rp((s.total||0).toFixed(1),9)+'  n '+Rp(s.count||0,5)+'  mean '+Rp((s.mean||0).toFixed(2),7)+'  max '+Rp((s.max||0).toFixed(1),7),'c']]}}
@@ -694,7 +696,7 @@ function render(){
  DET=[]; // reset the click-to-detail index map for this frame
  // ---- header (rows 0/1) ----
  let hdr='<div class="t"> Google Fonts library build'+(snap.paused?(snap.running_builds>0?' [PAUSED · '+snap.running_builds+(snap.running_builds==1?' build':' builds')+' frozen]':' [PAUSED]'):'')+
-   (pre?'<span class="right muted">first-time setup</span>':'<span class="right w">elapsed '+hms(snap.elapsed)+(snap.batch_elapsed!=null?'  ·  batch '+hms(snap.batch_elapsed)+(snap.batch_complete?' ✓ (N-1)':' …'):'')+'</span>')+'</div>';
+   (pre?'<span class="right muted">first-time setup</span>':'<span class="right w">elapsed '+hms(snap.elapsed)+(snap.batch_elapsed!=null?'  ·  '+E(snap.batch_label||'batch')+' '+hms(snap.batch_elapsed)+(snap.batch_complete?' ✓ (N-1)':' …'):'')+'</span>')+'</div>';
  if(pre){hdr+='<div class="sub"> configure your build below, then navigate to ▶ Start build</div>';}
  else{
   const bld=snap.disk_build_total||0,arc=snap.disk_archive_total||0;

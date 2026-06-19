@@ -608,7 +608,11 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
                         source.control(&ControlSet { paused: Some(!snap.paused), ..Default::default() });
                     }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
-                        if let Some(slug) = selected_slug(&snap, ui.tab, ui.section, ui.sel, ui.fc_sel) {
+                        // on the "Failures by cause" list, r retries the WHOLE selected category (timed by
+                        // the batch timer); on a family list it retries just the selected family.
+                        if let Some(cause) = selected_cause(&snap, ui.tab, ui.section, ui.fc_sel) {
+                            source.control(&ControlSet { retry_category: Some(cause), ..Default::default() });
+                        } else if let Some(slug) = selected_slug(&snap, ui.tab, ui.section, ui.sel, ui.fc_sel) {
                             source.control(&ControlSet { retry: Some(vec![slug]), ..Default::default() });
                         }
                     }
@@ -691,6 +695,19 @@ fn selected_slug(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel
     let s = secs.get(section)?;
     if matches!(s.dview, "failures" | "built" | "queue" | "history") {
         s.keys.get(sel).cloned()
+    } else {
+        None
+    }
+}
+
+/// The failure category under the cursor when the "Failures by cause" section is focused (its selection
+/// is `fc_sel`, the sticky cause index). Returns None on any other section — the caller falls back to a
+/// per-family retry. This is what makes `r` retry the whole category on the cause list.
+fn selected_cause(snap: &Snapshot, tab: usize, section: usize, fc_sel: usize) -> Option<String> {
+    let secs = sections_for(snap, tab, fc_sel);
+    let s = secs.get(section)?;
+    if s.dview == "failcat" {
+        s.keys.get(fc_sel).cloned()
     } else {
         None
     }
@@ -1111,7 +1128,7 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                     ]
                 }).collect();
                 secs.push(SectionR {
-                    title: "Failures by cause  (←/→ here, ↑/↓ to pick — filters the list below)".into(), dview: "failcat", rows,
+                    title: "Failures by cause  (↑/↓ pick · r = retry whole cause · filters the list below)".into(), dview: "failcat", rows,
                     keys: snap.fail_categories.iter().map(|c| c.cat.clone()).collect(),
                 });
             }
@@ -1326,9 +1343,13 @@ fn render(scr: &mut Screen, snap: &Snapshot, ui: &Ui) {
     } else {
         put(scr, 0, w.saturating_sub(24), &format!("elapsed {}", hms(snap.elapsed)), Color::White, w);
         if let Some(be) = snap.batch_elapsed {
-            // batch timer (RESET ALL → N-1): live "…" until N-1 reached, then "✓N-1" (frozen)
+            // batch timer (RESET ALL or a bulk retry → N-1): live "…" until N-1 reached, then "✓N-1".
+            // Compact prefix only (the slot is narrow); the failures view / web show the full cause.
             let tag = if snap.batch_complete { " \u{2713}N-1" } else { " \u{2026}" };
-            put(scr, 0, w.saturating_sub(46), &format!("batch {}{}", hms(be), tag), Color::Cyan, w);
+            let lbl = if snap.batch_label.is_empty() { "batch" }
+                      else if snap.batch_label.starts_with("retry") { "retry" }
+                      else { snap.batch_label.as_str() };
+            put(scr, 0, w.saturating_sub(46), &format!("{} {}{}", lbl, hms(be), tag), Color::Cyan, w);
         }
         let bld = snap.disk_build_total;
         let arc = snap.disk_archive_total;

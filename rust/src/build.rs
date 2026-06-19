@@ -236,6 +236,9 @@ pub struct Orchestrator {
     // Batch timer: wall-clock from "Delete everything!" (RESET ALL) to when N-1 families reach a terminal
     // result — N-1, not N, so a single stuck family (e.g. an endless compile) can't hold the clock open.
     pub batch_start: Mutex<Option<f64>>,
+    // What the batch timer is currently measuring: "batch" for a full RESET-ALL run, or "retry: <cause>"
+    // (etc.) for a bulk retry. Surfaced in the snapshot so both UIs label the timer.
+    pub batch_label: Mutex<String>,
     pub batch_done: Mutex<Option<f64>>,
     pub python_auth: Mutex<PyAuth>, // T2: per-family/per-dep Python allow-list for python_policy=selective
     pub manage_venvs: AtomicBool,           // SETTING (live): build with cohort venvs (true) or the single build-python (false)
@@ -515,6 +518,7 @@ impl Orchestrator {
             job_limit: AtomicUsize::new(jobs),
             batch_start: Mutex::new(None),
             batch_done: Mutex::new(None),
+            batch_label: Mutex::new(String::new()),
             python_auth: Mutex::new(python_auth0),
             manage_venvs: AtomicBool::new(manage_venvs0),
             cfg_overrides: Mutex::new(std::collections::BTreeMap::new()),
@@ -1220,6 +1224,15 @@ impl Orchestrator {
     /// Live toggle: pre-upgrade format-2 `.glyphs` sources to format 3 before a builder3 build.
     fn upgrade_glyphs2(&self) -> bool {
         self.shared.lock().unwrap().upgrade_glyphs2
+    }
+
+    /// (Re)start the batch timer and label what it is measuring. `snapshot()` stamps the end the moment
+    /// N-1 families reach a terminal result, so restarting here lets a bulk retry (a whole failure
+    /// category, all-failed, the config-override set) be timed exactly like a fresh RESET-ALL run.
+    fn restart_batch_timer(&self, label: &str) {
+        *self.batch_start.lock().unwrap() = Some(now());
+        *self.batch_done.lock().unwrap() = None;
+        *self.batch_label.lock().unwrap() = label.to_string();
     }
 
     /// Whether THIS family may use Python (builder2, cohort venvs, Python pre-build) under the live policy.
@@ -2197,8 +2210,7 @@ impl Orchestrator {
         }
         // start the batch timer at RESET ALL activation (the user's chosen "start" point); cleared end
         // is stamped in snapshot() when N-1 families reach a terminal result.
-        *self.batch_start.lock().unwrap() = Some(now());
-        *self.batch_done.lock().unwrap() = None;
+        self.restart_batch_timer("batch");
         // 1) pause: the worker pool starts nothing new while paused (worker_loop's ready-gate checks it)
         {
             let mut sh = self.shared.lock().unwrap();
@@ -2597,15 +2609,39 @@ impl Orchestrator {
                     .filter(|r| r.status == "failed")
                     .map(|r| r.slug.clone())
                     .collect();
+                let mut n = 0;
                 for slug in failed {
                     if let Some(r) = sh.results.get_mut(&slug) {
                         r.status = "queued".into();
                         r.queued_kind = "retry".into();
                         r.error.clear();
                         sh.queue.push_front(slug); // requested retry → ahead of not-yet-built families
+                        n += 1;
                     }
                 }
+                if n > 0 { self.restart_batch_timer("retry: all failed"); }
                 log.push("retry ALL failed".into());
+            }
+            if let Some(cat) = &set.retry_category {
+                // Re-queue EVERY failed family in this failure category (the same categorize_failure cause
+                // the failures view groups by) — not just the capped 40 the UI lists. The batch timer is
+                // restarted so its elapsed measures this category-retry's total wall-clock.
+                let victims: Vec<String> = sh.results.values()
+                    .filter(|r| r.status == "failed" && crate::classify::categorize_failure(&r.error).0 == cat.as_str())
+                    .map(|r| r.slug.clone())
+                    .collect();
+                for slug in &victims {
+                    if let Some(r) = sh.results.get_mut(slug) {
+                        r.status = "queued".into();
+                        r.queued_kind = "retry".into();
+                        r.error.clear();
+                        sh.queue.push_front(slug.clone()); // requested retry → jump the queue
+                    }
+                }
+                if !victims.is_empty() {
+                    self.restart_batch_timer(&format!("retry: {}", cat));
+                }
+                log.push(format!("retry category '{}' — re-queued {} families", cat, victims.len()));
             }
             if set.retry_overrides == Some(true) {
                 // re-queue every FAILED family we've written a gflib-build override config.yaml for
@@ -2630,6 +2666,7 @@ impl Orchestrator {
                         }
                     }
                 }
+                if n > 0 { self.restart_batch_timer("retry: config-fixed"); }
                 log.push(format!("retry {} override-fixed families", n));
             }
             if set.repackage_all == Some(true) {
@@ -3520,6 +3557,7 @@ impl Orchestrator {
             *bd
         };
         let batch_elapsed = batch_start.map(|s| batch_done_val.unwrap_or_else(now) - s);
+        let batch_label = self.batch_label.lock().unwrap().clone();
         let (py_auth_families, py_auth_deps) = {
             let a = self.python_auth.lock().unwrap();
             let mut f: Vec<String> = a.families.iter().cloned().collect();
@@ -3532,6 +3570,7 @@ impl Orchestrator {
             elapsed: self.elapsed(),
             batch_elapsed,
             batch_complete: batch_done_val.is_some(),
+            batch_label,
             python_authorized_families: py_auth_families,
             python_authorized_deps: py_auth_deps,
             disk_used_delta: 0,
