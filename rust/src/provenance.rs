@@ -96,11 +96,17 @@ pub fn builder_version_str(builder: &str, python: &str, builder3_bin: Option<&st
                     String::from_utf8_lossy(&o.stdout),
                     String::from_utf8_lossy(&o.stderr)
                 );
-                let mut ver = if txt.trim().is_empty() {
-                    "builder3 (unknown version)".to_string()
-                } else {
-                    first_line(&txt)
-                };
+                let line = first_line(&txt);
+                let low = line.to_lowercase();
+                // gftools-builder v3.x has NO --version flag (only --verbose) → clap prints a usage/arg
+                // error. NEVER record that as the "version": it pollutes M0 provenance and, because it
+                // contains "error", hijacks the failure-line extraction so the real build error is hidden.
+                // Accept only a plausible version line; otherwise fall back to a clean name (+ src commit).
+                let is_version = !line.trim().is_empty()
+                    && !low.contains("error")
+                    && !low.contains("unexpected argument")
+                    && !low.contains("usage");
+                let mut ver = if is_version { line } else { "gftools-builder3".to_string() };
                 append_source_commit(bin, &mut ver);
                 return if ver.to_lowercase().contains("builder3") {
                     ver

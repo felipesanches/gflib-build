@@ -26,6 +26,14 @@ pub fn categorize_failure(error: &str) -> (&'static str, &'static str) {
             "the Rust-only policy refused a Python pre-build step — authorize Python for this family/dependency, or port the pre-build to shell or Rust",
         );
     }
+    if (low.contains("no such file or directory") || low.contains("permission denied"))
+        && (low.contains("failed to execute") || low.contains("taskset") || low.contains("/tools/"))
+    {
+        return (
+            "builder binary missing",
+            "the builder/compiler binary is missing or not runnable at its provisioned path — provision the Rust toolchain (it auto-installs to <data-dir>/tools/), or set --builder3-bin / --fontc-bin to a built binary, then retrigger",
+        );
+    }
     if low.contains("could not launch builder") || low.contains("no such file or directory: 'fontmake'") {
         return (
             "build launcher error",
@@ -257,6 +265,12 @@ mod tests {
         assert_eq!(categorize_failure("missing system library: libcairo").0, "missing system library");
         assert_eq!(categorize_failure("not in mirror: deadbeef").0, "stale archive mirror");
         assert_eq!(categorize_failure("kaboom").0, "other");
+        // a launcher/exec failure (missing or non-runnable builder binary) — the python_policy=off case
+        assert_eq!(categorize_failure(
+            "taskset: failed to execute /data/tools/builder3-cf74f20a99/bin/gftools-builder: No such file or directory").0,
+            "builder binary missing");
+        // …but a fontc error about a missing SOURCE file is NOT the launcher bucket
+        assert_ne!(categorize_failure("no such file or directory: sources/Foo.glif").0, "builder binary missing");
     }
     #[test]
     fn fontc_and_source_level_buckets() {

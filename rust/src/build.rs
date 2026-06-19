@@ -4102,6 +4102,18 @@ fn last_error_line(log_path: &Path) -> String {
         s.starts_with("FAILED:") || s.starts_with("ninja:") || s.starts_with("Command failed")
             || s.starts_with("Cleaning up") || s.starts_with("Done cleaning")
     };
+    // pass 0: a launcher/exec failure — the builder or compiler binary is missing or not runnable
+    // (e.g. "taskset: failed to execute …/gftools-builder: No such file or directory"). This means the
+    // build never started, so it IS the cause; surface it ahead of everything (it carries no keyword
+    // the later passes match, and would otherwise be lost to a stray earlier line).
+    for ln in txt.lines().rev() {
+        let s = ln.trim();
+        if (s.contains("No such file or directory") || s.contains("Permission denied"))
+            && (s.contains("failed to execute") || s.contains("taskset") || s.contains("/tools/"))
+        {
+            return clip(s);
+        }
+    }
     // pass 1: the actual fontc error message, or builder3's cyclic-graph report (most diagnostic)
     for ln in txt.lines().rev() {
         let s = ln.trim();
