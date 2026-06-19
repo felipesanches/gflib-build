@@ -194,6 +194,7 @@ pub struct Orchestrator {
     pub start_time: f64,
     pub resumed_elapsed: f64,
     pub active: AtomicUsize,
+    pub reset_all_running: AtomicBool, // a "delete everything" wipe is in progress — reject re-entry
     pub spawned: Mutex<usize>,
     pub venvs: Option<VenvManager>, // cohort venv manager (R2); None unless --manage-venvs
     pub build_rules: std::collections::HashMap<String, Vec<String>>, // per-family pre-build (R3)
@@ -440,6 +441,7 @@ impl Orchestrator {
             start_time: now(),
             resumed_elapsed: state.elapsed_so_far, // cumulative clock survives restart/migration (R1)
             active: AtomicUsize::new(0),
+            reset_all_running: AtomicBool::new(false),
             spawned: Mutex::new(0),
             venvs,
             build_rules,
@@ -704,6 +706,12 @@ impl Orchestrator {
         loop {
             if self.stop.load(Ordering::Relaxed) {
                 return;
+            }
+            // park while frozen (global pause / a "delete everything" wipe) so we don't recreate
+            // _summary.json under the deletion — mirrors the build/QA/package workers' freeze-gate
+            if self.frozen.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(500));
+                continue;
             }
             let (path, version) = match self.qa_bin.lock().unwrap().clone() {
                 Some(bv) => bv,
@@ -1692,6 +1700,11 @@ impl Orchestrator {
             actionable: bytes > 0, ..Default::default() // most portions: clickable iff there's something on disk
         };
         vec![
+            // the global nuke: stop jobs, pause, wipe the whole build dir + toolchain (NOT the archive)
+            ResetPortion { actionable: true,
+              ..p("all", "⚠ DELETE EVERYTHING — stop jobs · pause · wipe all build data",
+                  dir_size(bd).saturating_add(dir_size(&self.cfg.data_dir.join("tools"))),
+                  "stops every running job, pauses the build, then permanently deletes ALL build data — outputs, logs, venvs, packages, state, the provisioned toolchain — everything under the build dir plus data-dir/tools, EXCEPT the bare git repo archive (and the google/fonts clone). Every family resets to queued; the build stays PAUSED so you can resume to rebuild from scratch") },
             ResetPortion { actionable: fontc_bytes > 0 || fontc_reset_any,
               ..p("fonts-fontc", "font binaries built by fontc", fontc_bytes,
               "deletes fontc-built fonts (incl. builder3) + the logs of fontc-built AND fontc-failed families, re-queuing them all — both the built and the red failed bar segments regress (pause first if you don't want them rebuilt)") },
@@ -1725,6 +1738,23 @@ impl Orchestrator {
         let me = Arc::clone(self);
         thread::spawn(move || {
             me.shared.lock().unwrap().reset_notes.remove(&key); // fresh attempt → clear any old outcome
+            if key == "all" {
+                // the global "Delete everything!" button — its own stop→pause→wipe sequence
+                if me.cfg.dry_run {
+                    let now = me.elapsed();
+                    me.shared.lock().unwrap().reset_notes
+                        .insert("all".into(), ("⛔ disabled in --dry-run (the mockup never wipes the real build dir)".into(), now));
+                    return;
+                }
+                // re-entrancy guard: a double-click (or a stale control replay) must not start a second
+                // concurrent wipe racing the first. Held for the whole reset_everything run.
+                if me.reset_all_running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                    return; // a delete-everything is already in progress — ignore the duplicate
+                }
+                me.reset_everything();
+                me.reset_all_running.store(false, Ordering::SeqCst);
+                return;
+            }
             let bd = me.cfg.build_dir.clone();
 
             // what's actively in use right now — never deleted out from under a running build.
@@ -1922,6 +1952,146 @@ impl Orchestrator {
             sh.reset_notes.insert(key.clone(), (msg.clone(), now)); // lingers ~6 s
             sh.control_log.push(format!("reset {}: {}", key, msg));
         });
+    }
+
+    /// The global "Delete everything!" button (reset-tab key "all"): STOP every running job, PAUSE so the
+    /// pool starts nothing new, then WIPE all build data — outputs, logs, venvs, packages, state and the
+    /// provisioned toolchain (everything under the build dir except the daemon's own pid/control files,
+    /// plus data-dir/tools). The bare git repo archive and the google/fonts clone are NEVER touched. Every
+    /// family is reset to queued and the build stays PAUSED, so the user gets a clean slate to inspect and
+    /// can resume to rebuild from scratch. Runs in the reset thread (off the control watcher).
+    fn reset_everything(self: &Arc<Self>) {
+        let bd = self.cfg.build_dir.clone();
+        let tools = self.cfg.data_dir.join("tools");
+        // SAFETY GUARD: never wipe if the bare git archive (or the google/fonts clone) lives INSIDE the
+        // build dir — the one thing "delete everything" must never destroy. Mirrors the CLI run_reset guard.
+        // Refuse, leave everything intact (don't even pause).
+        {
+            let bdc = bd.canonicalize().unwrap_or_else(|_| bd.clone());
+            let inside = |p: &std::path::Path| {
+                p.canonicalize().map(|pc| pc == bdc || pc.starts_with(&bdc)).unwrap_or(false)
+            };
+            let blocked = if inside(&self.cfg.archive) {
+                Some("bare git repo archive")
+            } else if self.cfg.google_fonts.as_deref().map(|g| inside(g)).unwrap_or(false) {
+                Some("google/fonts clone")
+            } else {
+                None
+            };
+            if let Some(what) = blocked {
+                let now = self.elapsed();
+                let mut sh = self.shared.lock().unwrap();
+                let msg = format!("⛔ refused — the {} lives inside the build dir; move it first", what);
+                sh.reset_notes.insert("all".into(), (msg.clone(), now));
+                sh.control_log.push(format!("delete everything: {}", msg));
+                return;
+            }
+        }
+        // 1) pause: the worker pool starts nothing new while paused (worker_loop's ready-gate checks it)
+        {
+            let mut sh = self.shared.lock().unwrap();
+            sh.paused = true;
+            sh.reset_notes.insert("all".into(), ("stopping all running jobs…".into(), self.elapsed()));
+            sh.control_log.push("delete everything: pausing and stopping all running jobs…".into());
+        }
+        self.frozen.store(true, Ordering::Relaxed);
+        // 2) terminate every in-flight builder process group (thaw a frozen child first so it can die)
+        self.signal_running(SIGCONT);
+        self.signal_running(SIGKILL);
+        self.cond.notify_all();
+        // 3) DRAIN every worker pool that writes into the build dir — build (active / "building"), QA
+        //    (qa_active) and packaging (pkg_now). Paused/frozen ⇒ each parks at its next loop top and takes
+        //    no new work, so once these clear they stay clear. Bounded by a 60s deadline.
+        let busy = || {
+            self.active.load(Ordering::Relaxed) > 0 || {
+                let sh = self.shared.lock().unwrap();
+                sh.results.values().any(|r| r.status == "building")
+                    || !sh.qa_active.is_empty()
+                    || !sh.pkg_now.is_empty()
+            }
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while busy() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+        }
+        // If a job couldn't be stopped in time — a venv install / git clone in the build prologue isn't a
+        // registered process group, so SIGKILL can't reach it — REFUSE the wipe rather than delete out from
+        // under a live build (the CLI run_reset refuses-when-running for the same reason). Stay PAUSED so
+        // the user can retry once it settles; nothing was deleted and no results were reset.
+        if busy() {
+            let now = self.elapsed();
+            let mut sh = self.shared.lock().unwrap();
+            let msg = "⛔ couldn't stop all jobs within 60s (a venv install or clone is in flight) — nothing deleted; still PAUSED, click again once it settles".to_string();
+            sh.reset_notes.insert("all".into(), (msg.clone(), now));
+            sh.control_log.push(format!("delete everything: {}", msg));
+            return;
+        }
+        // 4) reset the in-memory worklist to pristine queued (bar regresses to 0 built / 0 failed)
+        {
+            let mut sh = self.shared.lock().unwrap();
+            let slugs: Vec<String> = sh.results.keys().cloned().collect();
+            sh.queue.clear();
+            for slug in &slugs {
+                if let Some(r) = sh.results.get_mut(slug) {
+                    r.status = "queued".into();
+                    r.queued_kind = "rebuild".into();
+                    r.error.clear();
+                }
+                sh.queue.push_back(slug.clone());
+            }
+            sh.packaged.clear();
+            sh.cached_cohorts.clear(); // the venvs are about to be deleted; recreated on demand from cohort_reqs
+            // the fontspector/ results are about to be wiped — clear the QA de-dup set + queue so rebuilt
+            // families are re-QA'd this session (else enqueue_qa skips anything still in qa_done)
+            sh.qa_done.clear();
+            sh.qa_queue.clear();
+            sh.fontspector = None;
+        }
+        // 5) wipe disk (off-lock — can be many GB). `total` freezes the live progress bar's denominator.
+        let total = dir_size(&bd).saturating_add(dir_size(&tools));
+        self.shared.lock().unwrap().reset_progress.insert("all".into(), (0, total));
+        let mut freed = 0u64;
+        let me2 = Arc::clone(self);
+        let mut last_pub = std::time::Instant::now();
+        let mut publish = move |fr: u64| {
+            if last_pub.elapsed() >= Duration::from_millis(200) {
+                last_pub = std::time::Instant::now();
+                me2.shared.lock().unwrap().reset_progress.insert("all".into(), (fr, total));
+            }
+        };
+        // every entry under the build dir EXCEPT the daemon's own operational files (pid/control), which
+        // the still-running daemon needs; logs/ is recreated empty afterwards (every build needs it).
+        if let Ok(entries) = std::fs::read_dir(&bd) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name == "daemon.pid" || name == "control.json" {
+                    continue;
+                }
+                let p = e.path();
+                if p.is_dir() {
+                    remove_tree_progress(&p, &mut freed, &mut publish);
+                } else if let Ok(m) = std::fs::metadata(&p) {
+                    freed += m.len();
+                    let _ = std::fs::remove_file(&p);
+                    publish(freed);
+                }
+            }
+        }
+        if tools.is_dir() {
+            remove_tree_progress(&tools, &mut freed, &mut publish);
+        }
+        let _ = std::fs::create_dir_all(bd.join("logs"));
+        // 6) persist the cleared state, refresh sizes, leave PAUSED (do NOT resume)
+        self.save_state();
+        let portions = self.compute_reset_portions();
+        let now = self.elapsed();
+        let mut sh = self.shared.lock().unwrap();
+        sh.reset_progress.remove("all");
+        sh.reset_portions = portions;
+        let msg = format!("✓ deleted everything (freed {}) — PAUSED; resume to rebuild from scratch (archive kept)",
+            crate::util::human(freed));
+        sh.reset_notes.insert("all".into(), (msg.clone(), now));
+        sh.control_log.push(format!("delete everything: {}", msg));
     }
 
     /// Content signature of the gflib-build override config.yaml (+ this family's build_rules entry) for
@@ -2289,6 +2459,7 @@ impl Orchestrator {
                 return;
             }
             if self.frozen.load(Ordering::Relaxed) {
+                self.shared.lock().unwrap().pkg_now.clear(); // parked: not packaging — keep pkg_now honest
                 thread::sleep(Duration::from_millis(300)); // paused: also pause packaging
                 continue;
             }
@@ -3669,6 +3840,18 @@ fn run_builder(
     if let Some(t) = timeout {
         let mut deadline = std::time::Instant::now() + Duration::from_secs(t);
         loop {
+            // ALWAYS reap first: a child that exited — including one SIGKILLed while frozen (e.g. by
+            // "delete everything") — must be observed promptly so the worker returns and the drain
+            // completes. (Previously the frozen branch `continue`d without try_wait, so a kill while
+            // frozen was never reaped and the build hung.)
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    running.lock().unwrap().remove(pgid); // exited+reaped → deregister before returning
+                    return if st.success() { Ok(()) } else { Err(last_error_line(log_path)) };
+                }
+                Ok(None) => {} // still running — fall through to freeze / deadline handling
+                Err(e) => return Err(format!("wait: {}", e)),
+            }
             // frozen time — by a global pause OR by the job limit (this build's own freeze flag) — must
             // not count toward the deadline, else a long freeze would spuriously time the build out.
             if frozen.load(Ordering::Relaxed) || running.lock().unwrap().is_frozen(pgid) {
@@ -3676,22 +3859,13 @@ fn run_builder(
                 deadline += Duration::from_millis(300); // don't count frozen time
                 continue;
             }
-            match child.try_wait() {
-                Ok(Some(st)) => {
-                    running.lock().unwrap().remove(pgid); // exited+reaped → deregister before returning
-                    return if st.success() { Ok(()) } else { Err(last_error_line(log_path)) };
-                }
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        signal_group(pgid, SIGKILL); // kill the whole group, then reap
-                        let _ = child.wait();
-                        running.lock().unwrap().remove(pgid);
-                        return Err(format!("timed out after {}s", t));
-                    }
-                    thread::sleep(Duration::from_millis(300));
-                }
-                Err(e) => return Err(format!("wait: {}", e)),
+            if std::time::Instant::now() >= deadline {
+                signal_group(pgid, SIGKILL); // kill the whole group, then reap
+                let _ = child.wait();
+                running.lock().unwrap().remove(pgid);
+                return Err(format!("timed out after {}s", t));
             }
+            thread::sleep(Duration::from_millis(300));
         }
     } else {
         // no timeout: wait() blocks until exit; a frozen child simply keeps the worker parked here

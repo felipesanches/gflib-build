@@ -401,6 +401,14 @@ function resetView(){
     '<div class="barwrap" style="max-width:46em"><div class="seg rg" style="width:'+pct+'%"></div><div class="seg dg" style="width:'+(100-pct)+'%"></div>'+
     '<div class="barlbl">'+human(fr)+' / '+human(tot)+' deleted ('+pct+'%)</div></div></div>';
   }
+  if(p.key=='all'){
+   // the global nuke — danger-styled, behind a confirm (the only reset-tab action that asks)
+   const note=p.note?'<span class="'+(p.note.indexOf('⛔')==0?'r':'g')+'"> — '+E(p.note)+'</span>':'';
+   return '<div class="ln" style="margin:4px 0 10px">'+
+     '<button class="btn" style="background:#b91c1c;border-color:#b91c1c;color:#fff;font-weight:600" onclick="if(confirm(\'Delete EVERYTHING? This STOPS all running jobs, PAUSES the build, and permanently deletes ALL build data (outputs, logs, venvs, packages, state, toolchain) — only the bare git repo archive is kept. Every family resets to queued. Continue?\'))resetPortion(\'all\',\'all\','+p.bytes+')">⚠ Delete everything!</button>  '+
+     '<span class="y">'+human(p.bytes)+'</span>'+note+
+     '<br><span class="muted" style="margin-left:1em">'+E(p.hint)+'</span></div>';
+  }
   // enable on 'actionable' (frees disk / deletes a log / resets a result), not raw bytes — so a font
   // portion stays clickable when only logs or 'built' results remain. Fall back to bytes for old snapshots.
   const dis=(p.actionable===undefined)?(p.bytes==0):!p.actionable;

@@ -546,10 +546,17 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
                         if !ui.detail_lines.is_empty() { ui.dscroll = 0; ui.detail = true; }
                     }
                     // reset tab: D deletes the selected portion immediately (no overlay/confirm —
-                    // matches the web button; outcome shows on the row as a bar then '✓ freed X')
+                    // matches the web button; outcome shows on the row as a bar then '✓ freed X').
+                    // EXCEPT the global "all" nuke: it requires the deliberate detail-overlay confirm
+                    // (open the warning; D again there fires it) so a stray keypress never wipes everything.
                     KeyCode::Char('d') | KeyCode::Char('D') if TABS.get(ui.tab) == Some(&"reset") => {
                         if let Some(p) = snap.reset_portions.get(ui.sel) {
-                            source.control(&ControlSet { reset_portion: Some(p.key.clone()), ..Default::default() });
+                            if p.key == "all" {
+                                ui.detail_lines = build_detail(&snap, ui.tab, ui.section, ui.sel, ui.fc_sel, &source.build_dir());
+                                if !ui.detail_lines.is_empty() { ui.dscroll = 0; ui.detail = true; }
+                            } else {
+                                source.control(&ControlSet { reset_portion: Some(p.key.clone()), ..Default::default() });
+                            }
                         }
                     }
                     KeyCode::Char('p') | KeyCode::Char('P') => {
@@ -1947,14 +1954,22 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
                 o.push(format!(" reset: {}", p.label));
                 o.push(format!("   on disk now: {}", crate::util::human(p.bytes)));
                 o.push(format!("   {}", p.hint));
-                if p.key.starts_with("fonts-") {
+                if p.key == "all" {
+                    o.push("   ⚠ GLOBAL NUKE: stops all running jobs, PAUSES the build, then deletes ALL".into());
+                    o.push("   build data + the provisioned toolchain. ONLY the bare git repo archive (and".into());
+                    o.push("   the google/fonts clone) survive. Every family resets to queued.".into());
+                    o.push(String::new());
+                    o.push("   ▶ press D again to DELETE EVERYTHING — then resume to rebuild from scratch".into());
+                } else if p.key.starts_with("fonts-") {
                     o.push("   the bare git archive is never touched; deleting these fonts re-queues".into());
                     o.push("   those families (build RESULTS reset to queued → the progress bar regresses)".into());
+                    o.push(String::new());
+                    o.push("   ▶ press D to DELETE now — items in use by a running build are kept, the rest are deleted".into());
                 } else {
                     o.push("   the repo archive, google/fonts clone and build RESULTS are never touched".into());
+                    o.push(String::new());
+                    o.push("   ▶ press D to DELETE now — items in use by a running build are kept, the rest are deleted".into());
                 }
-                o.push(String::new());
-                o.push("   ▶ press D to DELETE now — items in use by a running build are kept, the rest are deleted".into());
             }
             return o;
         }
