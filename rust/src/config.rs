@@ -83,7 +83,8 @@ impl Default for Config {
             backend: "auto".into(),
             orchestrator: "auto".into(),
             python_policy: "on".into(), // default: today's full pipeline; set "off" for the Rust-only baseline
-            upgrade_glyphs2: true, // auto-convert format-2 .glyphs to 3 on the fly for builder3
+            upgrade_glyphs2: false, // SUPERSEDED by babelfont's in-memory v2 upgrade (builder3 >= 9ff670f);
+                                    // the on-disk rewrite caused fontc ParseFloat/STAT regressions — keep off
             fontc_bin: None,
             builder3_bin: None,
             auto_provision: true,

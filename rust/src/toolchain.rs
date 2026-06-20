@@ -42,7 +42,7 @@ pub const FONTC_GIT: &str = "https://github.com/googlefonts/fontc";
 /// Pinned gftools-builder3 revision (no crates.io release exists — git deps), installed with
 /// `cargo install --git … --rev … --locked` using the repo's committed Cargo.lock.
 pub const BUILDER3_GIT: &str = "https://github.com/simoncozens/gftools-builder3";
-pub const BUILDER3_REV: &str = "cf74f20a995a9cff78e1a9e3cd8303caf0ae25d4";
+pub const BUILDER3_REV: &str = "9ff670f69bd6e6025697214d651cc7907588bf93";
 /// builder3's package + binary name (its Cargo.toml: package "gftools-builder", version 3.x).
 pub const BUILDER3_PKG: &str = "gftools-builder";
 
@@ -158,8 +158,9 @@ pub fn builder3_spec() -> ToolSpec {
         bin_name: BUILDER3_PKG,
         pin: BUILDER3_REV[..10.min(BUILDER3_REV.len())].into(),
         install: InstallSource::Git { url: BUILDER3_GIT.into(), rev: BUILDER3_REV.into(), package: BUILDER3_PKG },
-        // the cf74f20 lockfile pins ascii-dag 0.4.2, whose rust-version is 1.92 (verified
-        // empirically: rustc 1.91.1 fails the install). Re-derive when bumping BUILDER3_REV.
+        // 1.92 floor carried from cf74f20 (ascii-dag 0.4.2 needs rust-version 1.92). The 9ff670f lockfile
+        // bumps the dep set (babelfont 5f125b0 with the v2 fix, glyphslib 0.2.7, fontc d62ba01) — re-derive
+        // the true MSRV from the first host build and raise this if cargo reports a higher requirement.
         min_rustc: Some("1.92"),
     }
 }

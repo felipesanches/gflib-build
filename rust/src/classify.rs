@@ -386,7 +386,7 @@ mod tests {
         assert_eq!(categorize_failure("kaboom").0, "other");
         // a launcher/exec failure (missing or non-runnable builder binary) — the python_policy=off case
         assert_eq!(categorize_failure(
-            "taskset: failed to execute /data/tools/builder3-cf74f20a99/bin/gftools-builder: No such file or directory").0,
+            "taskset: failed to execute /data/tools/builder3-9ff670f69b/bin/gftools-builder: No such file or directory").0,
             "builder binary missing");
         // ---- the new builder3 R0 buckets (split out of the generic "builder3 error") ----
         assert_eq!(categorize_failure("builder3: recipe is not valid: failed to load source sources/X.glyphs: wrong convertor for file \"sources/X.glyphs\"").0, "builder3: unsupported source format");
