@@ -441,7 +441,6 @@ pub struct ControlSet {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub orchestrator: Option<String>, // auto|builder3|builder2 (live)
     #[serde(default, skip_serializing_if = "Option::is_none")] pub python_policy: Option<String>, // off|selective|on (live) — Rust-only build mode
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub upgrade_glyphs2: Option<bool>, // pre-upgrade .glyphs v2→v3 for builder3 (live)
     #[serde(default, skip_serializing_if = "Option::is_none")] pub compare: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_all: Option<bool>,

@@ -62,7 +62,6 @@ pub struct Shared {
     pub backend: String,
     pub orchestrator: String, // SETTING (live): auto | builder3 | builder2 — drives attempt_chain
     pub python_policy: String, // SETTING (live): off | selective | on — Rust-only build mode (no Python when off)
-    pub upgrade_glyphs2: bool, // SETTING (live): pre-upgrade format-2 .glyphs to format 3 for builder3 (babelfont WrongConvertor workaround)
     pub compare: bool,
     pub cver_cache: HashMap<(String, String), String>,
     pub bver_cache: HashMap<(String, String), String>,
@@ -433,7 +432,6 @@ impl Orchestrator {
             backend: cfg.backend.clone(),
             orchestrator: cfg.orchestrator.clone(),
             python_policy: cfg.python_policy.clone(),
-            upgrade_glyphs2: cfg.upgrade_glyphs2,
             compare: cfg.compare,
             cver_cache: HashMap::new(),
             bver_cache: HashMap::new(),
@@ -1221,11 +1219,6 @@ impl Orchestrator {
         self.shared.lock().unwrap().python_policy.clone()
     }
 
-    /// Live toggle: pre-upgrade format-2 `.glyphs` sources to format 3 before a builder3 build.
-    fn upgrade_glyphs2(&self) -> bool {
-        self.shared.lock().unwrap().upgrade_glyphs2
-    }
-
     /// (Re)start the batch timer and label what it is measuring. `snapshot()` stamps the end the moment
     /// N-1 families reach a terminal result, so restarting here lets a bulk retry (a whole failure
     /// category, all-failed, the config-override set) be timed exactly like a fresh RESET-ALL run.
@@ -1552,16 +1545,6 @@ impl Orchestrator {
             if let Err(e) = self.timed(slug, "extract", || extract_tree(&mirror, &fam.commit, &work, EXTRACT_TIMEOUT, &log_path)) {
                 last_err = e;
                 continue;
-            }
-            // On-the-fly Glyphs v2→v3 upgrade (builder3 only): babelfont-rs rejects format-2 .glyphs as
-            // WrongConvertor (it never calls glyphslib upgrade()). Pre-upgrading the throwaway extract lets
-            // those families build under builder3+fontc with no Python — the stand-in for the babelfont PR.
-            // builder2/fontmake handle format 2 natively, so we leave their (re-extracted) sources untouched.
-            if builder == "builder3" && self.upgrade_glyphs2() {
-                let n = self.timed(slug, "glyphs-upgrade", || upgrade_glyphs2_sources(&work, &log_path));
-                if n > 0 {
-                    log_line(&log_path, &format!("glyphs-upgrade: upgraded {} Glyphs source(s) format 2 → 3", n));
-                }
             }
             // registered pre-build commands (generate/pre-compile sources) — run AFTER extraction
             // (so they survive the per-backend re-extract) and BEFORE the builder. (R3 / parity)
@@ -2496,11 +2479,6 @@ impl Orchestrator {
                 persist.insert("compare".into(), serde_json::json!(c));
                 log.push(format!("compare → {}", if c { "on" } else { "off" }));
             }
-            if let Some(u) = set.upgrade_glyphs2 {
-                sh.upgrade_glyphs2 = u;
-                persist.insert("upgrade_glyphs2".into(), serde_json::json!(u));
-                log.push(format!("upgrade .glyphs v2→v3 → {}", if u { "on" } else { "off" }));
-            }
             if let Some(b) = set.build_debs {
                 sh.build_debs = b;
                 persist.insert("build_debs".into(), serde_json::json!(b));
@@ -3021,7 +2999,6 @@ impl Orchestrator {
         // NOTE: --percent is intentionally omitted — re-narrowing the sample on restart would drop families
         // (and their state.json results) the live session already admitted. percent stays per-session.
         v.push(if sh.compare { "--compare" } else { "--no-compare" }.into());
-        v.push(if sh.upgrade_glyphs2 { "--upgrade-glyphs2" } else { "--no-upgrade-glyphs2" }.into());
         v.push(if sh.build_debs { "--build-debs" } else { "--no-build-debs" }.into());
         // cohort venvs (live) — its current atomic value
         v.push(if self.manage_venvs.load(Ordering::Relaxed) { "--manage-venvs" } else { "--no-manage-venvs" }.into());
@@ -3646,7 +3623,6 @@ impl Orchestrator {
                 c.insert("backend".into(), serde_json::json!(sh.backend));
                 c.insert("orchestrator".into(), serde_json::json!(sh.orchestrator));
                 c.insert("python_policy".into(), serde_json::json!(sh.python_policy));
-                c.insert("upgrade_glyphs2".into(), serde_json::json!(sh.upgrade_glyphs2));
                 c.insert("compare".into(), serde_json::json!(sh.compare));
                 c.insert("manage_venvs".into(), serde_json::json!(self.manage_venvs.load(Ordering::Relaxed)));
                 c
@@ -3859,53 +3835,6 @@ fn translate_override_for_builder3(yaml_text: &str) -> Option<String> {
     out.push_str(&format!("buildVariable: {}\n", variable));
     out.push_str(&format!("buildWebfont: {}\n", webfont));
     Some(out)
-}
-
-/// Upgrade one `.glyphs`/`.glyphspackage` source from Glyphs format 2 to format 3 in place.
-/// Returns `Ok(true)` if it was a format-2 file and was rewritten, `Ok(false)` if already format 3.
-///
-/// Uses glyphslib's `Font::upgrade()` — the exact crate+version (0.2.4) babelfont depends on — so the
-/// result is identical to what an upstream babelfont "fall back to `upgrade()` when `as_glyphs3()` is
-/// None" fix would feed its loader. This is the on-the-fly stand-in that lets us measure the win before
-/// committing to that PR.
-fn upgrade_one_glyphs(path: &Path) -> Result<bool, String> {
-    let font = glyphslib::Font::load(path).map_err(|e| e.to_string())?;
-    if font.as_glyphs3().is_some() {
-        return Ok(false); // already format 3 — nothing to do
-    }
-    font.upgrade().save(path).map_err(|e| e.to_string())?;
-    Ok(true)
-}
-
-/// Recursively upgrade every Glyphs format-2 source under `work` to format 3, in place.
-///
-/// `work` is a throwaway `git archive` extract, so rewriting sources never touches the repo archive.
-/// This is the workaround for builder3's dominant Rust-only failure: babelfont-rs returns
-/// `WrongConvertor` for format-2 `.glyphs` files because it never calls glyphslib's `upgrade()`.
-/// Pre-upgrading the sources here makes those families build under builder3+fontc with no Python.
-/// Per-file failures are logged and skipped (the family then fails as it would have, correctly
-/// classified). Returns the number of files upgraded.
-fn upgrade_glyphs2_sources(work: &Path, log_path: &Path) -> usize {
-    fn visit(dir: &Path, log_path: &Path, count: &mut usize) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            let ext = path.extension().and_then(|e| e.to_str());
-            if ext == Some("glyphs") || ext == Some("glyphspackage") {
-                // both a .glyphs file and a .glyphspackage directory are loadable units, not dirs to descend
-                match upgrade_one_glyphs(&path) {
-                    Ok(true) => *count += 1,
-                    Ok(false) => {}
-                    Err(e) => log_line(log_path, &format!("glyphs-upgrade: skipped {} ({})", path.display(), e)),
-                }
-            } else if path.is_dir() {
-                visit(&path, log_path, count);
-            }
-        }
-    }
-    let mut count = 0;
-    visit(work, log_path, &mut count);
-    count
 }
 
 /// Resolve the gftools-builder config: a google/fonts override, else the in-repo config_yaml, else
@@ -4919,38 +4848,6 @@ recipe:
         let srcs: Vec<String> = v.get("sources").unwrap().as_sequence().unwrap().iter()
             .map(|s| s.as_str().unwrap().to_string()).collect();
         assert_eq!(srcs, vec!["sources/Foo.glyphs", "sources/Foo-Italic.glyphs"]);
-    }
-
-    #[test]
-    fn upgrade_glyphs2_sources_upgrades_v2_recursively_and_leaves_others() {
-        let root = std::env::temp_dir().join(format!("_g2to3_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("sources/sub")).unwrap();
-        // two format-2 sources (no .formatVersion), one nested; minimal but valid Glyphs2
-        let v2 = "{\n.appVersion = \"1302\";\nfamilyName = \"TestV2\";\nunitsPerEm = 1000;\n}\n";
-        std::fs::write(root.join("sources/Test.glyphs"), v2).unwrap();
-        std::fs::write(root.join("sources/sub/Nested.glyphs"), v2).unwrap();
-        // an already-format-3 source must not be rewritten
-        let v3 = "{\n.appVersion = \"1302\";\n.formatVersion = 3;\nfamilyName = \"AlreadyV3\";\nunitsPerEm = 1000;\n}\n";
-        std::fs::write(root.join("sources/Already.glyphs"), v3).unwrap();
-        // a non-glyphs file must be untouched
-        let readme = "not a glyphs file";
-        std::fs::write(root.join("README.md"), readme).unwrap();
-        let log = root.join("build.log");
-
-        let n = upgrade_glyphs2_sources(&root, &log);
-        assert_eq!(n, 2, "exactly the two format-2 sources should be upgraded");
-        // the upgraded files now carry .formatVersion (parse as Glyphs3)
-        for f in ["sources/Test.glyphs", "sources/sub/Nested.glyphs"] {
-            let font = glyphslib::Font::load(&root.join(f)).expect("reloads");
-            assert!(font.as_glyphs3().is_some(), "{f} should now be format 3");
-        }
-        // already-v3 and non-glyphs files are byte-unchanged
-        assert_eq!(std::fs::read_to_string(root.join("sources/Already.glyphs")).unwrap(), v3);
-        assert_eq!(std::fs::read_to_string(root.join("README.md")).unwrap(), readme);
-        // idempotent: a second pass upgrades nothing
-        assert_eq!(upgrade_glyphs2_sources(&root, &log), 0, "second pass is a no-op");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

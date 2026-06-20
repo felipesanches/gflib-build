@@ -13,7 +13,6 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
-glyphslib = "0.2.7"
 crossterm = "0.29"
 
 [profile.release]
