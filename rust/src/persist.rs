@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 pub fn status_path(build_dir: &Path) -> PathBuf { build_dir.join("status.json") }
 /// Directory holding fontspector QA results: per-family <slug__>.json + _summary.json (the aggregate).
 pub fn fontspector_dir(build_dir: &Path) -> PathBuf { build_dir.join("fontspector") }
+/// Directory holding diffenator3 vs-shipped results: per-family <slug__>.json + _summary.json.
+pub fn diffenator3_dir(build_dir: &Path) -> PathBuf { build_dir.join("diffenator3") }
 
 /// Read the fontspector aggregate (build_dir/fontspector/_summary.json) for the breakdown panels.
 pub fn read_fontspector_summary(build_dir: &Path) -> Option<FontspectorView> {

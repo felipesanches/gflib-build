@@ -340,7 +340,7 @@ let snap={}, tab='overview';
 // wins and nothing is pinned stale.
 let OPT={};
 // tab order MUST match the TUI's VIEWS
-const TABS=['config','overview','queue','cohorts','archive','built','packaging','tools','failures','stats','fontspector','crater','reset'];
+const TABS=['config','overview','queue','cohorts','archive','built','packaging','tools','failures','stats','fontspector','diff','crater','reset'];
 // colour a fontc_crater verdict token (magenta = fontc can't build it — the gold pairing on our built rows)
 function craterCol(tok){if(!tok)return 'muted';if(tok=='fontc-fail'||tok=='both-fail'||tok=='src-miss')return 'm';if(tok=='fmake-fail')return 'muted';if(tok[0]=='~')return 'y';return 'c'}
 // readable label for the fontc_crater verdict (was the cryptic "cr:<token>")
@@ -373,6 +373,7 @@ const SCHEMA=[
  {k:'auto_upgrade',l:'auto-upgrade built families (better backend)',t:'bool',live:false},
  {k:'compare',l:'compare to shipped',t:'bool',live:true},
  {k:'fontspector_qa',l:'fontspector QA on green builds',t:'bool',live:false},
+ {k:'diffenator',l:'diffenator3 diff vs shipped',t:'bool',live:false},
  {k:'build_debs',l:'build .deb packages (auto-package built families)',t:'bool',live:true},
 ];
 function human(n){n=n||0;const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return (i?n.toFixed(1):n)+u[i]}
@@ -602,6 +603,15 @@ function fsView(){const fs=snap.fontspector;
  }
  return h;
 }
+function diffView(){const d=snap.diffenator;
+ if(!d)return '<div class="sec">diffenator3 — built vs shipped</div><div class="ln muted">No diff results yet. Enable "diffenator3 diff vs shipped" in the config tab + restart (needs a --google-fonts clone), then refresh.</div>';
+ let h='<div class="sec">Built vs shipped — '+d.families_checked+' checked · <span class="g">'+(d.identical||0)+' identical</span> · <span class="o">'+(d.differs||0)+' differ</span> · <span class="muted">'+(d.errored||0)+' n/a</span></div>';
+ const fams=filterList(d.families||[],['slug','summary']);
+ if(!fams.length)return h+'<div class="ln muted">(no families match)</div>';
+ h+=fams.map(f=>{const cls=f.status=='identical'?'g':(f.status=='differs'?'o':'muted');
+   return '<div class="ln"><span class="'+cls+'">'+E(L(f.slug,40))+'</span> <span class="muted">'+E(f.summary||f.status)+'</span></div>';}).join('');
+ return h;
+}
 function fsFamLink(slug){return '<span class="clk c" onclick="event.stopPropagation();openDetail(\'fsfamily\',\''+E(slug)+'\')">'+E(slug)+'</span>'}
 function toggleFsCheck(i){const e=document.getElementById('fsck'+i);if(e)e.style.display=e.style.display=='none'?'block':'none'}
 
@@ -635,13 +645,13 @@ const CHOICES={source:['metadata','archive'],backend:['auto','fontc','fontmake',
 const LIVE_APPLY={backend:1,orchestrator:1,python_policy:1,jobs:1,percent:1,compare:1,build_debs:1,manage_venvs:1};
 // settings read once at launch (paths / worklist source / toolchain / startup re-queue behaviours):
 // editable, but the edit is recorded and applied on the next daemon restart (↻), never mid-run.
-const RESTART_KEYS={source:1,google_fonts:1,archive:1,build_dir:1,fontc_bin:1,auto_provision:1,auto_upgrade:1,retry_failed:1,fontspector_qa:1};
+const RESTART_KEYS={source:1,google_fonts:1,archive:1,build_dir:1,fontc_bin:1,auto_provision:1,auto_upgrade:1,retry_failed:1,fontspector_qa:1,diffenator:1};
 // logical groupings for the config panel (related settings under one sub-header)
 const GROUPS=[
  {t:'Sources & paths', k:['source','google_fonts','archive','build_dir']},
  {t:'Build engine',    k:['backend','orchestrator','python_policy','fontc_bin','auto_provision','manage_venvs','jobs','timeout']},
  {t:'Scope',           k:['percent','retry_failed','auto_upgrade','populate_archive']},
- {t:'QA & packaging',  k:['compare','fontspector_qa','build_debs']},
+ {t:'QA & packaging',  k:['compare','fontspector_qa','diffenator','build_debs']},
 ];
 // one form control per field: live → an editable widget that posts straight to control.json;
 // otherwise a real (greyed) widget that shows the current value but isn't editable on a running build.
@@ -715,7 +725,7 @@ function render(){
  //      user is typing in the filter, so the live sync never steals focus from it. No refresh-rate
  //      knob: the page refreshes automatically (see the W5 polling block). ----
  {
-  const listTab=['overview','queue','cohorts','built','failures','fontspector'].includes(tab);
+  const listTab=['overview','queue','cohorts','built','failures','fontspector','diff'].includes(tab);
   const notifyBtn=(window.Notification&&Notification.permission!='granted')?' <button class="tbtn" onclick="askNotify()" title="notify when the build completes">🔔 notify</button>':'';
   setHTML('ctl',
     '<button title="pause scheduling AND freeze (SIGSTOP) running builds to free CPU/RAM" onclick="ctl({paused:true})"'+(snap.paused?' disabled':'')+'>pause</button> '+
@@ -742,6 +752,7 @@ function render(){
  if(tab=='config')body+=cfgView();
  else if(tab=='archive')body+=archiveView();
  else if(tab=='fontspector')body+=fsView();
+ else if(tab=='diff')body+=diffView();
  else if(tab=='crater')body+=craterView();
  else if(tab=='packaging')body+=packagingView();
  else if(tab=='reset')body+=resetView();

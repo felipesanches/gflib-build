@@ -56,6 +56,7 @@ pub struct Config {
     pub fontspector_bin: Option<PathBuf>,   // explicit binary (else cargo-install the pinned version)
     pub fontspector_rerun: bool,            // re-QA families that already have a result (default: skip them)
     pub fontspector_qa: bool,               // SETTING: run QA asynchronously during the build (green families, niced)
+    pub diffenator: bool,                   // SETTING: diff each built family vs the shipped font (diffenator3-lib, async)
     pub build_debs: bool,                   // SETTING: build+validate .deb packages during --export-deb (default off)
     pub yes: bool,
     pub dry_run: bool,         // MOCKUP: replay a previous session's outcomes (no real clone/venv/compile/QA)
@@ -112,6 +113,7 @@ impl Default for Config {
             fontspector_bin: None,
             fontspector_rerun: false,
             fontspector_qa: false,
+            diffenator: false,
             build_debs: false,
             yes: false,
             dry_run: false,
@@ -255,6 +257,8 @@ pub fn parse(args: &[String]) -> Parsed {
             "--fontspector" => cfg.fontspector_qa = true,
             "--fontspector-pass" => mode = Mode::Fontspector,
             "--no-fontspector" => cfg.fontspector_qa = false,
+            "--diffenator" => cfg.diffenator = true,
+            "--no-diffenator" => cfg.diffenator = false,
             "--build-debs" => cfg.build_debs = true,
             "--no-build-debs" => cfg.build_debs = false,
             "--fontspector-version" => cfg.fontspector_version = next(&mut i, a),
@@ -305,6 +309,7 @@ fn merge_persisted(cfg: &mut Config, loaded: &BTreeMap<String, serde_json::Value
             "compare" => if let Some(x) = v.as_bool() { cfg.compare = x },
             "manage_venvs" => if let Some(x) = v.as_bool() { cfg.manage_venvs = x },
             "fontspector_qa" => if let Some(x) = v.as_bool() { cfg.fontspector_qa = x },
+            "diffenator" => if let Some(x) = v.as_bool() { cfg.diffenator = x },
             "build_debs" => if let Some(x) = v.as_bool() { cfg.build_debs = x },
             // NOTE: 'ui' is deliberately NOT loaded — it's a per-invocation choice, not a saved
             // preference. (A prior `--ui none` must never silence a later interactive run.)
@@ -338,6 +343,7 @@ pub fn save_config(cfg: &Config) {
     m.insert("compare".into(), json!(cfg.compare));
     m.insert("manage_venvs".into(), json!(cfg.manage_venvs));
     m.insert("fontspector_qa".into(), json!(cfg.fontspector_qa));
+    m.insert("diffenator".into(), json!(cfg.diffenator));
     m.insert("build_debs".into(), json!(cfg.build_debs));
     // 'ui' is intentionally NOT persisted (per-invocation choice — see merge_persisted).
     m.insert("web_port".into(), json!(cfg.web_port));
@@ -416,6 +422,7 @@ pub fn config_map(cfg: &Config) -> BTreeMap<String, serde_json::Value> {
     m.insert("retry_failed".into(), json!(cfg.retry_failed));
     m.insert("compare".into(), json!(cfg.compare));
     m.insert("fontspector_qa".into(), json!(cfg.fontspector_qa));
+    m.insert("diffenator".into(), json!(cfg.diffenator));
     m.insert("build_debs".into(), json!(cfg.build_debs));
     m
 }

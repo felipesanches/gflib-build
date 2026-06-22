@@ -13,6 +13,7 @@ mod daemon;
 mod deb;
 mod discover;
 mod fontspector;
+mod diffenator3;
 mod mirror;
 mod model;
 mod monitor;

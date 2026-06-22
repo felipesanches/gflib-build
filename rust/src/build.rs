@@ -88,6 +88,11 @@ pub struct Shared {
     pub packaged: HashSet<String>,            // families already packaged this session (de-dup; cleared on rebuild)
     pub pkg_now: String,                      // package worker's current activity ("packaging <slug>" / "linting <slug>" / "")
     pub fontspector: Option<crate::model::FontspectorView>, // live aggregate (also written to _summary.json)
+    pub diff_queue: VecDeque<String>,         // built families awaiting diffenator3 vs-shipped diff
+    pub diff_active: Vec<String>,             // families being diffed right now
+    pub diff_done: HashSet<String>,           // families diffed this run (de-dup)
+    pub diff_init: bool,                      // diff subsystem ready (queue seeded, or disabled)
+    pub diffview: Option<crate::model::DiffView>, // live diff aggregate (also written to _summary.json)
     // cohort map (R1: preserved across resume/migration; populated by R2's VenvManager later)
     pub cohort_members: BTreeMap<String, Vec<String>>,
     pub cohort_reqs: BTreeMap<String, String>,
@@ -452,6 +457,11 @@ impl Orchestrator {
             packaged: HashSet::new(),
             pkg_now: String::new(),
             fontspector: None,
+            diff_queue: VecDeque::new(),
+            diff_active: Vec::new(),
+            diff_done: HashSet::new(),
+            diff_init: false,
+            diffview: None,
             cohort_members: state.cohort_members,
             cohort_reqs: state.cohort_reqs,
             cached_cohorts: HashSet::new(),
@@ -554,6 +564,7 @@ impl Orchestrator {
         self.ensure_workers(jobs);
         self.spawn_archive_prewarmer();
         self.spawn_qa();
+        self.spawn_diff(); // parks unless --diffenator; then diffs built families vs shipped (niced)
         self.spawn_package_worker(); // parks until build_debs is on; then packages built families live
         self.spawn_status_writer();
         self.spawn_size_thread();
@@ -780,6 +791,124 @@ impl Orchestrator {
             let view = crate::fontspector::aggregate(&fsdir, &self.cfg.fontspector_profile, &version);
             let _ = std::fs::write(fsdir.join("_summary.json"), serde_json::to_string(&view).unwrap_or_default());
             self.shared.lock().unwrap().fontspector = Some(view);
+            thread::sleep(Duration::from_secs(4));
+        }
+    }
+
+    /// Asynchronous diffenator3 vs-shipped diff (--diffenator): no binary to resolve (it's a linked
+    /// library), so just seed the queue with already-built families, then run niced workers + an
+    /// aggregator. Mirrors `spawn_qa`.
+    fn spawn_diff(self: &Arc<Self>) {
+        if !self.cfg.diffenator {
+            return;
+        }
+        if self.cfg.google_fonts.is_none() {
+            let mut sh = self.shared.lock().unwrap();
+            sh.control_log.push("diffenator disabled: no --google-fonts clone to diff against".into());
+            sh.diff_init = true;
+            return;
+        }
+        let me = Arc::clone(self);
+        thread::spawn(move || {
+            let _ = std::fs::create_dir_all(crate::persist::diffenator3_dir(&me.cfg.build_dir));
+            me.seed_diff_queue();
+            me.shared.lock().unwrap().diff_init = true;
+            let n = me.cfg.jobs.clamp(1, 8);
+            for _ in 0..n {
+                let w = Arc::clone(&me);
+                thread::spawn(move || w.diff_worker_loop());
+            }
+            let agg = Arc::clone(&me);
+            thread::spawn(move || agg.diff_aggregator_loop());
+        });
+    }
+
+    /// Enqueue every already-built family that has no stored diff result yet.
+    fn seed_diff_queue(&self) {
+        let ddir = crate::persist::diffenator3_dir(&self.cfg.build_dir);
+        let built = crate::fontspector::enumerate_built(&self.cfg.build_dir.join("out"));
+        let mut sh = self.shared.lock().unwrap();
+        for (slug, _fonts) in built {
+            let has = ddir.join(format!("{}.json", slug.replace('/', "__"))).is_file();
+            if !has && !sh.diff_done.contains(&slug) && !sh.diff_queue.contains(&slug) {
+                sh.diff_queue.push_back(slug);
+            }
+        }
+    }
+
+    /// Enqueue one freshly-green family for a vs-shipped diff (called on every successful build).
+    fn enqueue_diff(&self, slug: &str) {
+        if !self.cfg.diffenator {
+            return;
+        }
+        let mut sh = self.shared.lock().unwrap();
+        if !sh.diff_done.contains(slug) && !sh.diff_queue.contains(&slug.to_string()) {
+            sh.diff_queue.push_back(slug.to_string());
+        }
+    }
+
+    fn diff_worker_loop(self: Arc<Self>) {
+        let Some(gf) = self.cfg.google_fonts.clone() else { return };
+        let ddir = crate::persist::diffenator3_dir(&self.cfg.build_dir);
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            if self.frozen.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(300));
+                continue;
+            }
+            let slug = {
+                let mut sh = self.shared.lock().unwrap();
+                match sh.diff_queue.pop_front() {
+                    Some(s) => {
+                        sh.diff_active.push(s.clone());
+                        s
+                    }
+                    None => {
+                        drop(sh);
+                        thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                }
+            };
+            // map each built font (by basename) to its path, then diff vs the shipped same-named font
+            let out = self.cfg.build_dir.join("out").join(slug.replace('/', "__"));
+            let mut built = std::collections::BTreeMap::new();
+            for p in crate::fontspector::collect_fonts(&out) {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    built.insert(name.to_string(), p);
+                }
+            }
+            if !built.is_empty() {
+                let (status, fonts) = crate::diffenator3::diff_family(&gf, &slug, &built);
+                let summary = fonts.iter().find(|f| f.status.starts_with("differs"))
+                    .map(|f| f.status.clone())
+                    .unwrap_or_else(|| status.clone());
+                let doc = serde_json::json!({ "slug": slug, "status": status, "summary": summary, "fonts": fonts });
+                let resfile = ddir.join(format!("{}.json", slug.replace('/', "__")));
+                let _ = std::fs::write(&resfile, serde_json::to_string(&doc).unwrap_or_default());
+            }
+            let mut sh = self.shared.lock().unwrap();
+            sh.diff_active.retain(|s| s != &slug);
+            sh.diff_done.insert(slug);
+        }
+    }
+
+    /// Re-aggregate the per-family diff results into the snapshot + _summary.json every few seconds.
+    fn diff_aggregator_loop(self: Arc<Self>) {
+        let ddir = crate::persist::diffenator3_dir(&self.cfg.build_dir);
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            if self.frozen.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            let view = crate::diffenator3::aggregate(&ddir);
+            let _ = std::fs::write(ddir.join("_summary.json"), serde_json::to_string(&view).unwrap_or_default());
+            self.shared.lock().unwrap().diffview = Some(view);
             thread::sleep(Duration::from_secs(4));
         }
     }
@@ -1147,6 +1276,7 @@ impl Orchestrator {
         });
         self.emit("built", slug, serde_json::json!({"backend":"both","bytes":bytes,"vs":vs}));
         self.enqueue_qa(slug);
+        self.enqueue_diff(slug);
     }
 
     /// Record an operation's duration (bottleneck timing): updates the global op aggregate and the
@@ -1643,6 +1773,7 @@ impl Orchestrator {
             }
             self.emit("built", slug, serde_json::json!({"backend": used, "builder": builder, "bytes": bytes, "compare": cmp}));
             self.enqueue_qa(slug);
+            self.enqueue_diff(slug);
             // keep the built fonts when deb-packaging is on: the live package worker needs them on
             // disk (otherwise --discard-fonts would prune them before it can assemble the .deb).
             if !self.cfg.keep_fonts && !self.shared.lock().unwrap().build_debs {
@@ -2215,6 +2346,9 @@ impl Orchestrator {
             sh.qa_done.clear();
             sh.qa_queue.clear();
             sh.fontspector = None;
+            sh.diff_done.clear();
+            sh.diff_queue.clear();
+            sh.diffview = None;
             // "delete everything" wipes python-authorized.json from disk — clear the in-memory T2 allow-list
             // too, so a fresh selective run starts clean instead of silently keeping stale authorizations.
             { let mut a = self.python_auth.lock().unwrap(); a.families.clear(); a.deps.clear(); }
@@ -2474,6 +2608,7 @@ impl Orchestrator {
             }
             restart_bool!(auto_upgrade, "auto_upgrade", "auto-upgrade");
             restart_bool!(fontspector_qa, "fontspector_qa", "fontspector QA");
+            restart_bool!(diffenator, "diffenator", "diffenator vs-shipped diff");
             restart_bool!(retry_failed, "retry_failed", "retry ALL failed");
             restart_bool!(auto_provision, "auto_provision", "auto-provision toolchain");
             restart_str!(source, "source", "worklist source");
@@ -2966,6 +3101,7 @@ impl Orchestrator {
             match k.as_str() {
                 "auto_upgrade" => flag("--auto-upgrade", val.as_bool() == Some(true), "--no-auto-upgrade"),
                 "fontspector_qa" => flag("--fontspector", val.as_bool() == Some(true), "--no-fontspector"),
+                "diffenator" => flag("--diffenator", val.as_bool() == Some(true), "--no-diffenator"),
                 "retry_failed" => flag("--retry-failed", val.as_bool() == Some(true), "--no-retry-failed"),
                 "auto_provision" => flag("--toolchain-provision", val.as_bool() == Some(true), "--no-toolchain-provision"),
                 "source" | "google_fonts" | "archive" | "build_dir" | "fontc_bin" => {
@@ -3327,12 +3463,14 @@ impl Orchestrator {
         // daemon doesn't exit mid-QA.
         let qa_pending = self.cfg.fontspector_qa
             && (!sh.qa_init || !sh.qa_queue.is_empty() || !sh.qa_active.is_empty());
+        let diff_pending = self.cfg.diffenator
+            && (!sh.diff_init || !sh.diff_queue.is_empty() || !sh.diff_active.is_empty());
         // when auto-packaging is on, also wait for the package backlog so a headless/foreground run
         // doesn't request_stop (killing the package worker) with built-but-unpackaged families left.
         let pkg_pending = sh.build_debs
             && sh.results.values().any(|r| r.status == "built" && !sh.packaged.contains(&r.slug));
         let done = counts.queued == 0 && counts.building == 0
-            && self.active.load(Ordering::Relaxed) == 0 && !qa_pending && !pkg_pending;
+            && self.active.load(Ordering::Relaxed) == 0 && !qa_pending && !diff_pending && !pkg_pending;
 
         let op_stats: BTreeMap<String, OpStat> = sh
             .op_stats
@@ -3587,6 +3725,7 @@ impl Orchestrator {
             config_path: self.cfg.data_dir.join("gflib-build.config").to_string_lossy().to_string(),
             pre_build: false, // a live build is never the setup wizard
             fontspector: sh.fontspector.clone(), // live QA aggregate (async --fontspector orchestration)
+            diffenator: sh.diffview.clone(), // live diff aggregate (async --diffenator)
             crater: crater_view,
             done,
             daemon_alive: true,

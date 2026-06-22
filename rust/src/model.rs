@@ -222,6 +222,23 @@ pub struct FontspectorView {
     #[serde(default)] pub per_family: Vec<FsFamily>, // panel A (the family list)
 }
 
+/// The diffenator3 aggregate carried in the snapshot (built-vs-shipped semantic diff results).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DiffView {
+    #[serde(default)] pub families_checked: usize,
+    #[serde(default)] pub identical: usize,
+    #[serde(default)] pub differs: usize,
+    #[serde(default)] pub errored: usize,    // error / no-shipped-font (couldn't compare)
+    #[serde(default)] pub families: Vec<DiffFamily>, // differs first, then errors, then identical
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DiffFamily {
+    pub slug: String,
+    pub status: String,                    // identical | differs | error | no shipped font
+    #[serde(default)] pub summary: String, // worst per-font summary (e.g. "differs: 3 tables, 12 glyphs")
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FailHist {
     #[serde(default)] pub ts: f64,
@@ -399,6 +416,7 @@ pub struct Snapshot {
     #[serde(default)] pub config_path: String,
     #[serde(default)] pub pre_build: bool, // first-run setup wizard (config tab is the only view)
     #[serde(default)] pub fontspector: Option<FontspectorView>, // QA results (the --fontspector pass)
+    #[serde(default)] pub diffenator: Option<DiffView>, // built-vs-shipped diff results (--diffenator)
     #[serde(default)] pub crater: Option<CraterView>, // fontc_crater build-status comparison (when loaded)
     #[serde(default)] pub done: bool,
     #[serde(default)] pub daemon_alive: bool,
@@ -455,6 +473,7 @@ pub struct ControlSet {
     // re-emits it as a CLI flag on the next daemon restart, so the edit is applied then (not mid-run).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub auto_upgrade: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub fontspector_qa: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub diffenator: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_failed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub auto_provision: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub source: Option<String>,

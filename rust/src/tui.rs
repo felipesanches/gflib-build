@@ -20,8 +20,8 @@ use std::time::Duration;
 
 // Tab order MUST match the web UI's TABS (a user switching between the terminal and the browser
 // sees the same tabs in the same order).
-const TABS: [&str; 13] = [
-    "config", "overview", "queue", "cohorts", "archive", "built", "packaging", "tools", "failures", "stats", "fontspector", "crater", "reset",
+const TABS: [&str; 14] = [
+    "config", "overview", "queue", "cohorts", "archive", "built", "packaging", "tools", "failures", "stats", "fontspector", "diff", "crater", "reset",
 ];
 
 /// Succinct glossary of the Python->Rust migration milestones, shown in the tools tab so a UI label
@@ -106,6 +106,7 @@ fn cfg_schema() -> Vec<(&'static str, &'static str, CfgKind, bool)> {
         // QA & packaging
         ("compare", "compare to shipped", CfgKind::Bool, true),
         ("fontspector_qa", "fontspector QA on green builds", CfgKind::Bool, false),
+        ("diffenator", "diffenator3 diff vs shipped", CfgKind::Bool, false),
         ("build_debs", "build .deb packages (auto-package built families)", CfgKind::Bool, true),
     ]
 }
@@ -116,7 +117,7 @@ fn cfg_group(key: &str) -> &'static str {
         "source" | "google_fonts" | "archive" | "build_dir" => "Sources & paths",
         "backend" | "orchestrator" | "python_policy" | "fontc_bin" | "auto_provision" | "manage_venvs" | "jobs" | "timeout" => "Build engine",
         "percent" | "retry_failed" | "auto_upgrade" | "populate_archive" => "Scope",
-        "compare" | "fontspector_qa" | "build_debs" => "QA & packaging",
+        "compare" | "fontspector_qa" | "diffenator" | "build_debs" => "QA & packaging",
         _ => "Other",
     }
 }
@@ -296,7 +297,7 @@ fn cfg_actions(setup: bool) -> &'static [&'static str] {
 /// also gates which non-live fields are editable on a running build: editable ⇔ appliable-live OR
 /// persistable, so the UI never invites an edit that 'apply' would silently drop.
 const TUI_PERSIST: &[&str] = &[
-    "source", "backend", "orchestrator", "python_policy", "jobs", "percent", "compare", "manage_venvs", "fontspector_qa", "build_debs",
+    "source", "backend", "orchestrator", "python_policy", "jobs", "percent", "compare", "manage_venvs", "fontspector_qa", "diffenator", "build_debs",
 ];
 
 fn cfg_persistable(key: &str) -> bool {
@@ -308,7 +309,7 @@ fn cfg_persistable(key: &str) -> bool {
 /// (↻), never mid-run. Mirrors the web RESTART_KEYS set.
 const TUI_RESTART: &[&str] = &[
     "source", "google_fonts", "archive", "build_dir", "fontc_bin",
-    "auto_provision", "auto_upgrade", "retry_failed", "fontspector_qa",
+    "auto_provision", "auto_upgrade", "retry_failed", "fontspector_qa", "diffenator",
 ];
 fn cfg_restart_editable(key: &str) -> bool {
     TUI_RESTART.contains(&key)
@@ -377,6 +378,7 @@ fn cfg_apply_live(fields: &[CfgField], snap: &Snapshot, src: &dyn Source) -> Str
     }; }
     fwd_bool!("auto_upgrade", auto_upgrade);
     fwd_bool!("fontspector_qa", fontspector_qa);
+    fwd_bool!("diffenator", diffenator);
     fwd_bool!("retry_failed", retry_failed);
     fwd_bool!("auto_provision", auto_provision);
     fwd_str!("source", source);
@@ -1225,6 +1227,30 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                 ]
             }
         },
+        "diff" => match &snap.diffenator {
+            None => vec![SectionR {
+                title: "diffenator3 vs shipped — no results yet (enable 'diffenator3 diff vs shipped' + restart; needs --google-fonts)".into(),
+                dview: "", rows: Vec::new(), keys: Vec::new(),
+            }],
+            Some(d) => {
+                let rows = d.families.iter().map(|f| {
+                    let c = match f.status.as_str() {
+                        "identical" => Color::Green,
+                        "differs" => Color::Yellow,
+                        _ => Color::DarkGrey,
+                    };
+                    vec![
+                        (format!("{:<9} ", f.status), c),
+                        (format!("{:<40} ", head(&f.slug, 40)), Color::Grey),
+                        (head(&f.summary, 40), Color::DarkGrey),
+                    ]
+                }).collect();
+                vec![SectionR {
+                    title: format!("Built vs shipped — {} checked · {} identical · {} differ · {} n/a", d.families_checked, d.identical, d.differs, d.errored),
+                    dview: "diff", rows, keys: d.families.iter().map(|f| f.slug.clone()).collect(),
+                }]
+            }
+        },
         "crater" => match &snap.crater {
             None => vec![SectionR {
                 title: "fontc_crater — not loaded  (put fontc_crater_targets.json in gflib-data, or run gfonts_agents' fetch_crater_analysis.py; --no-crater disables)".into(),
@@ -1863,6 +1889,7 @@ fn field_help(key: &str) -> &str {
         "retry_failed" => "also re-attempt families that failed with genuine build errors (fixable causes — broken venvs, transient fetches — are always retried)",
         "compare" => "sha256-compare each built font to the shipped one (metadata source only)",
         "fontspector_qa" => "run fontspector QA asynchronously on each successfully-built family (niced; results in the fontspector tab)",
+        "diffenator" => "diff each built family against the shipped font with diffenator3 (tables/cmap/glyph+word renders; needs --google-fonts; results in the diff tab)",
         _ => "edit with ←/→ or type",
     }
 }
