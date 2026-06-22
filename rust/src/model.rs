@@ -42,7 +42,7 @@ pub struct Res {
     #[serde(default)]
     pub cohort: String,
     #[serde(default)]
-    pub note: String,            // transient ("checkout", "pre-build", "installing deps")
+    pub note: String,            // transient ("checkout", "installing deps")
     #[serde(default)]
     pub queued_kind: String,     // new | retry | rebuild
     #[serde(default)]
@@ -66,7 +66,7 @@ pub struct Res {
     #[serde(default)]
     pub timings: BTreeMap<String, f64>, // per-operation seconds for this family (extract/venv/build/…)
     #[serde(default)]
-    pub config_sig: String, // content hash of the gflib-build override config (+ build_rules entry) used
+    pub config_sig: String, // content hash of the gflib-build override config.yaml used
                             // for this attempt; lets the daemon auto-rebuild when we change the fix
     #[serde(default)]
     pub upgrade_attempted: String, // toolchain signature (pins + orchestrator) this result was last

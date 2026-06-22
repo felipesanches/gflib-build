@@ -18,7 +18,6 @@ mod model;
 mod monitor;
 mod persist;
 mod provenance;
-mod rules;
 mod toolchain;
 mod tui;
 mod util;
@@ -100,16 +99,6 @@ fn run_build(mut cfg: config::Config) {
             cfg.archive = std::path::PathBuf::from(a);
         }
     }
-    // auto-detect build_rules.json (version-controlled next to the tool / in CWD)
-    if cfg.build_rules.is_none() {
-        for c in ["build_rules.json", "../build_rules.json"] {
-            let p = std::path::PathBuf::from(c);
-            if p.is_file() {
-                cfg.build_rules = Some(p);
-                break;
-            }
-        }
-    }
     // auto-detect the base toolchain requirements (so --manage-venvs reuses the same venvs the
     // Python tool built — the cohort marker hashes the base lines, so the file content must match)
     if cfg.manage_venvs && cfg.base_requirements.is_none() {
@@ -136,7 +125,7 @@ fn run_build(mut cfg: config::Config) {
     }
     let ui = pick_frontend(&cfg.ui);
 
-    // ---- first-run setup wizard: the editable config tab, pre-build (launch on ▶ Start build).
+    // ---- first-run setup wizard: the editable config tab, shown before building (launch on ▶ Start build).
     //      Triggered by --setup/--wizard or a missing google/fonts clone (metadata mode), when
     //      interactive and not --yes — mirroring the Python first-run flow. ----
     let need_gf = cfg.source == "metadata"
@@ -499,9 +488,8 @@ BUILD:
                                 per family to builder2+fontc, then builder2+fontmake. builder3/
                                 builder2 force that orchestrator only (builder3 = no Python fallback).
   --python-policy <off|selective|on>  Rust-only build mode (default on). off = no Python anywhere:
-                                force builder3+fontc (no builder2), skip cohort venvs, refuse Python
-                                pre-build rules (shell pre-build still runs). selective = off except
-                                families on the per-family allow-list. Aliases: --no-python (=off),
+                                force builder3+fontc (no builder2), skip cohort venvs. selective = off
+                                except families on the per-family allow-list. Aliases: --no-python (=off),
                                 --python (=on). Live-editable in the config tab.
   --fontc-bin <PATH>            explicit fontc binary (default: auto — the provisioned pin, else detected)
   --builder3-bin <PATH>         explicit gftools-builder3 binary (default: auto, like fontc)
@@ -540,7 +528,7 @@ FONTC_CRATER COMPARISON (compare our build status to fontc_crater's latest run):
                                 fontc-failed | both-failed | failed | diff. e.g.
                                 --retrigger-crater fontc-failed rebuilds every family
                                 fontc_crater's fontc cannot compile — to find the ones WE can
-                                (their config.yaml / build rules then unblock crater too).
+                                (their override config.yaml then unblocks crater too).
 
 UI:
   --ui <auto|curses|plain|json|none|web>   frontend (default auto)
@@ -549,7 +537,7 @@ UI:
 LIFECYCLE:
   --dry-run / --demo / --mock   MOCKUP: replay a previous session's data live (no real clone/venv/
                                 compile/QA, no disk writes) — a CPU-light demo. View with --ui curses/web.
-  --setup / --wizard            open the editable Configuration tab pre-build; launch on ▶ Start build
+  --setup / --wizard            open the editable Configuration tab before building; launch on ▶ Start build
   --fontspector                 enable async fontspector QA during the build: a pinned release runs
                                 (niced) on each green-built family, results in the 'fontspector' tab.
                                 Also a config-tab/wizard setting (fontspector_qa). --no-fontspector off.

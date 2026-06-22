@@ -31,7 +31,6 @@ pub struct Config {
                                         // no wheel on the first rung falls back to an older one (keeping
                                         // the exact pins) before relaxing. Single entry = legacy behavior.
     pub base_requirements: Option<PathBuf>, // pinned base toolchain (gftools/fontmake/…)
-    pub build_rules: Option<PathBuf>,   // per-family pre-build commands (build_rules.json)
     pub manage_venvs: bool,
     pub jobs: usize,
     pub timeout: Option<u64>,
@@ -89,7 +88,6 @@ impl Default for Config {
             base_python: "python3".into(),
             pythons: vec!["python3".into()],
             base_requirements: None,
-            build_rules: None,
             manage_venvs: false,
             jobs: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
             timeout: None,
@@ -219,7 +217,6 @@ pub fn parse(args: &[String]) -> Parsed {
                 if !v.is_empty() { cfg.base_python = v[0].clone(); cfg.pythons = v; }
             }
             "--base-requirements" => cfg.base_requirements = Some(PathBuf::from(next(&mut i, a))),
-            "--build-rules" => cfg.build_rules = Some(PathBuf::from(next(&mut i, a))),
             "--manage-venvs" => cfg.manage_venvs = true,
             "--no-manage-venvs" => cfg.manage_venvs = false,
             // jobs 0 = load + inspect the latest data with NO build workers (no font building)

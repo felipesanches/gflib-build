@@ -448,7 +448,7 @@ fn rules(pkg: &str, has_ttf: bool, has_otf: bool) -> String {
         "\tdh $@".into(),
         String::new(),
         "override_dh_auto_build:".into(),
-        "\t# DRAFT: run pre_build (build_rules) then gftools-builder / fontc with the".into(),
+        "\t# DRAFT: run gftools-builder / fontc with the".into(),
         "\t# family config at the pinned commit. Wired in a later stage (sbuild + wheelhouse).".into(),
         "\ttrue".into(),
         String::new(),

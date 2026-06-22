@@ -20,12 +20,6 @@ pub fn is_transient_clone_error(err: &str) -> bool {
 /// Map a failure message to a short CAUSE + an actionable HINT (verbatim from Python).
 pub fn categorize_failure(error: &str) -> (&'static str, &'static str) {
     let low = error.to_lowercase();
-    if low.contains("needs python pre-build") {
-        return (
-            "needs Python pre-build",
-            "the Rust-only policy refused a Python pre-build step — authorize Python for this family/dependency, or port the pre-build to shell or Rust",
-        );
-    }
     if (low.contains("no such file or directory") || low.contains("permission denied"))
         && (low.contains("failed to execute") || low.contains("taskset") || low.contains("/tools/"))
     {
@@ -167,7 +161,7 @@ pub fn categorize_failure(error: &str) -> (&'static str, &'static str) {
     if low.contains("gliflib") || (low.contains(".glif") && low.contains("does not exist")) {
         return (
             "incomplete UFO source (missing .glif)",
-            "a glyph in the UFO's contents.plist has no .glif file on disk — the upstream source is incomplete, or a pre-build step that should generate it didn't run",
+            "a glyph in the UFO's contents.plist has no .glif file on disk — the upstream sources are incomplete (a generation step the upstream build performs is not reflected in the committed sources)",
         );
     }
     // fontmake's source-prep (instance/UFO generation) failed before any compile
@@ -230,11 +224,11 @@ pub fn categorize_failure(error: &str) -> (&'static str, &'static str) {
         );
     }
     // a build operation referenced a file that isn't there (missing source / un-generated intermediate) —
-    // often the symptom of a skipped Python pre-build step under python_policy=off
+    // commonly the upstream sources are incomplete (a generation step is not committed)
     if low.contains("while building") && low.contains("no such file or directory") {
         return (
             "builder3: missing source file",
-            "a build operation referenced a file that doesn't exist (a missing source or un-generated intermediate) — often a skipped Python pre-build step; check the recipe",
+            "a build operation referenced a file that doesn't exist (a missing source or un-generated intermediate) — the committed upstream sources are likely incomplete; check the recipe",
         );
     }
     // fontc requires identical per-master feature (.fea) files
@@ -311,13 +305,6 @@ pub fn subclassify_failure(error: &str) -> Option<String> {
     // the recipe operation that failed (ToBytes / Fontc / Autohint / …)
     if let Some(op) = between(error, "operation '", "'") {
         return Some(format!("op: {}", op));
-    }
-    // the tool a refused Python pre-build invokes
-    if low.contains("needs python pre-build") {
-        if let Some(t) = between(error, "rule uses '", "'") {
-            let base = t.split_whitespace().next().unwrap_or(t).rsplit('/').next().unwrap_or(t);
-            return Some(format!("tool: {}", base));
-        }
     }
     None
 }
@@ -409,7 +396,6 @@ mod tests {
         // a fontprimer error contains BOTH "recipeprovider" and "could not parse config" → provider wins
         assert_eq!(sc("builder3: Could not parse config file sources/config.yaml: recipeprovider: unknown variant `fontprimer`").as_deref(), Some("provider: fontprimer"));
         assert_eq!(sc("builder3: Could not parse config file __gflib_override_config.yaml: data did not match any variant of untagged enum Step").as_deref(), Some("override config: unknown recipe Step"));
-        assert_eq!(sc("needs Python pre-build: rule uses 'glyphs2ufo' (glyphs2ufo sources/X.glyphspackage)").as_deref(), Some("tool: glyphs2ufo"));
         assert_eq!(sc("builder3: error parsing designspace file: missing field `conditionset`").as_deref(), Some("missing field: conditionset"));
         assert_eq!(sc("builder3: some brand new orchestrator hiccup"), None);
         // …but a fontc error about a missing SOURCE file is NOT the launcher bucket

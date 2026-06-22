@@ -32,20 +32,18 @@ pub const MAX_JOBS: usize = 256;
 /// clone). The "retry override-fixed" UI action re-queues failed families whose override has it.
 pub const OVERRIDE_MARKER: &str = "# gflib-build override";
 
-/// Signature of a family's effective gflib-build fix: a hash of the override config.yaml text plus its
-/// build_rules pre-build entry. Empty unless the config carries OVERRIDE_MARKER **or** the family has a
-/// build_rules entry — so only fixes WE authored are tracked (never a natural upstream config.yaml), but a
-/// build_rules-only fix (a pre-build / source patch with no override config) still auto-rebuilds. The
-/// config-watcher re-queues a failed family when this changes — editing the override OR its pre-build flips it.
-pub fn config_signature(config_text: &str, rule: Option<&Vec<String>>) -> String {
-    if !config_text.contains(OVERRIDE_MARKER) && rule.is_none() {
+/// Signature of a family's effective gflib-build fix: a hash of the override config.yaml text. Empty
+/// unless the config carries OVERRIDE_MARKER — so only overrides WE authored are tracked (never a natural
+/// upstream config.yaml). The config-watcher re-queues a failed family when this changes (editing the
+/// override flips it).
+pub fn config_signature(config_text: &str) -> String {
+    if !config_text.contains(OVERRIDE_MARKER) {
         return String::new();
     }
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     config_text.hash(&mut h);
-    rule.hash(&mut h);
     format!("{:016x}", h.finish())
 }
 
@@ -224,7 +222,6 @@ pub struct Orchestrator {
     pub abort_builds: Arc<AtomicBool>,
     pub spawned: Mutex<usize>,
     pub venvs: Option<VenvManager>, // cohort venv manager (R2); None unless --manage-venvs
-    pub build_rules: std::collections::HashMap<String, Vec<String>>, // per-family pre-build (R3)
     pub all_families: Vec<Family>,  // full discovered list (R6: raising % enqueues more from here)
     pub clone_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>, // per-repo clone lock (--mirror-missing)
     pub qa_bin: Mutex<Option<(PathBuf, String)>>, // resolved fontspector (path, version), lazily set
@@ -488,11 +485,6 @@ impl Orchestrator {
                 .unwrap_or_default()
         };
         let venvs = Some(VenvManager::new(&cfg.build_dir, &cfg.pythons, cfg.base_requirements.clone(), abort_builds.clone()));
-        let build_rules = cfg
-            .build_rules
-            .as_ref()
-            .map(|p| crate::rules::load_build_rules(p))
-            .unwrap_or_default();
         Arc::new(Orchestrator {
             cfg,
             shared: Arc::new(Mutex::new(shared)),
@@ -506,7 +498,6 @@ impl Orchestrator {
             abort_builds,
             spawned: Mutex::new(0),
             venvs,
-            build_rules,
             all_families,
             clone_locks: Mutex::new(HashMap::new()),
             qa_bin: Mutex::new(None),
@@ -1081,20 +1072,15 @@ impl Orchestrator {
         ]
     }
 
-    /// Run ONE backend end-to-end into `dest` (extract → pre-build → preclean → config → build →
+    /// Run ONE backend end-to-end into `dest` (extract → preclean → config → build →
     /// collect). Returns (ok, err, found, bytes). Used by the --backend both path.
     #[allow(clippy::too_many_arguments)]
     fn run_backend_into(
-        &self, slug: &str, fam: &Family, backend: &str, dest: &Path, work: &Path, mirror: &Path,
+        &self, _slug: &str, fam: &Family, backend: &str, dest: &Path, work: &Path, mirror: &Path,
         python: &str, log_path: &Path, fontc_bin: Option<&str>,
     ) -> (bool, String, BTreeMap<String, PathBuf>, u64) {
         if let Err(e) = extract_tree(mirror, &fam.commit, work, EXTRACT_TIMEOUT, log_path) {
             return (false, e, BTreeMap::new(), 0);
-        }
-        if let Some(cmds) = self.build_rules.get(slug) {
-            if let Err(e) = crate::rules::run_pre_build(work, python, cmds, log_path, self.cfg.timeout) {
-                return (false, e, BTreeMap::new(), 0);
-            }
         }
         preclean_outputs(work);
         let (cfg_path, _label) = match resolve_config(self.cfg.google_fonts.as_deref(), fam, work, "builder2") {
@@ -1228,7 +1214,7 @@ impl Orchestrator {
         *self.batch_label.lock().unwrap() = label.to_string();
     }
 
-    /// Whether THIS family may use Python (builder2, cohort venvs, Python pre-build) under the live policy.
+    /// Whether THIS family may use Python (builder2, cohort venvs) under the live policy.
     /// `selective` consults the persisted allow-list (T2): the family's slug, OR any Python package it
     /// declares being in the authorized-deps set (the dep check reads the family's requirements, so it's
     /// only done when needed — selective + not already slug-authorized + some deps are authorized).
@@ -1374,7 +1360,7 @@ impl Orchestrator {
 
         // Python policy (T1): may THIS family touch Python at all? When not (python_policy=off, or
         // selective+unauthorized) the family takes the strict Rust-only path — no cohort venv, no
-        // builder2, and Python pre-build rules are refused below. Computed once and threaded through.
+        // builder2 and cohort venvs are gated on this. Computed once and threaded through.
         let py_allowed = self.python_allowed(slug, &mirror, &fam.commit);
 
         // Cohort venv (R2): read the family's requirements read-only from the mirror, create/reuse the
@@ -1465,25 +1451,6 @@ impl Orchestrator {
             &live_orchestrator, fontc_bin.is_some(), builder3_bin.is_some());
         let mut pairs = self.attempt_pairs(fontc_bin.is_some(), builder3_bin.is_some(), py_allowed);
 
-        // Rust-only policy: a family whose pre-build needs Python cannot build without it (shell pre-build
-        // is fine). Decide this BEFORE stashing/extracting, naming the offending rule so the analysis round
-        // can attribute it (and the classifier decision is auditable in the log). For an auto-upgrade probe
-        // we must NOT destroy the prior success (an upgrade never costs a success) — keep it instead.
-        if !py_allowed {
-            if let Some((tok, cmd)) = self.build_rules.get(slug)
-                .and_then(|cmds| cmds.iter().find_map(|c| crate::rules::rule_needs_python(c).map(|t| (t, c.clone()))))
-            {
-                let msg = format!("needs Python pre-build: rule uses '{}' ({})", tok, cmd);
-                log_line(&log_path, &msg);
-                match &upgrade_prior {
-                    Some(prior) => self.restore_prior(slug, prior, &tc_sig, "needs Python pre-build — kept prior success"),
-                    None => self.fail(slug, "needs Python pre-build", &msg),
-                }
-                cleanup(&work, self.cfg.keep_work);
-                return;
-            }
-        }
-
         let mut stash: Option<PathBuf> = None;
         if let Some(prior) = &upgrade_prior {
             // already attempted under EXACTLY these capabilities? nothing new to learn — quick
@@ -1545,18 +1512,6 @@ impl Orchestrator {
             if let Err(e) = self.timed(slug, "extract", || extract_tree(&mirror, &fam.commit, &work, EXTRACT_TIMEOUT, &log_path)) {
                 last_err = e;
                 continue;
-            }
-            // registered pre-build commands (generate/pre-compile sources) — run AFTER extraction
-            // (so they survive the per-backend re-extract) and BEFORE the builder. (R3 / parity)
-            if let Some(cmds) = self.build_rules.get(slug) {
-                self.set_result(slug, |r| r.note = "pre-build".into());
-                log_line(&log_path, &format!("pre-build: running {} command(s)…", cmds.len()));
-                if let Err(e) = crate::rules::run_pre_build(&work, &python, cmds, &log_path, self.cfg.timeout) {
-                    last_err = e;
-                    self.set_result(slug, |r| r.note = String::new());
-                    break; // a pre-build failure won't be cured by another backend
-                }
-                self.set_result(slug, |r| r.note = String::new());
             }
             preclean_outputs(&work);
             let (cfg_path, label) = match self.timed(slug, "config", || resolve_config(self.cfg.google_fonts.as_deref(), &fam, &work, builder)) {
@@ -2311,15 +2266,15 @@ impl Orchestrator {
         sh.control_log.push(format!("delete everything: {}", msg));
     }
 
-    /// Content signature of the gflib-build override config.yaml (+ this family's build_rules entry) for
-    /// `slug`. Empty unless google/fonts has an override carrying OVERRIDE_MARKER — so only families we've
-    /// written a fix for are tracked, never ones with a natural upstream config.yaml.
+    /// Content signature of the gflib-build override config.yaml for `slug`. Empty unless google/fonts has
+    /// an override carrying OVERRIDE_MARKER — so only families we've written a fix for are tracked, never
+    /// ones with a natural upstream config.yaml.
     fn config_sig(&self, slug: &str) -> String {
         let Some(gf) = self.cfg.google_fonts.as_ref() else {
             return String::new();
         };
         let txt = std::fs::read_to_string(gf.join(slug).join("config.yaml")).unwrap_or_default();
-        config_signature(&txt, self.build_rules.get(slug))
+        config_signature(&txt)
     }
 
     /// Auto-rebuild watcher: when a FAILED family's override-config signature changes (we wrote or edited a
@@ -5038,22 +4993,15 @@ recipe:
 
     #[test]
     fn config_signature_tracks_only_marked_overrides() {
-        // a natural upstream config (no marker) with no build_rules entry is never tracked -> never rebuilt
-        assert_eq!(config_signature("sources:\n  - Foo.glyphs\n", None), "");
-        // but a build_rules-only fix (no override config, yet a pre-build entry) IS tracked
-        let pre = vec!["touch sources/family.fea".to_string()];
-        assert!(!config_signature("sources:\n  - Foo.glyphs\n", Some(&pre)).is_empty());
+        // a natural upstream config (no marker) is never tracked -> never auto-rebuilt
+        assert_eq!(config_signature("sources:\n  - Foo.glyphs\n"), "");
         // a gflib-build override changes signature when its text changes...
-        let a = config_signature("# gflib-build override\nrecipe:\n  x:\n    - source: a\n", None);
-        let b = config_signature("# gflib-build override\nrecipe:\n  x:\n    - source: b\n", None);
+        let a = config_signature("# gflib-build override\nrecipe:\n  x:\n    - source: a\n");
+        let b = config_signature("# gflib-build override\nrecipe:\n  x:\n    - source: b\n");
         assert!(!a.is_empty() && a != b);
-        // ...and when only its build_rules (staging) entry changes
-        let rule1 = vec!["cp a sources/a".to_string()];
-        let rule2 = vec!["cp b sources/b".to_string()];
+        // ...and is stable for identical input (so a still-failing rebuild doesn't loop)
         let txt = "# gflib-build override\nrecipe:\n  x:\n    - source: a\n";
-        assert_ne!(config_signature(txt, Some(&rule1)), config_signature(txt, Some(&rule2)));
-        // identical inputs are stable (so a still-failing rebuild doesn't loop)
-        assert_eq!(config_signature(txt, Some(&rule1)), config_signature(txt, Some(&rule1)));
+        assert_eq!(config_signature(txt), config_signature(txt));
     }
 
     #[test]
