@@ -276,6 +276,11 @@ pub fn parse(args: &[String]) -> Parsed {
             "--stop" => mode = Mode::Stop,
             "--reset" => mode = Mode::Reset,
             "--help" | "-h" => mode = Mode::Help,
+            // Removed flags, accepted-and-ignored: the daemon re-execs by re-passing its original argv
+            // verbatim (daemon.rs), and old launch commands / already-running daemons may still carry
+            // these. Tolerating them keeps a restart from hard-failing after the feature was dropped.
+            "--build-rules" => { let _ = next(&mut i, a); } // pre-build actions removed
+            "--upgrade-glyphs2" | "--no-upgrade-glyphs2" => {} // on-the-fly Glyphs v2→v3 rewrite removed
             other => die(&format!("unknown argument: {}", other)),
         }
         i += 1;
@@ -458,6 +463,16 @@ pub fn apply_setup_map(cfg: &mut Config, m: &BTreeMap<String, serde_json::Value>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn removed_flags_are_tolerated_not_fatal() {
+        // a daemon re-exec (or an old launch command) may still carry flags we've since removed —
+        // parse must accept-and-ignore them, including consuming --build-rules' value, not die().
+        let args: Vec<String> = ["--build-rules", "build_rules.json", "--upgrade-glyphs2",
+            "--no-upgrade-glyphs2", "--jobs", "7", "--ui", "web"]
+            .iter().map(|s| s.to_string()).collect();
+        let parsed = parse(&args);
+        assert_eq!(parsed.cfg.jobs, 7, "real flags after a removed one must still parse");
+    }
     #[test]
     fn save_config_map_persists_merges_and_roundtrips_build_debs() {
         // baseline on disk: build_debs off, plus an absolute path that the overlay must NOT clobber
