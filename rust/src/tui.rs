@@ -619,6 +619,8 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
                         // the batch timer); on a family list it retries just the selected family.
                         if let Some(cause) = selected_cause(&snap, ui.tab, ui.section, ui.fc_sel) {
                             source.control(&ControlSet { retry_category: Some(cause), ..Default::default() });
+                        } else if let Some(rs) = selected_subcause(&snap, ui.tab, ui.section, ui.sel, ui.fc_sel) {
+                            source.control(&ControlSet { retry_subcause: Some(rs), ..Default::default() });
                         } else if let Some(slug) = selected_slug(&snap, ui.tab, ui.section, ui.sel, ui.fc_sel) {
                             source.control(&ControlSet { retry: Some(vec![slug]), ..Default::default() });
                         }
@@ -718,6 +720,20 @@ fn selected_cause(snap: &Snapshot, tab: usize, section: usize, fc_sel: usize) ->
     } else {
         None
     }
+}
+
+/// The (category, sub-cause) under the cursor when the scoped "Sub-causes" section is focused. The
+/// category is the sticky failcat selection (fc_sel); the sub-cause is this section's selected key. This
+/// is what makes `r` retry the whole sub-cause (timed by the batch timer).
+fn selected_subcause(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel: usize) -> Option<crate::model::RetrySub> {
+    let secs = sections_for(snap, tab, fc_sel);
+    let s = secs.get(section)?;
+    if s.dview != "subcat" {
+        return None;
+    }
+    let sub = s.keys.get(sel)?.clone();
+    let cat = snap.fail_categories.get(fc_sel)?.cat.clone();
+    Some(crate::model::RetrySub { cat, sub })
 }
 
 // ---- flicker-free rendering: draw the whole frame into a back-buffer of cells, then emit ONLY the
@@ -1139,8 +1155,9 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                     keys: snap.fail_categories.iter().map(|c| c.cat.clone()).collect(),
                 });
             }
-            // sub-cause breakdown of the selected cause (the fine-grained classification), display-only.
-            // The web nests every category's sub-causes; the terminal shows the selected one's, scoped.
+            // sub-cause breakdown of the selected cause (the fine-grained classification). Selectable:
+            // ENTER shows the affected families, r retries the whole sub-cause. The web nests every
+            // category's sub-causes; the terminal shows the selected one's, scoped.
             if let Some(c) = sel_cat {
                 if !c.subcauses.is_empty() {
                     let mut subs: Vec<(&String, &usize)> = c.subcauses.iter().collect();
@@ -1151,12 +1168,9 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                         (format!("↳ {}", name), Color::Grey),
                     ]).collect();
                     let other = c.count.saturating_sub(classified);
-                    let title = if other > 0 {
-                        format!("Sub-causes of '{}'  ({} classified · {} unclassified)", c.cat, classified, other)
-                    } else {
-                        format!("Sub-causes of '{}'", c.cat)
-                    };
-                    secs.push(SectionR { title, dview: "", rows, keys: Vec::new() });
+                    let extra = if other > 0 { format!("  ({} classified · {} unclassified)", classified, other) } else { String::new() };
+                    let title = format!("Sub-causes of '{}'{}  (ENTER = families · r = retry this sub-cause)", c.cat, extra);
+                    secs.push(SectionR { title, dview: "subcat", rows, keys: subs.iter().map(|(name, _)| (*name).clone()).collect() });
                 }
             }
             // families list, scoped to the selected cause. We list the cause's OWN
@@ -2028,6 +2042,16 @@ fn focus_info(snap: &Snapshot, ui: &Ui) -> Vec<String> {
                 vec![l1, format!("   {}{}", shown.join(", "), more), format!("   → {}", fc.hint)]
             }
         }).unwrap_or_default(),
+        "subcat" => {
+            let sub = secs.get(ui.section).and_then(|s| s.keys.get(sel).cloned());
+            match (sub, snap.fail_categories.get(ui.fc_sel)) {
+                (Some(sub), Some(fc)) => {
+                    let n = fc.subcauses.get(&sub).copied().unwrap_or(0);
+                    vec![format!(" {} families — {} › {}", n, fc.cat, sub), "   ENTER = families · r = retry this sub-cause".into()]
+                }
+                _ => Vec::new(),
+            }
+        }
         "history" => snap.failure_history.get(sel).map(|h| {
             let pv = prov_str(&h.compiler_version, &h.backend, &h.builder_version);
             let head = if pv.is_empty() { format!(" {}  —  {}", h.slug, h.cause) } else { format!(" {}  —  {}  [{}]", h.slug, h.cause, pv) };
@@ -2296,6 +2320,26 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
                 o.push(String::new());
                 o.push("what to do:".into());
                 o.push(format!("  {}", fc.hint));
+            }
+        }
+        "subcat" => {
+            let sub = sections_for(snap, tab, fc_sel).get(section).and_then(|s| s.keys.get(sel).cloned());
+            if let (Some(sub), Some(fc)) = (sub, snap.fail_categories.get(fc_sel)) {
+                let n = fc.subcauses.get(&sub).copied().unwrap_or(0);
+                o.push(format!("Failure cause:  {}", fc.cat));
+                o.push(format!("Sub-cause:      {}", sub));
+                o.push(format!("families affected: {}", n));
+                o.push(String::new());
+                o.push("press r to re-queue ALL these families (timed by the batch timer)".into());
+                o.push(String::new());
+                o.push("affected families:".into());
+                match fc.sub_families.get(&sub) {
+                    Some(fams) if !fams.is_empty() => {
+                        for s in fams { o.push(format!("  {}", s)); }
+                        if fams.len() < n { o.push(format!("  … and {} more", n - fams.len())); }
+                    }
+                    _ => o.push("  (no family list captured)".into()),
+                }
             }
         }
         "lintcat" => {

@@ -150,6 +150,8 @@ pub struct FailCategory {
     // finer sub-cause breakdown within this category (e.g. source: .glyphs → 451) — the per-iteration
     // detailed chart, computed automatically from classify::subclassify_failure
     #[serde(default)] pub subcauses: BTreeMap<String, usize>,
+    // up-to-40 affected families per sub-cause (for the clickable sub-cause detail + retry-all)
+    #[serde(default)] pub sub_families: BTreeMap<String, Vec<String>>,
 }
 
 /// One lintian finding tag grouped across packages (the packaging analogue of FailCategory).
@@ -475,6 +477,13 @@ pub struct PyAuthDelta {
 /// Only the keys actually being set are serialized (unset = omitted, never `null`) so a control.json
 /// the Rust UI writes is byte-identical to one the Python tool writes — a Python daemon reading it
 /// won't trip over a `null` percent/jobs.
+/// A (failure category, sub-cause) pair — the "retry all" target of a clicked sub-cause.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RetrySub {
+    #[serde(default)] pub cat: String,
+    #[serde(default)] pub sub: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ControlSet {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub jobs: Option<usize>,
@@ -488,6 +497,7 @@ pub struct ControlSet {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_all: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_overrides: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_category: Option<String>, // re-queue ALL failed families in this failure category (categorize_failure cause)
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub retry_subcause: Option<RetrySub>, // re-queue ALL failed families matching a (category, sub-cause)
     #[serde(default, skip_serializing_if = "Option::is_none")] pub repackage_all: Option<bool>, // rebuild every .deb from existing fonts (apply packaging fixes + re-lint)
     #[serde(default, skip_serializing_if = "Option::is_none")] pub build_debs: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub restart: Option<bool>, // re-exec the daemon (apply startup-only settings)

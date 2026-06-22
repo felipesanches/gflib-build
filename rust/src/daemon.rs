@@ -63,15 +63,8 @@ pub fn daemonize(build_dir: &Path) -> bool {
         }
         // grandchild = daemon
     }
-    let _ = std::fs::create_dir_all(build_dir);
+    redirect_io_to_log(build_dir);
     use std::os::unix::io::AsRawFd;
-    if let Ok(log) = std::fs::OpenOptions::new().create(true).append(true).open(build_dir.join("daemon.log")) {
-        unsafe {
-            dup2(log.as_raw_fd(), 1);
-            dup2(log.as_raw_fd(), 2);
-        }
-        std::mem::forget(log); // keep the fd open for the daemon's lifetime
-    }
     if let Ok(devnull) = std::fs::File::open("/dev/null") {
         unsafe {
             dup2(devnull.as_raw_fd(), 0);
@@ -80,6 +73,22 @@ pub fn daemonize(build_dir: &Path) -> bool {
     }
     persist::write_pid(build_dir);
     true
+}
+
+/// Send this process's stdout+stderr to `<build_dir>/daemon.log` (append). Used by the daemon, and by a
+/// foreground `--ui web` run so in-process progress bars (notably diffenator3-lib's indicatif, which
+/// draws to stderr unconditionally — no quiet flag) and worker chatter go to the log instead of the
+/// user's terminal. indicatif also auto-hides once stderr is no longer a TTY.
+pub fn redirect_io_to_log(build_dir: &std::path::Path) {
+    use std::os::unix::io::AsRawFd;
+    let _ = std::fs::create_dir_all(build_dir);
+    if let Ok(log) = std::fs::OpenOptions::new().create(true).append(true).open(build_dir.join("daemon.log")) {
+        unsafe {
+            dup2(log.as_raw_fd(), 1);
+            dup2(log.as_raw_fd(), 2);
+        }
+        std::mem::forget(log); // keep the fd open for the process lifetime
+    }
 }
 
 /// The daemon's main loop after `start()`: keep running until the build is done AND has been idle for

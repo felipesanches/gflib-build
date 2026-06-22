@@ -511,11 +511,25 @@ function debToolRow(t){const ok=!!t.present;
 // clicking a cause FILTERS the families list below (and highlights the selected cause)
 function failcatRow(c){const sel=fsCause==c.cat;
  return {segs:[[(sel?'▸':' ')+Rp(c.count,3)+'  ','w'],[L(c.cat,24),sel?'y':'c'],[' '+(c.hint||''),'muted']],fc:c.cat,rc:c.cat}}
-// a category row followed by its sub-cause breakdown (indented, display-only)
+// a category row followed by its sub-cause breakdown (indented, click a sub-cause for details + retry)
 function failcatRows(c){const rows=[failcatRow(c)];
  const subs=Object.entries(c.subcauses||{}).sort((a,b)=>b[1]-a[1]);
- for(const [name,n] of subs) rows.push({segs:[['     '+Rp(n,4)+'  ','muted'],['↳ '+E(L(name,42)),'gr']]});
+ for(const [name,n] of subs) rows.push({segs:[['     '+Rp(n,4)+'  ','muted'],['↳ '+E(L(name,42)),'gr']],det:['subcat',c.cat+'\t'+name]});
  return rows;}
+// sub-cause detail: affected families + a "retry all" that re-queues every failed family with this
+// (category, sub-cause). id encodes "<cat>\0<sub>".
+function openSubcat(id){const i=id.indexOf('\t');const cat=id.slice(0,i),sub=id.slice(i+1);
+ const c=(snap.fail_categories||[]).find(x=>x.cat==cat);if(!c)return;
+ const fams=(c.sub_families&&c.sub_families[sub])||[];
+ const n=(c.subcauses&&c.subcauses[sub])||fams.length;
+ const el=document.getElementById('detail');
+ el.innerHTML='<div class="dhead"><span class="muted">'+E(cat)+' ›</span> <span class="y">'+E(sub)+'</span> &nbsp;<span class="muted">'+n+' families</span>'+
+   ' &nbsp;<button class="rb" onclick="if(confirm(\'Re-queue all '+n+' failed families with sub-cause: '+E(sub)+' ?\\n\\nThe batch timer will measure the retry.\'))ctl({retry_subcause:{cat:\''+E(cat)+'\',sub:\''+E(sub)+'\'}})" title="re-queue every failed family with this sub-cause (timed by the batch timer)">↻ retry all</button>'+
+   '<span class="dclose" onclick="closeDetail()">✕ close</span></div>'+
+   '<div class="dbody">'+(fams.length?fams.map(f=>'<div class="ln gr clk" onclick="openDetail(\'failed\',\''+E(f)+'\')">'+E(f)+'</div>').join(''):'<div class="ln muted">(no family list captured)</div>')+
+   (n>fams.length?'<div class="ln muted">… and '+(n-fams.length)+' more</div>':'')+'</div>';
+ el.style.display='block';
+}
 function histRow(h){return {segs:[[L(h.cause,20)+' ','y'],[h.slug||'','gr']],rt:h.slug,det:['history',h.slug]}}
 function phaseRow(kv){return {segs:[[L(kv[0],12)+' '+hms(kv[1]),'gr']]}}
 function opRow(kv){const s=kv[1];return {segs:[[L(kv[0],10)+' total '+Rp((s.total||0).toFixed(1),9)+'  n '+Rp(s.count||0,5)+'  mean '+Rp((s.mean||0).toFixed(2),7)+'  max '+Rp((s.max||0).toFixed(1),7),'c']]}}
@@ -889,6 +903,7 @@ function openDetail(kind,id){
   if(subs.length){lines.push('','sub-cause breakdown:');subs.forEach(kv=>lines.push('  '+Rp(kv[1],5)+'  '+kv[0]));}
   lines.push('','affected families:');(c.families&&c.families.length?c.families:['(none)']).forEach(s=>lines.push('  '+s));lines.push('','what to do:','  '+(c.hint||''));
  } else if(kind=='lintcat'){openLintcat(id);return;
+ } else if(kind=='subcat'){openSubcat(id);return;
  } else if(kind=='history'){const h=findBy(snap.failure_history,'slug',id);if(!h)return;slug=id;title='Failed (history): '+h.slug;
   lines=['cause: '+h.cause,'provenance: '+prov(h),'rebuild: gflib-build --only '+h.slug+' --rebuild --yes','','error:','  '+(h.error||'')];
  } else if(kind=='task'){const t=findBy(snap.tasks,'key',id);if(!t)return;title='Pipeline task: '+t.name;

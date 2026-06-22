@@ -175,6 +175,13 @@ fn run_build(mut cfg: config::Config) {
         "gflib-build (Rust): source={} backend={} jobs={} build_dir={}",
         cfg.source, cfg.backend, cfg.jobs, cfg.build_dir.display()
     );
+    // Web UI: the browser is the interface, so keep the terminal quiet. Print the URL, then send
+    // stdout/stderr to the build log BEFORE workers spawn — otherwise in-process progress bars
+    // (diffenator3-lib's indicatif draws to stderr with no off switch) flood the terminal.
+    if ui == "web" {
+        eprintln!("gflib-build web dashboard: http://127.0.0.1:{}/   (logs → {}/daemon.log)", cfg.web_port, cfg.build_dir.display());
+        daemon::redirect_io_to_log(&cfg.build_dir);
+    }
     let orch = build::Orchestrator::new(cfg.clone());
     persist::write_pid(&cfg.build_dir);
     daemon::install_sigterm_handler();

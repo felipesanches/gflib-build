@@ -2711,6 +2711,29 @@ impl Orchestrator {
                 }
                 log.push(format!("retry category '{}' — re-queued {} families", cat, victims.len()));
             }
+            if let Some(rs) = &set.retry_subcause {
+                // Re-queue EVERY failed family matching a (category, sub-cause) — the finer-grained retry
+                // a clicked sub-cause offers. Matches on both so an "op: Fontc" sub-cause that appears under
+                // several categories only retries the one the user drilled into.
+                let victims: Vec<String> = sh.results.values()
+                    .filter(|r| r.status == "failed"
+                        && crate::classify::categorize_failure(&r.error).0 == rs.cat.as_str()
+                        && crate::classify::subclassify_failure(&r.error).as_deref() == Some(rs.sub.as_str()))
+                    .map(|r| r.slug.clone())
+                    .collect();
+                for slug in &victims {
+                    if let Some(r) = sh.results.get_mut(slug) {
+                        r.status = "queued".into();
+                        r.queued_kind = "retry".into();
+                        r.error.clear();
+                        sh.queue.push_front(slug.clone());
+                    }
+                }
+                if !victims.is_empty() {
+                    self.restart_batch_timer(&format!("retry: {} / {}", rs.cat, rs.sub));
+                }
+                log.push(format!("retry sub-cause '{}' / '{}' — re-queued {} families", rs.cat, rs.sub, victims.len()));
+            }
             if set.retry_overrides == Some(true) {
                 // re-queue every FAILED family we've written a gflib-build override config.yaml for
                 // (the OVERRIDE_MARKER) — e.g. the whole instantiateUfo-bypass set — so a config fix
@@ -3304,7 +3327,7 @@ impl Orchestrator {
         let mut queued_list = Vec::new();
         let mut fails = Vec::new();
         let mut built = Vec::new();
-        let mut fail_cat: BTreeMap<String, (usize, Vec<String>, &'static str, BTreeMap<String, usize>)> = BTreeMap::new();
+        let mut fail_cat: BTreeMap<String, (usize, Vec<String>, &'static str, BTreeMap<String, usize>, BTreeMap<String, Vec<String>>)> = BTreeMap::new();
 
         for r in sh.results.values() {
             match r.status.as_str() {
@@ -3387,13 +3410,17 @@ impl Orchestrator {
                         .unwrap_or_default(),
                 });
                 let (cause, hint) = crate::classify::categorize_failure(&r.error);
-                let ent = fail_cat.entry(cause.to_string()).or_insert((0, Vec::new(), hint, BTreeMap::new()));
+                let ent = fail_cat.entry(cause.to_string()).or_insert((0, Vec::new(), hint, BTreeMap::new(), BTreeMap::new()));
                 ent.0 += 1;
                 if ent.1.len() < 40 {
                     ent.1.push(r.slug.clone());
                 }
                 if let Some(sub) = crate::classify::subclassify_failure(&r.error) {
-                    *ent.3.entry(sub).or_insert(0) += 1;
+                    *ent.3.entry(sub.clone()).or_insert(0) += 1;
+                    let fams = ent.4.entry(sub).or_insert_with(Vec::new);
+                    if fams.len() < 40 {
+                        fams.push(r.slug.clone());
+                    }
                 }
             }
         }
@@ -3407,12 +3434,13 @@ impl Orchestrator {
         let fail_categories = {
             let mut v: Vec<FailCategory> = fail_cat
                 .into_iter()
-                .map(|(cat, (count, families, hint, subcauses))| FailCategory {
+                .map(|(cat, (count, families, hint, subcauses, sub_families))| FailCategory {
                     hint: hint.to_string(),
                     cat,
                     count,
                     families,
                     subcauses,
+                    sub_families,
                 })
                 .collect();
             v.sort_by(|a, b| b.count.cmp(&a.count));
