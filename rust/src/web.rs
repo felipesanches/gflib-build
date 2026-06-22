@@ -86,6 +86,13 @@ fn handle(mut stream: TcpStream, source: Arc<dyn Source>) -> std::io::Result<()>
             let body = read_debian_files(&source.build_dir(), &slug);
             respond(&mut stream, 200, "text/plain; charset=utf-8", body.as_bytes())
         }
+        ("GET", p) if p.starts_with("/api/lintian-tag") => {
+            // the lintian.debian.org explanation for a tag (fetched+cached): /api/lintian-tag?tag=foo
+            let tag = query_param(p, "tag").unwrap_or_default();
+            let body = crate::deb::lintian_tag_explanation(&source.build_dir(), &tag);
+            let body = if body.is_empty() { "(could not fetch the lintian explanation — offline, or the tag page was unavailable)".to_string() } else { body };
+            respond(&mut stream, 200, "text/plain; charset=utf-8", body.as_bytes())
+        }
         ("GET", p) if p.starts_with("/api/lintian") => {
             // the saved lintian report for a package: /api/lintian?slug=ofl/foo
             let slug = query_param(p, "slug").unwrap_or_default();
@@ -864,8 +871,7 @@ function openDetail(kind,id){
   const subs=Object.entries(c.subcauses||{}).sort((a,b)=>b[1]-a[1]);
   if(subs.length){lines.push('','sub-cause breakdown:');subs.forEach(kv=>lines.push('  '+Rp(kv[1],5)+'  '+kv[0]));}
   lines.push('','affected families:');(c.families&&c.families.length?c.families:['(none)']).forEach(s=>lines.push('  '+s));lines.push('','what to do:','  '+(c.hint||''));
- } else if(kind=='lintcat'){const c=(snap.lint_categories||[]).find(x=>x.severity+':'+x.tag==id);if(!c)return;title='lintian '+(c.severity=='E'?'error':'warning')+': '+c.tag;
-  lines=['severity: '+(c.severity=='E'?'ERROR':'warning'),'packages affected: '+c.count,'lintian tag docs: https://lintian.debian.org/tags/'+c.tag,'','affected packages:'];(c.families&&c.families.length?c.families:['(none)']).forEach(s=>lines.push('  '+s));
+ } else if(kind=='lintcat'){openLintcat(id);return;
  } else if(kind=='history'){const h=findBy(snap.failure_history,'slug',id);if(!h)return;slug=id;title='Failed (history): '+h.slug;
   lines=['cause: '+h.cause,'provenance: '+prov(h),'rebuild: gflib-build --only '+h.slug+' --rebuild --yes','','error:','  '+(h.error||'')];
  } else if(kind=='task'){const t=findBy(snap.tasks,'key',id);if(!t)return;title='Pipeline task: '+t.name;
@@ -915,6 +921,24 @@ function openLintian(slug){
  fetch('/api/lintian?slug='+encodeURIComponent(slug)).then(r=>r.text()).then(t=>{const m=document.getElementById('lintbody');if(m)m.innerHTML=hlLint(t)}).catch(()=>{const m=document.getElementById('lintbody');if(m)m.textContent='(failed to load)'});
 }
 function hlLint(t){return t.split('\n').map(l=>{const c=l[0]=='E'?'r':l[0]=='W'?'y':(l[0]=='I'||l[0]=='P')?'c':'gr';return '<span class="'+c+'">'+E(l)+'</span>'}).join('\n')}
+// lintian tag detail: clickable docs link + the affected packages + the explanation fetched from
+// lintian.debian.org (server-side cached) and shown inline.
+function openLintcat(id){
+ const c=(snap.lint_categories||[]).find(x=>x.severity+':'+x.tag==id);if(!c)return;
+ const sev=c.severity=='E'?'error':(c.severity=='W'?'warning':'info');
+ const url='https://lintian.debian.org/tags/'+encodeURIComponent(c.tag);
+ const fams=(c.families&&c.families.length?c.families:['(none)']).map(s=>'<div class="ln gr">  '+E(s)+'</div>').join('');
+ const el=document.getElementById('detail');
+ el.innerHTML='<div class="dhead">lintian '+sev+': <span class="'+(c.severity=='E'?'r':c.severity=='W'?'y':'c')+'">'+E(c.tag)+'</span>'+
+   ' &nbsp;<a class="rb" href="'+url+'" target="_blank" rel="noopener" title="open the lintian tag page">↗ lintian.debian.org</a>'+
+   '<span class="dclose" onclick="closeDetail()">✕ close</span></div>'+
+   '<div class="dbody"><div class="muted">packages affected: '+c.count+'</div>'+
+   '<div class="sec">Explanation <a href="'+url+'" target="_blank" rel="noopener" class="c">'+E(c.tag)+'</a></div>'+
+   '<pre id="ltexp" class="muted">loading explanation…</pre>'+
+   '<div class="sec">Affected packages</div>'+fams+'</div>';
+ el.style.display='block';
+ fetch('/api/lintian-tag?tag='+encodeURIComponent(c.tag)).then(r=>r.text()).then(t=>{const m=document.getElementById('ltexp');if(m){m.classList.remove('muted');m.textContent=t}}).catch(()=>{const m=document.getElementById('ltexp');if(m)m.textContent='(failed to load the explanation)'});
+}
 function showDetail(title,lines,slug){
  // T2: under SELECTIVE policy, offer to authorize Python for THIS family (and re-queue it) — the
  // one-family probe of the re-enablement loop. Shows ✓ when already authorized. Only under 'selective':

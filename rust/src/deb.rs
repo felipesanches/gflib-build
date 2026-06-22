@@ -905,6 +905,106 @@ pub fn lintian_report(build_dir: &Path, slug: &str) -> String {
     })
 }
 
+/// Fetch (once, then cache) the human explanation for a lintian tag from lintian.debian.org and
+/// reduce it to plain text, so the UI can show it inline next to the clickable tag link. Cached under
+/// `<build_dir>/lintian-tags/<tag>.txt`; network fetch via `curl` (offline-safe: returns "" on failure).
+pub fn lintian_tag_explanation(build_dir: &Path, tag: &str) -> String {
+    // lintian tags are [a-z0-9-]; reject anything else (it goes into a URL and a file path)
+    if tag.is_empty() || tag.len() > 120 || !tag.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+        return String::new();
+    }
+    let dir = build_dir.join("lintian-tags");
+    let cache = dir.join(format!("{}.txt", tag));
+    if let Ok(s) = std::fs::read_to_string(&cache) {
+        return s;
+    }
+    let url = format!("https://lintian.debian.org/tags/{}", tag);
+    let html = match std::process::Command::new("curl")
+        .args(["-sS", "--max-time", "12", "-A", "gflib-build", &url])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return String::new(),
+    };
+    let text = extract_lintian_explanation(&html);
+    if !text.is_empty() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(&cache, &text);
+    }
+    text
+}
+
+/// Reduce a lintian.debian.org tag page to plain text: take the `<div id="content">` region, drop the
+/// `<table>`/script/style, strip tags, decode the few entities lintian emits, and collapse blank runs.
+fn extract_lintian_explanation(html: &str) -> String {
+    let content = match html.find("<div id=\"content\">") {
+        Some(i) => {
+            let rest = &html[i..];
+            let end = rest.find("<div id=\"footer\"").unwrap_or(rest.len());
+            &rest[..end]
+        }
+        None => html,
+    };
+    let mut out = String::with_capacity(content.len() / 2);
+    let mut in_tag = false;
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+            out.push(' '); // tag boundary → whitespace so words don't run together
+        } else if !in_tag {
+            out.push(c);
+        }
+        i += 1;
+    }
+    let out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+    // collapse runs of blank lines and trailing spaces
+    let mut lines: Vec<String> = Vec::new();
+    for raw in out.lines() {
+        let t = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if t.is_empty() {
+            if matches!(lines.last(), Some(l) if l.is_empty()) {
+                continue;
+            }
+            lines.push(String::new());
+        } else {
+            lines.push(t);
+        }
+    }
+    lines.join("\n").trim().to_string()
+}
+
+#[cfg(test)]
+mod lintian_tests {
+    use super::extract_lintian_explanation;
+    #[test]
+    fn extracts_explanation_text_and_strips_html() {
+        let html = "<html><head><title>x</title></head><body>\
+            <div id=\"header\">NAV junk <a href=\"/\">Tags</a></div>\
+            <div id=\"content\"><h1><code class=\"warning\">truetype-font-prohibits-installable-embedding</code></h1>\
+            <p>This package installs a TrueType font with restrictive license terms &amp; conditions. \
+            The font does not permit installable embedding.</p>\
+            <table><tr><td>Severity: </td><td><code>warning</code></td></tr></table></div>\
+            <div id=\"footer\">footer junk</div></body></html>";
+        let t = extract_lintian_explanation(html);
+        assert!(t.contains("installable embedding"), "got: {t}");
+        assert!(t.contains("restrictive license terms & conditions"), "entities decoded: {t}");
+        assert!(t.contains("Severity:") && t.contains("warning"), "severity kept: {t}");
+        assert!(!t.contains('<') && !t.contains('>'), "tags stripped: {t}");
+        assert!(!t.contains("footer junk") && !t.contains("NAV junk"), "only #content kept: {t}");
+    }
+}
+
 /// Locate the built .deb in pool/ for a slug, via packaging/build-results.json (package + version).
 fn find_built_deb(pkg_root: &Path, slug: &str) -> Option<PathBuf> {
     let txt = std::fs::read_to_string(pkg_root.join("build-results.json")).ok()?;

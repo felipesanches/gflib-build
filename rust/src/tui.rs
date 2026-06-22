@@ -550,6 +550,17 @@ pub fn run_mode(source: Arc<dyn Source>, setup: bool) -> std::io::Result<TuiResu
                             }
                             ui.detail = false;
                         }
+                        // fetch + cache the lintian.debian.org explanation for the selected tag, then
+                        // rebuild the detail so it shows inline (blocking — an explicit action; curl caps at 12s)
+                        KeyCode::Char('f') | KeyCode::Char('F') => {
+                            let secs = sections_for(&snap, ui.tab, ui.fc_sel);
+                            if secs.get(ui.section).map(|s| s.dview) == Some("lintcat") {
+                                if let Some(c) = snap.lint_categories.get(ui.sel) {
+                                    let _ = crate::deb::lintian_tag_explanation(&source.build_dir(), &c.tag);
+                                    ui.detail_lines = build_detail(&snap, ui.tab, ui.section, ui.sel, ui.fc_sel, &source.build_dir());
+                                }
+                            }
+                        }
                         KeyCode::Enter | KeyCode::Backspace | KeyCode::Left => ui.detail = false,
                         _ => {}
                     }
@@ -2243,6 +2254,15 @@ fn build_detail(snap: &Snapshot, tab: usize, section: usize, sel: usize, fc_sel:
                 o.push(format!("lintian {}: {}", if c.severity == "E" { "error" } else { "warning" }, c.tag));
                 o.push(format!("packages affected: {}", c.count));
                 o.push(format!("lintian tag docs: https://lintian.debian.org/tags/{}", c.tag));
+                // explanation: show the server-cached lintian.debian.org text if it's been fetched
+                // (the web UI / `f` populates <build_dir>/lintian-tags/<tag>.txt); else hint how to get it.
+                o.push(String::new());
+                o.push("explanation:".into());
+                let cached = std::fs::read_to_string(build_dir.join("lintian-tags").join(format!("{}.txt", c.tag))).ok();
+                match cached {
+                    Some(t) => for l in t.lines() { o.push(format!("  {}", l)); },
+                    None => o.push("  (not fetched yet — press f to fetch, or open the tag in the web UI)".into()),
+                }
                 o.push(String::new());
                 o.push("affected packages:".into());
                 if c.families.is_empty() {
