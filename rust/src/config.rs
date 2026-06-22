@@ -11,6 +11,7 @@ pub struct Config {
     pub source: String,        // metadata | archive
     pub data_dir: PathBuf,
     pub google_fonts: Option<PathBuf>,
+    pub descriptions_repo: Option<PathBuf>, // separate git repo holding per-family Debian descriptions
     pub archive: PathBuf,
     pub archive_rev: String,
     pub build_dir: PathBuf,
@@ -75,6 +76,7 @@ impl Default for Config {
             archive: data_dir.join("archive"),
             build_dir: data_dir.join("build"),
             google_fonts: None,
+            descriptions_repo: None,
             data_dir,
             archive_rev: "HEAD".into(),
             backend: "auto".into(),
@@ -195,6 +197,7 @@ pub fn parse(args: &[String]) -> Parsed {
             "--data-dir" => { let _ = next(&mut i, a); }
             "--source" => cfg.source = next(&mut i, a),
             "--google-fonts" => cfg.google_fonts = Some(PathBuf::from(next(&mut i, a))),
+            "--descriptions-repo" => cfg.descriptions_repo = Some(PathBuf::from(next(&mut i, a))),
             "--archive" => explicit_archive = Some(PathBuf::from(next(&mut i, a))),
             "--archive-rev" => cfg.archive_rev = next(&mut i, a),
             "--build-dir" => explicit_build_dir = Some(PathBuf::from(next(&mut i, a))),
@@ -409,6 +412,7 @@ pub fn config_map(cfg: &Config) -> BTreeMap<String, serde_json::Value> {
     // path fields are shown relative to the cwd when under it (matches the TUI's display_path), so the
     // terminal and the browser render the same short paths
     m.insert("google_fonts".into(), json!(cfg.google_fonts.as_ref().map(|p| disp_path(&p.to_string_lossy())).unwrap_or_default()));
+    m.insert("descriptions_repo".into(), json!(cfg.descriptions_repo.as_ref().map(|p| disp_path(&p.to_string_lossy())).unwrap_or_default()));
     m.insert("archive".into(), json!(disp_path(&cfg.archive.to_string_lossy())));
     m.insert("build_dir".into(), json!(disp_path(&cfg.build_dir.to_string_lossy())));
     m.insert("backend".into(), json!(cfg.backend));
@@ -439,6 +443,7 @@ pub fn apply_setup_map(cfg: &mut Config, m: &BTreeMap<String, serde_json::Value>
     let s = |k: &str| -> Option<String> { m.get(k).and_then(|v| v.as_str()).map(|s| s.to_string()) };
     if let Some(v) = s("source") { cfg.source = v; }
     cfg.google_fonts = s("google_fonts").filter(|v| !v.is_empty()).map(PathBuf::from);
+    cfg.descriptions_repo = s("descriptions_repo").filter(|v| !v.is_empty()).map(PathBuf::from);
     if let Some(v) = s("archive").filter(|v| !v.is_empty()) { cfg.archive = PathBuf::from(v); }
     if let Some(v) = s("build_dir").filter(|v| !v.is_empty()) { cfg.build_dir = PathBuf::from(v); }
     if let Some(v) = s("backend") { cfg.backend = v; }

@@ -83,6 +83,7 @@ pub fn run_export_deb(cfg: &config::Config) {
             st.cohort_reqs.get(&res.cohort),
             build_debs,
             lint_present,
+            cfg.descriptions_repo.as_deref(),
         );
         match o.skipped {
             Some("no_fonts") => {
@@ -122,6 +123,8 @@ pub fn run_export_deb(cfg: &config::Config) {
             let _ = std::fs::write(pkg_root.join("build-results.json"), txt);
         }
     }
+    // commit any per-family description seeds written/updated this pass (frequent commits)
+    commit_descriptions(cfg.descriptions_repo.as_deref(), &format!("export-deb {} pkg", exported));
     eprintln!("export-deb: drafted {} package(s) under {}", exported, pkg_root.display());
     eprintln!(
         "  skipped: {} built-but-not-in-worklist, {} built-but-no-fonts-on-disk (pruned without --keep-fonts){}",
@@ -166,6 +169,7 @@ pub fn package_one_family(
     cohort_req: Option<&String>,
     build_debs: bool,
     lint_present: bool,
+    desc_repo: Option<&Path>,
 ) -> PackageOutcome {
     let pkg_root = build_dir.join("packaging");
     let pool = pkg_root.join("pool");
@@ -218,8 +222,8 @@ pub fn package_one_family(
     let copyright_txt = copyright(fam, dep5, &holder);
     let changelog_txt = changelog(&pkg, &version, slug, &fam.commit, epoch);
     let writes: Vec<(PathBuf, String)> = vec![
-        (debian.join("control"), control(&pkg, fam, spdx)),
-        (rules_path.clone(), rules(&pkg, has_ttf, has_otf)),
+        (debian.join("control"), control(&pkg, fam, spdx, desc_repo, slug)),
+        (rules_path.clone(), rules(&pkg, has_ttf, has_otf, &fam.config_yaml, epoch as i64)),
         (debian.join("copyright"), copyright_txt.clone()),
         (debian.join("changelog"), changelog_txt.clone()),
         (debian.join("watch"), watch(&fam.url)),
@@ -400,20 +404,20 @@ fn is_license_placeholder(s: &str) -> bool {
         || (l.contains('<') && l.contains('>')) // <dates>, <Copyright Holder>, <URL|email>, <year>
 }
 
-fn control(pkg: &str, fam: &model::Family, spdx: &str) -> String {
+fn control(pkg: &str, fam: &model::Family, spdx: &str, desc_repo: Option<&Path>, slug: &str) -> String {
     // Built line-by-line (NOT via `\n\` continuation, which strips the leading whitespace that
     // control-file field folding and the long Description require).
-    let name = oneline(if fam.name.is_empty() { pkg } else { fam.name.as_str() });
     let url = oneline(&fam.url);
     let mut v: Vec<String> = vec![
         format!("Source: {}", pkg),
         "Section: fonts".into(),
         "Priority: optional".into(),
         format!("Maintainer: {}", MAINTAINER),
+        // TRUE build-from-source under python_policy=off: the Rust toolchain only — the font is compiled
+        // in the package by gftools-builder + fontc (themselves real packages), no Python.
         "Build-Depends: debhelper-compat (= 13),".into(),
-        " fontmake,".into(),
-        " gftools,".into(),
-        " python3".into(),
+        " gftools-builder,".into(),
+        " fontc".into(),
         "Standards-Version: 4.6.2".into(),
         "Rules-Requires-Root: no".into(),
     ];
@@ -426,45 +430,111 @@ fn control(pkg: &str, fam: &model::Family, spdx: &str) -> String {
     v.push("Architecture: all".into());
     v.push("Multi-Arch: foreign".into());
     v.push("Depends: ${misc:Depends}".into());
-    v.push(format!("Description: {} -- Google Fonts, reproducible build", name));
-    v.push(format!(" {}, packaged from upstream source ({}) and built from the pinned", name, spdx));
-    v.push(" commit with the recorded gflib-build recipe (see debian/gflib-provenance).".into());
-    v.push(" .".into());
-    v.push(" Part of the self-hosted Google Fonts deb-packaging collection; the build is".into());
-    v.push(" reproducible from the recorded manifest.".into());
+    // Description: synopsis + extended body, sourced from the separate descriptions repo (human-editable),
+    // seeded from a default when absent.
+    let (synopsis, extended) = description(desc_repo, slug, fam, spdx);
+    v.push(format!("Description: {}", synopsis));
+    for line in &extended {
+        if line.is_empty() {
+            v.push(" .".into());
+        } else {
+            v.push(format!(" {}", line));
+        }
+    }
     v.join("\n") + "\n"
 }
 
-fn rules(pkg: &str, has_ttf: bool, has_otf: bool) -> String {
+/// Per-family package Description = (synopsis, extended body lines), sourced from the separate
+/// descriptions repo (`<repo>/<slug>/description.txt`: line 1 = synopsis, rest = body; blank lines are
+/// kept). When the repo is configured but the family has no file yet, a default is written there as an
+/// editable seed. With no repo, the default is returned without persisting.
+fn description(desc_repo: Option<&Path>, slug: &str, fam: &model::Family, spdx: &str) -> (String, Vec<String>) {
+    let name = oneline(if fam.name.is_empty() { slug } else { fam.name.as_str() });
+    let default = || -> (String, Vec<String>) {
+        (
+            format!("{}, a Google Fonts typeface", name),
+            vec![
+                format!("{}, compiled from upstream source ({}) at the pinned commit by the recorded", name, spdx),
+                "gflib-build recipe (see debian/gflib-provenance) — a true build-from-source package.".into(),
+                String::new(),
+                "Part of the self-hosted Google Fonts deb-packaging collection; reproducible from the manifest.".into(),
+            ],
+        )
+    };
+    let Some(repo) = desc_repo else { return default() };
+    let file = repo.join(slug).join("description.txt");
+    if let Ok(txt) = std::fs::read_to_string(&file) {
+        let mut lines = txt.lines();
+        let synopsis = oneline(lines.next().unwrap_or("").trim());
+        let extended: Vec<String> = lines.map(|l| oneline(l.trim_end())).collect();
+        if !synopsis.is_empty() {
+            return (synopsis, extended);
+        }
+    }
+    // seed the repo with the default so it can be hand-edited later
+    let (synopsis, extended) = default();
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let seed = format!("{}\n{}\n", synopsis, extended.join("\n"));
+    let _ = std::fs::write(&file, seed);
+    (synopsis, extended)
+}
+
+/// Commit any pending changes in the descriptions repo (frequent commits, as requested). No-op if the
+/// repo isn't a git repo or has nothing staged.
+pub fn commit_descriptions(desc_repo: Option<&Path>, ts_label: &str) {
+    let Some(repo) = desc_repo else { return };
+    if !repo.join(".git").exists() {
+        return;
+    }
+    let _ = std::process::Command::new("git").arg("-C").arg(repo).args(["add", "-A"]).output();
+    // anything staged?
+    let dirty = std::process::Command::new("git")
+        .arg("-C").arg(repo).args(["diff", "--cached", "--quiet"]).status()
+        .map(|s| !s.success()).unwrap_or(false);
+    if !dirty {
+        return;
+    }
+    let n = String::from_utf8_lossy(
+        &std::process::Command::new("git").arg("-C").arg(repo)
+            .args(["diff", "--cached", "--name-only"]).output()
+            .map(|o| o.stdout).unwrap_or_default(),
+    ).lines().count();
+    let msg = format!("descriptions: update {} file(s) [{}]", n, ts_label);
+    let _ = std::process::Command::new("git").arg("-C").arg(repo).args(["commit", "-q", "-m", &msg]).output();
+}
+
+fn rules(pkg: &str, has_ttf: bool, has_otf: bool, config_path: &str, epoch: i64) -> String {
     let fam = pkg.strip_prefix("fonts-gf-").unwrap_or(pkg);
     let subdir = format!("gf-{}", fam);
+    let cfg = if config_path.is_empty() { "sources/config.yaml" } else { config_path };
     let mut v: Vec<String> = vec![
         "#!/usr/bin/make -f".into(),
-        "# Built from upstream source via the recorded gflib-build recipe.".into(),
-        "# Source is fetched from the local repo archive mirror at the pinned commit".into(),
-        "# (see debian/gflib-provenance); the metadata references the real upstream.".into(),
+        "# TRUE build-from-source: the font is COMPILED here from the upstream source shipped in this".into(),
+        "# package (the .orig tarball is the pinned commit from the repo-archive mirror), by the Rust".into(),
+        "# toolchain gftools-builder + fontc — no Python. See debian/gflib-provenance for the recipe.".into(),
         String::new(),
         "%:".into(),
         "\tdh $@".into(),
         String::new(),
         "override_dh_auto_build:".into(),
-        "\t# DRAFT: run gftools-builder / fontc with the".into(),
-        "\t# family config at the pinned commit. Wired in a later stage (sbuild + wheelhouse).".into(),
-        "\ttrue".into(),
+        "\t# SOURCE_DATE_EPOCH makes the compiled font byte-reproducible (fontc/fontTools honour it).".into(),
+        format!("\tSOURCE_DATE_EPOCH={} gftools-builder {}", epoch, cfg),
         String::new(),
         "override_dh_auto_install:".into(),
     ];
     if has_ttf {
         v.push(format!("\tinstall -d debian/{}/usr/share/fonts/truetype/{}", pkg, subdir));
         v.push(format!(
-            "\tif ls built-fonts/*.ttf >/dev/null 2>&1; then install -m644 built-fonts/*.ttf debian/{}/usr/share/fonts/truetype/{}; fi",
+            "\tfind fonts -name '*.ttf' -exec install -m644 '{{}}' debian/{}/usr/share/fonts/truetype/{}/ ';'",
             pkg, subdir
         ));
     }
     if has_otf {
         v.push(format!("\tinstall -d debian/{}/usr/share/fonts/opentype/{}", pkg, subdir));
         v.push(format!(
-            "\tif ls built-fonts/*.otf >/dev/null 2>&1; then install -m644 built-fonts/*.otf debian/{}/usr/share/fonts/opentype/{}; fi",
+            "\tfind fonts -name '*.otf' -exec install -m644 '{{}}' debian/{}/usr/share/fonts/opentype/{}/ ';'",
             pkg, subdir
         ));
     }

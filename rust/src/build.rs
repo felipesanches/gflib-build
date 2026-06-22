@@ -2948,7 +2948,9 @@ impl Orchestrator {
                 cohort_req.as_ref(),
                 true,
                 lint,
+                self.cfg.descriptions_repo.as_deref(),
             );
+            crate::deb::commit_descriptions(self.cfg.descriptions_repo.as_deref(), &slug);
             // built but its out/ fonts were pruned (--discard-fonts before build_debs was on): record a
             // terminal failure so it's visible in deb_status and not re-attempted every restart.
             if o.skipped == Some("no_fonts") {
