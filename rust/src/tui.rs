@@ -21,7 +21,7 @@ use std::time::Duration;
 // Tab order MUST match the web UI's TABS (a user switching between the terminal and the browser
 // sees the same tabs in the same order).
 const TABS: [&str; 14] = [
-    "config", "overview", "queue", "cohorts", "archive", "built", "packaging", "tools", "failures", "stats", "fontspector", "diff", "crater", "reset",
+    "config", "overview", "queue", "cohorts", "archive", "built", "failures", "packaging", "tools", "stats", "fontspector", "diff", "crater", "reset",
 ];
 
 /// Succinct glossary of the Python->Rust migration milestones, shown in the tools tab so a UI label

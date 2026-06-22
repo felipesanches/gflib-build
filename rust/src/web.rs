@@ -340,7 +340,7 @@ let snap={}, tab='overview';
 // wins and nothing is pinned stale.
 let OPT={};
 // tab order MUST match the TUI's VIEWS
-const TABS=['config','overview','queue','cohorts','archive','built','packaging','tools','failures','stats','fontspector','diff','crater','reset'];
+const TABS=['config','overview','queue','cohorts','archive','built','failures','packaging','tools','stats','fontspector','diff','crater','reset'];
 // colour a fontc_crater verdict token (magenta = fontc can't build it — the gold pairing on our built rows)
 function craterCol(tok){if(!tok)return 'muted';if(tok=='fontc-fail'||tok=='both-fail'||tok=='src-miss')return 'm';if(tok=='fmake-fail')return 'muted';if(tok[0]=='~')return 'y';return 'c'}
 // readable label for the fontc_crater verdict (was the cryptic "cr:<token>")
