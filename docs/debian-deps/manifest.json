@@ -1,0 +1,287 @@
+{
+  "count": 30,
+  "packages": [
+    {
+      "crate": "ascii-dag",
+      "version": "0.4.2",
+      "source": "crates.io",
+      "kind": "crate (crates.io)",
+      "deps_in_set": []
+    },
+    {
+      "crate": "ascii_plist_derive",
+      "version": "0.2.0",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": []
+    },
+    {
+      "crate": "font-types",
+      "version": "0.12.0",
+      "source": "crates.io",
+      "kind": "crate (crates.io)",
+      "deps_in_set": []
+    },
+    {
+      "crate": "read-fonts",
+      "version": "0.40.1",
+      "source": "crates.io",
+      "kind": "crate (crates.io)",
+      "deps_in_set": [
+        "font-types"
+      ]
+    },
+    {
+      "crate": "write-fonts",
+      "version": "0.49.1",
+      "source": "crates.io",
+      "kind": "crate (crates.io)",
+      "deps_in_set": [
+        "font-types",
+        "read-fonts"
+      ]
+    },
+    {
+      "crate": "fontdrasil",
+      "version": "0.4.0",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": [
+        "write-fonts"
+      ]
+    },
+    {
+      "crate": "fea-rs",
+      "version": "0.22.0",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": [
+        "fontdrasil",
+        "write-fonts"
+      ]
+    },
+    {
+      "crate": "fontir",
+      "version": "0.5.0",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": [
+        "fontdrasil",
+        "write-fonts"
+      ]
+    },
+    {
+      "crate": "fontbe",
+      "version": "0.5.0",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": [
+        "fea-rs",
+        "fontdrasil",
+        "fontir",
+        "write-fonts"
+      ]
+    },
+    {
+      "crate": "fontra2fontir",
+      "version": "0.4.0",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": [
+        "fontdrasil",
+        "fontir",
+        "write-fonts"
+      ]
+    },
+    {
+      "crate": "glyphs-reader",
+      "version": "0.5.0",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": [
+        "ascii_plist_derive",
+        "fontdrasil",
+        "write-fonts"
+      ]
+    },
+    {
+      "crate": "glyphs2fontir",
+      "version": "0.6.0",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": [
+        "fontdrasil",
+        "fontir",
+        "glyphs-reader",
+        "write-fonts"
+      ]
+    },
+    {
+      "crate": "norad",
+      "version": "0.18.4",
+      "source": "crates.io",
+      "kind": "crate (crates.io)",
+      "deps_in_set": []
+    },
+    {
+      "crate": "ufo2fontir",
+      "version": "0.4.0",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": [
+        "fea-rs",
+        "fontdrasil",
+        "fontir",
+        "glyphs-reader",
+        "norad",
+        "write-fonts"
+      ]
+    },
+    {
+      "crate": "fontc",
+      "version": "0.6.0",
+      "source": "git",
+      "kind": "tool (dh-cargo bin)",
+      "deps_in_set": [
+        "fontbe",
+        "fontdrasil",
+        "fontir",
+        "fontra2fontir",
+        "glyphs2fontir",
+        "ufo2fontir",
+        "write-fonts"
+      ]
+    },
+    {
+      "crate": "openstep-plist",
+      "version": "1.1.0",
+      "source": "crates.io",
+      "kind": "crate (crates.io)",
+      "deps_in_set": []
+    },
+    {
+      "crate": "glyphslib",
+      "version": "0.2.7",
+      "source": "crates.io",
+      "kind": "crate (crates.io)",
+      "deps_in_set": [
+        "openstep-plist"
+      ]
+    },
+    {
+      "crate": "skrifa",
+      "version": "0.43.2",
+      "source": "crates.io",
+      "kind": "crate (crates.io)",
+      "deps_in_set": [
+        "read-fonts"
+      ]
+    },
+    {
+      "crate": "babelfont",
+      "version": "0.2.0-pre",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": [
+        "fontbe",
+        "fontc",
+        "fontdrasil",
+        "fontir",
+        "glyphslib",
+        "norad",
+        "skrifa",
+        "write-fonts"
+      ]
+    },
+    {
+      "crate": "fontmerge",
+      "version": "0.1.0",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": [
+        "babelfont",
+        "fontdrasil"
+      ]
+    },
+    {
+      "crate": "google-fonts-subsets",
+      "version": "0.202602.1",
+      "source": "crates.io",
+      "kind": "crate (crates.io)",
+      "deps_in_set": []
+    },
+    {
+      "crate": "gftools",
+      "version": "0.1.0",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": [
+        "google-fonts-subsets",
+        "norad"
+      ]
+    },
+    {
+      "crate": "google-fonts-axisregistry",
+      "version": "0.4.18",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": []
+    },
+    {
+      "crate": "google-fonts-languages",
+      "version": "0.7.7",
+      "source": "crates.io",
+      "kind": "crate (crates.io)",
+      "deps_in_set": []
+    },
+    {
+      "crate": "interpolatable",
+      "version": "1.1.1",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": []
+    },
+    {
+      "crate": "serde_yaml_ng",
+      "version": "0.10.0",
+      "source": "crates.io",
+      "kind": "crate (crates.io)",
+      "deps_in_set": []
+    },
+    {
+      "crate": "skera",
+      "version": "0.1.1",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": [
+        "font-types",
+        "skrifa",
+        "write-fonts"
+      ]
+    },
+    {
+      "crate": "tilvisan",
+      "version": "0.1.0",
+      "source": "git",
+      "kind": "crate (git)",
+      "deps_in_set": [
+        "skrifa",
+        "write-fonts"
+      ]
+    },
+    {
+      "crate": "ttf2woff2",
+      "version": "0.10.4",
+      "source": "crates.io",
+      "kind": "crate (crates.io)",
+      "deps_in_set": []
+    },
+    {
+      "crate": "yeslogic-unicode-blocks",
+      "version": "0.2.0",
+      "source": "crates.io",
+      "kind": "crate (crates.io)",
+      "deps_in_set": []
+    }
+  ]
+}
