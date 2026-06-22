@@ -1139,6 +1139,26 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                     keys: snap.fail_categories.iter().map(|c| c.cat.clone()).collect(),
                 });
             }
+            // sub-cause breakdown of the selected cause (the fine-grained classification), display-only.
+            // The web nests every category's sub-causes; the terminal shows the selected one's, scoped.
+            if let Some(c) = sel_cat {
+                if !c.subcauses.is_empty() {
+                    let mut subs: Vec<(&String, &usize)> = c.subcauses.iter().collect();
+                    subs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                    let classified: usize = c.subcauses.values().sum();
+                    let rows = subs.iter().map(|(name, n)| vec![
+                        (format!("{:>6}  ", n), Color::Yellow),
+                        (format!("↳ {}", name), Color::Grey),
+                    ]).collect();
+                    let other = c.count.saturating_sub(classified);
+                    let title = if other > 0 {
+                        format!("Sub-causes of '{}'  ({} classified · {} unclassified)", c.cat, classified, other)
+                    } else {
+                        format!("Sub-causes of '{}'", c.cat)
+                    };
+                    secs.push(SectionR { title, dview: "", rows, keys: Vec::new() });
+                }
+            }
             // families list, scoped to the selected cause. We list the cause's OWN
             // families (the authoritative full set behind the count) rather than
             // intersecting with the capped 'recent' window — otherwise a cause whose

@@ -511,6 +511,11 @@ function debToolRow(t){const ok=!!t.present;
 // clicking a cause FILTERS the families list below (and highlights the selected cause)
 function failcatRow(c){const sel=fsCause==c.cat;
  return {segs:[[(sel?'▸':' ')+Rp(c.count,3)+'  ','w'],[L(c.cat,24),sel?'y':'c'],[' '+(c.hint||''),'muted']],fc:c.cat,rc:c.cat}}
+// a category row followed by its sub-cause breakdown (indented, display-only)
+function failcatRows(c){const rows=[failcatRow(c)];
+ const subs=Object.entries(c.subcauses||{}).sort((a,b)=>b[1]-a[1]);
+ for(const [name,n] of subs) rows.push({segs:[['     '+Rp(n,4)+'  ','muted'],['↳ '+E(L(name,42)),'gr']]});
+ return rows;}
 function histRow(h){return {segs:[[L(h.cause,20)+' ','y'],[h.slug||'','gr']],rt:h.slug,det:['history',h.slug]}}
 function phaseRow(kv){return {segs:[[L(kv[0],12)+' '+hms(kv[1]),'gr']]}}
 function opRow(kv){const s=kv[1];return {segs:[[L(kv[0],10)+' total '+Rp((s.total||0).toFixed(1),9)+'  n '+Rp(s.count||0,5)+'  mean '+Rp((s.mean||0).toFixed(2),7)+'  max '+Rp((s.max||0).toFixed(1),7),'c']]}}
@@ -532,7 +537,7 @@ function sections(t){
  if(t=='packaging')return [{title:'Deb toolchain  (install any ✗ to enable deb building/validation — auto-detected, recovers in ~5s)',rows:(snap.deb_tools||[]).map(debToolRow)},{title:'Packaging — per-family status  (drafted = debian/ on disk · draftable = built, ready to draft)',rows:filterList(snap.packages,['slug','compiler_version','backend']).map(packagingRow)}];
  if(t=='tools')return [{title:'Build-tool packages  (python = M5 blocker · rust = native · click = which families need it)',rows:filterList(snap.tool_packages,['name','lang','kind']).map(toolRow)},{title:'Migration milestones (M0–M7) — what the rungs mean',rows:MILESTONES.map(m=>({segs:[[L(m[0],4),'c'],[m[1],'gr']]}))}];
  if(t=='failures'){const s=[];const cats=snap.fail_categories||[];
-  if(cats.length)s.push({title:'Failures by cause (click to filter)',rows:filterList(cats,['cat','hint']).map(failcatRow)});
+  if(cats.length)s.push({title:'Failures by cause (click to filter)',rows:filterList(cats,['cat','hint']).flatMap(failcatRows)});
   // families list, scoped to the selected cause. When a cause is selected we list its
   // OWN families (the authoritative full set behind the count) rather than intersecting
   // with the capped 'recent' window — otherwise a cause whose families fell out of that
