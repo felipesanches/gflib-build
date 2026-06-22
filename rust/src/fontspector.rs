@@ -13,7 +13,7 @@ use crate::persist;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Entry point for `--fontspector`. Returns a process exit code.
 pub fn run_pass(cfg: &Config) -> i32 {
@@ -78,14 +78,22 @@ pub(crate) fn ensure_binary(cfg: &Config) -> Result<(PathBuf, String), String> {
         let v = binary_version(&bin)?;
         return Ok((bin, v));
     }
-    eprintln!("installing fontspector {} (one-time, via cargo install)…", cfg.fontspector_version);
-    let status = Command::new("cargo")
-        .args(["install", "fontspector", "--version", &cfg.fontspector_version, "--locked", "--root"])
-        .arg(&root)
-        .status()
-        .map_err(|e| format!("could not run cargo install (is cargo on PATH?): {}", e))?;
+    eprintln!("installing fontspector {} (one-time, via cargo install; output → fontspector/install.log)…", cfg.fontspector_version);
+    let mut c = Command::new("cargo");
+    c.args(["install", "fontspector", "--version", &cfg.fontspector_version, "--locked", "--root"]).arg(&root);
+    // route the verbose cargo-install build to a log, not the terminal
+    let logdir = persist::fontspector_dir(&cfg.build_dir);
+    let _ = std::fs::create_dir_all(&logdir);
+    match std::fs::OpenOptions::new().create(true).append(true).open(logdir.join("install.log")) {
+        Ok(f) => {
+            if let Ok(f2) = f.try_clone() { c.stderr(Stdio::from(f2)); }
+            c.stdout(Stdio::from(f));
+        }
+        Err(_) => { c.stdout(Stdio::null()).stderr(Stdio::null()); }
+    }
+    let status = c.status().map_err(|e| format!("could not run cargo install (is cargo on PATH?): {}", e))?;
     if !status.success() || !bin.is_file() {
-        return Err(format!("cargo install fontspector@{} failed (install it manually and pass --fontspector-bin)", cfg.fontspector_version));
+        return Err(format!("cargo install fontspector@{} failed (see fontspector/install.log; or install it manually and pass --fontspector-bin)", cfg.fontspector_version));
     }
     let v = binary_version(&bin)?;
     Ok((bin, v))
@@ -120,6 +128,10 @@ pub(crate) fn run_one(bin: &Path, cfg: &Config, slug: &str, fonts: &[PathBuf], v
     for f in fonts {
         cmd.arg(f);
     }
+    // The result is read from the --json temp file below, so the subprocess's stdout/stderr are pure
+    // noise — fontspector's indicatif progress bar ("Running N checks…", "NNN/NNN") writes to stderr and
+    // ignores --quiet, flooding the terminal of a foreground run. Discard both.
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
     let status = cmd.status().map_err(|e| format!("spawn fontspector: {}", e))?;
     let _ = status; // fontspector exits non-zero when checks FAIL; that's expected, not an error
     let raw = std::fs::read_to_string(&tmp).map_err(|e| format!("no fontspector json ({}): {}", tmp.display(), e))?;
