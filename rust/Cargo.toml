@@ -13,6 +13,7 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
+toml = "0.8"
 crossterm = "0.29"
 diffenator3-lib = "1.1.4"
 ttj = "1.1.4"

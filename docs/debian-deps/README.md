@@ -6,35 +6,39 @@ To make those — and **all** their dependencies — real Debian source packages
 packages via **debcargo**, then the two tool binaries via **dh-cargo**, reusing the ~540 ecosystem
 crates Debian already ships.
 
-This is **host work** (debcargo + sbuild; no `.deb` builds happen in the VM). These files are the plan:
+## gflib-build does this itself
 
-| file | purpose |
-|------|---------|
-| `gen_manifest.py` | regenerates the burn-down from `gftools-builder3/Cargo.lock` |
-| `manifest.json`   | machine-readable: each package's source/kind/deps-in-set, in build order |
-| `build-order.md`  | the human-readable bottom-up debcargo/dh-cargo order |
-| `verify-debian.sh`| **run on host**: lists crates.io crates missing from Debian to add to the set |
+```sh
+gflib-build --package-deb-deps          # run on the HOST (needs debcargo + sbuild/dpkg-buildpackage)
+```
 
-## Procedure (host)
+`--package-deb-deps` (module `src/deb_deps.rs`, **pure Rust — no Python**):
 
-1. `./verify-debian.sh` — confirm which crates.io crates Debian is missing; add any new ones to
-   `SPECIALIST_MISSING` in `gen_manifest.py` and re-run it. (A "registry" source ≠ in Debian — the
-   fontations family is crates.io-published yet absent, so it's already listed.)
-2. Set up a local apt repo + an `sbuild` chroot (trixie/sid) with `debcargo`, `dh-cargo`, `cargo`.
-3. Walk `build-order.md` top-to-bottom:
-   - **crates.io crate** → `debcargo package <crate> <version>` → `sbuild` → publish to the local repo.
-   - **git-pinned crate** → `debcargo` against a local checkout at the pinned rev, version-encode the
-     commit (e.g. `0.5.0+git<YYYYMMDD>`); `sbuild`; publish.
-   - **tool** (`fontc`, `gftools-builder`) → `dh $@ --buildsystem=cargo`, shipping `/usr/bin/<tool>`;
-     `Build-Depends` = the `librust-*-dev` packages from the steps above + the in-Debian ones.
-4. Build a font package: its `Build-Depends: debhelper-compat (= 13), gftools-builder, fontc` now
-   resolve to real local packages; `sbuild` it offline.
+1. Computes the burn-down from `gftools-builder3/Cargo.lock`: the git-pinned font crates + the
+   crates.io crates Debian lacks (incl. the fontations family) + the 2 tool binaries, in
+   **topological (leaves-first)** order — reusing every crate Debian already provides.
+2. Writes `<build_dir>/deb-deps/manifest.json` (the plan).
+3. **Drives it**: per package, `debcargo` (crates.io) / `debcargo` against the vendored source (git) /
+   `dh-cargo` (tools) → `dpkg-buildpackage` or `sbuild` → publish to the local apt repo
+   `<build_dir>/deb-deps/apt/` (+ `dpkg-scanpackages` index). Idempotent (skips already-built),
+   continue-on-failure, per-package results in `<build_dir>/deb-deps/results.json`.
+4. When `debcargo`/the build front-end are absent (e.g. in the build VM) it **dry-runs**: it prints the
+   exact commands per package so you can review/tune them before running on the host.
+
+Execution is host-only (no `.deb`/sbuild builds happen in the build VM). The planning and the per-package
+command construction are unit-tested in-tree; the exec recipes are deliberately small + commented for
+host tuning (esp. the git-crate `debcargo` flags and the sbuild chroot).
+
+## verify-debian.sh
+
+`verify-debian.sh` (host helper) lists the crates.io crates in the lock that Debian is **missing**, so
+any beyond the built-in set can be added to `SPECIALIST_MISSING` in `src/deb_deps.rs`.
 
 ## The M5 burn-down metric
 
-Every `fonts-gf-*` package's `Build-Depends` is now machine-queryable. The set of **Python** tool
-packages still referenced across the library is the M5 blocker list; as families move to the Rust
-toolchain it shrinks. With `python_policy=off` the target set is already just these two Rust tools +
-their (now archive-pure) crate graph — **0 Python**.
+Every `fonts-gf-*` package's `Build-Depends` is machine-queryable. With `python_policy=off` the target
+set is just `gftools-builder` + `fontc` + their (now archive-pure) crate graph — **0 Python**. As crates
+move from vendored/debcargo to proper `librust-*-dev`, the burn-down is visible in `results.json`.
 
-> Feature-gate fontspector/QA **off** when building the tools so its ~10 crates never enter the graph.
+> The tool packages are built with fontspector/QA feature-gated **off**, so its ~10 crates never enter
+> the build-deps graph.

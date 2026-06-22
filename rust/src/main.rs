@@ -11,6 +11,7 @@ mod config;
 mod crater;
 mod daemon;
 mod deb;
+mod deb_deps;
 mod discover;
 mod fontspector;
 mod diffenator3;
@@ -43,6 +44,7 @@ fn main() {
         Mode::CohortsReport => run_cohorts_report(&cfg),
         Mode::EffReq => run_effreq(&cfg),
         Mode::ExportDeb => deb::run_export_deb(&cfg),
+        Mode::PackageDebDeps => deb_deps::run_package_deb_deps(&cfg),
         Mode::Fontspector => std::process::exit(fontspector::run_pass(&cfg)),
         Mode::Attach => run_attach(&cfg),
         Mode::Build => run_build(cfg),
