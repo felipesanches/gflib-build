@@ -20,8 +20,8 @@ use std::time::Duration;
 
 // Tab order MUST match the web UI's TABS (a user switching between the terminal and the browser
 // sees the same tabs in the same order).
-const TABS: [&str; 14] = [
-    "config", "overview", "queue", "cohorts", "archive", "built", "failures", "packaging", "tools", "stats", "fontspector", "diff", "crater", "reset",
+const TABS: [&str; 15] = [
+    "config", "overview", "queue", "cohorts", "archive", "built", "failures", "packaging", "tools", "stats", "fontspector", "diff", "deb-deps", "crater", "reset",
 ];
 
 /// Succinct glossary of the Python->Rust migration milestones, shown in the tools tab so a UI label
@@ -1259,6 +1259,35 @@ fn sections_for(snap: &Snapshot, tab: usize, fc_sel: usize) -> Vec<SectionR> {
                 vec![SectionR {
                     title: format!("Built vs shipped — {} checked · {} identical · {} differ · {} n/a", d.families_checked, d.identical, d.differs, d.errored),
                     dview: "diff", rows, keys: d.families.iter().map(|f| f.slug.clone()).collect(),
+                }]
+            }
+        },
+        "deb-deps" => match &snap.deb_deps {
+            None => vec![SectionR {
+                title: "deb-deps burn-down — no run yet (host: gflib-build --package-deb-deps)".into(),
+                dview: "", rows: Vec::new(), keys: Vec::new(),
+            }],
+            Some(d) => {
+                let rows = d.packages.iter().map(|p| {
+                    let c = match p.status.as_str() {
+                        "built" => Color::Green,
+                        "failed" => Color::Red,
+                        "building" => Color::Yellow,
+                        "skipped" => Color::Cyan,
+                        _ => Color::DarkGrey,
+                    };
+                    vec![
+                        (format!("{:<9} ", p.status), c),
+                        (format!("{:<30} ", head(&p.krate, 30)), Color::Grey),
+                        (format!("{} {}/{}", p.version, p.kind, p.src), Color::DarkGrey),
+                    ]
+                }).collect();
+                let mode = if d.dry_run { " (dry-run)" } else { "" };
+                let building = if d.building.is_empty() { String::new() } else { format!(" · building {}", d.building) };
+                vec![SectionR {
+                    title: format!("Dependency burn-down{} — {} pkgs · {} built · {} skipped · {} failed · {} pending{}",
+                        mode, d.total, d.built, d.skipped, d.failed, d.pending, building),
+                    dview: "debdep", rows, keys: d.packages.iter().map(|p| p.krate.clone()).collect(),
                 }]
             }
         },

@@ -239,6 +239,29 @@ pub struct DiffFamily {
     #[serde(default)] pub summary: String, // worst per-font summary (e.g. "differs: 3 tables, 12 glyphs")
 }
 
+/// The archive-pure dependency-packaging burn-down (--package-deb-deps), read from deb-deps/results.json.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DepDepsView {
+    #[serde(default)] pub total: usize,
+    #[serde(default)] pub built: usize,
+    #[serde(default)] pub skipped: usize,
+    #[serde(default)] pub failed: usize,
+    #[serde(default)] pub pending: usize,
+    #[serde(default)] pub dry_run: bool,
+    #[serde(default)] pub building: String,         // the crate currently being packaged ("" when idle)
+    #[serde(default)] pub packages: Vec<DepDepsItem>, // in topological build order
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DepDepsItem {
+    pub krate: String,
+    #[serde(default)] pub version: String,
+    #[serde(default)] pub src: String,    // git | crates.io
+    #[serde(default)] pub kind: String,   // crate | tool
+    #[serde(default)] pub status: String, // pending | building | built | skipped | failed | dry-run
+    #[serde(default)] pub error: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FailHist {
     #[serde(default)] pub ts: f64,
@@ -417,6 +440,7 @@ pub struct Snapshot {
     #[serde(default)] pub pre_build: bool, // first-run setup wizard (config tab is the only view)
     #[serde(default)] pub fontspector: Option<FontspectorView>, // QA results (the --fontspector pass)
     #[serde(default)] pub diffenator: Option<DiffView>, // built-vs-shipped diff results (--diffenator)
+    #[serde(default)] pub deb_deps: Option<DepDepsView>, // dependency-packaging burn-down (--package-deb-deps)
     #[serde(default)] pub crater: Option<CraterView>, // fontc_crater build-status comparison (when loaded)
     #[serde(default)] pub done: bool,
     #[serde(default)] pub daemon_alive: bool,

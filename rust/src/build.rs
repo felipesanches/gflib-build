@@ -3728,6 +3728,7 @@ impl Orchestrator {
             pre_build: false, // a live build is never the setup wizard
             fontspector: sh.fontspector.clone(), // live QA aggregate (async --fontspector orchestration)
             diffenator: sh.diffview.clone(), // live diff aggregate (async --diffenator)
+            deb_deps: crate::deb_deps::read_view(&self.cfg.build_dir), // dep-packaging burn-down (--package-deb-deps, separate process)
             crater: crater_view,
             done,
             daemon_alive: true,

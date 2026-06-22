@@ -232,49 +232,71 @@ pub fn run_package_deb_deps(cfg: &Config) {
         let _ = run_logged(&format!("cd {} && cargo vendor {}", lock.parent().unwrap().display(), vendor.display()), &work);
     }
 
-    let mut results = Vec::new();
-    let (mut built, mut skipped, mut failed) = (0, 0, 0);
-    for pkg in &plan {
+    // Ordered items (status starts "pending"). results.json is rewritten after EVERY package so a
+    // running gflib-build daemon's deb-deps tab shows the burn-down live (this is a separate process).
+    let src_s = |s: Src| if s == Src::Git { "git" } else { "crates.io" };
+    let kind_s = |k: Kind| if k == Kind::Tool { "tool" } else { "crate" };
+    let mut items: Vec<serde_json::Value> = plan.iter().map(|p| serde_json::json!({
+        "krate": p.krate, "version": p.version, "src": src_s(p.src), "kind": kind_s(p.kind),
+        "status": "pending", "error": "",
+    })).collect();
+    let write_view = |items: &Vec<serde_json::Value>, building: &str| {
+        let count = |st: &str| items.iter().filter(|i| i["status"] == st).count();
+        let (built, skipped, failed, dry) = (count("built"), count("skipped"), count("failed"), count("dry-run"));
+        let doc = serde_json::json!({
+            "total": items.len(), "built": built, "skipped": skipped, "failed": failed,
+            "pending": items.len().saturating_sub(built + skipped + failed + dry + count("building")),
+            "dry_run": !can_run, "building": building, "packages": items });
+        if let Ok(txt) = serde_json::to_string_pretty(&doc) {
+            let _ = std::fs::write(work.join("results.json"), txt);
+        }
+    };
+    write_view(&items, "");
+    for idx in 0..plan.len() {
+        let pkg = &plan[idx];
         let cmds = package_commands(pkg, &work, &apt, &vendor, builder);
         if already_built(&apt, pkg) {
-            skipped += 1;
-            results.push(serde_json::json!({"crate": pkg.krate, "status": "skipped (already built)"}));
+            items[idx]["status"] = serde_json::json!("skipped");
+            write_view(&items, "");
             continue;
         }
         if !can_run {
-            results.push(serde_json::json!({"crate": pkg.krate, "status": "dry-run", "commands": cmds}));
+            items[idx]["status"] = serde_json::json!("dry-run");
             eprintln!("# {} {}", pkg.krate, pkg.version);
             for c in &cmds { eprintln!("    {c}"); }
+            write_view(&items, "");
             continue;
         }
+        items[idx]["status"] = serde_json::json!("building");
+        write_view(&items, &pkg.krate);
         let _ = std::fs::create_dir_all(work.join(&pkg.krate));
         let mut ok = true;
         let mut last = String::new();
         for c in &cmds {
-            match run_logged(c, &work) {
-                Ok(_) => {}
-                Err(e) => { ok = false; last = e; break; }
-            }
+            if let Err(e) = run_logged(c, &work) { ok = false; last = e; break; }
         }
         if ok && already_built(&apt, pkg) {
-            built += 1;
-            results.push(serde_json::json!({"crate": pkg.krate, "status": "built"}));
+            items[idx]["status"] = serde_json::json!("built");
         } else {
-            failed += 1;
-            results.push(serde_json::json!({"crate": pkg.krate, "status": "failed", "error": last}));
+            items[idx]["status"] = serde_json::json!("failed");
+            items[idx]["error"] = serde_json::json!(last);
             eprintln!("package-deb-deps: FAILED {} — {}", pkg.krate, last);
         }
+        write_view(&items, "");
     }
     if can_run {
         // regenerate the apt index so the next sbuild can resolve what we just published
         let _ = run_logged(&format!("cd {} && dpkg-scanpackages -m . /dev/null > Packages 2>/dev/null && gzip -9kf Packages", apt.display()), &work);
     }
-    let doc = serde_json::json!({ "built": built, "skipped": skipped, "failed": failed,
-        "dry_run": !can_run, "results": results });
-    if let Ok(txt) = serde_json::to_string_pretty(&doc) {
-        let _ = std::fs::write(work.join("results.json"), txt);
-    }
-    eprintln!("package-deb-deps: built {built}, skipped {skipped}, failed {failed} → {}", apt.display());
+    write_view(&items, "");
+    let n = |st: &str| items.iter().filter(|i| i["status"] == st).count();
+    eprintln!("package-deb-deps: built {}, skipped {}, failed {} → {}", n("built"), n("skipped"), n("failed"), apt.display());
+}
+
+/// Read the burn-down view from deb-deps/results.json for the live UI. None if no run has happened.
+pub fn read_view(build_dir: &Path) -> Option<crate::model::DepDepsView> {
+    let txt = std::fs::read_to_string(build_dir.join("deb-deps").join("results.json")).ok()?;
+    serde_json::from_str(&txt).ok()
 }
 
 /// Run one shell command, appending stdout+stderr to deb-deps/build.log. Ok(()) on success.

@@ -347,7 +347,7 @@ let snap={}, tab='overview';
 // wins and nothing is pinned stale.
 let OPT={};
 // tab order MUST match the TUI's VIEWS
-const TABS=['config','overview','queue','cohorts','archive','built','failures','packaging','tools','stats','fontspector','diff','crater','reset'];
+const TABS=['config','overview','queue','cohorts','archive','built','failures','packaging','tools','stats','fontspector','diff','deb-deps','crater','reset'];
 // colour a fontc_crater verdict token (magenta = fontc can't build it — the gold pairing on our built rows)
 function craterCol(tok){if(!tok)return 'muted';if(tok=='fontc-fail'||tok=='both-fail'||tok=='src-miss')return 'm';if(tok=='fmake-fail')return 'muted';if(tok[0]=='~')return 'y';return 'c'}
 // readable label for the fontc_crater verdict (was the cryptic "cr:<token>")
@@ -619,6 +619,17 @@ function diffView(){const d=snap.diffenator;
    return '<div class="ln"><span class="'+cls+'">'+E(L(f.slug,40))+'</span> <span class="muted">'+E(f.summary||f.status)+'</span></div>';}).join('');
  return h;
 }
+// archive-pure dependency-packaging burn-down (--package-deb-deps), read live from deb-deps/results.json
+function debDepsView(){const d=snap.deb_deps;
+ if(!d)return '<div class="sec">deb-deps burn-down</div><div class="ln muted">No run yet. On the host: <code>gflib-build --package-deb-deps</code> (dry-run prints the commands; with debcargo + sbuild/dpkg-buildpackage it builds them).</div>';
+ const mode=d.dry_run?' <span class="o">(dry-run)</span>':'';
+ let h='<div class="sec">Dependency burn-down'+mode+' — '+d.total+' pkgs · <span class="g">'+d.built+' built</span> · <span class="c">'+d.skipped+' skipped</span> · <span class="r">'+d.failed+' failed</span> · '+d.pending+' pending'+(d.building?' · building <span class="o">'+E(d.building)+'</span>':'')+'</div>';
+ const rows=filterList(d.packages||[],['krate','status']);
+ if(!rows.length)return h+'<div class="ln muted">(no packages match)</div>';
+ h+=rows.map(p=>{const c=p.status=='built'?'g':p.status=='failed'?'r':p.status=='building'?'o':(p.status=='skipped'?'c':'muted');
+   return '<div class="ln"><span class="'+c+'">'+L((''+p.status),9)+'</span> <span class="gr">'+E(L(p.krate,30))+'</span> <span class="muted">'+E(p.version)+' · '+E(p.kind)+'/'+E(p.src)+(p.error?' · '+E(p.error):'')+'</span></div>';}).join('');
+ return h;
+}
 function fsFamLink(slug){return '<span class="clk c" onclick="event.stopPropagation();openDetail(\'fsfamily\',\''+E(slug)+'\')">'+E(slug)+'</span>'}
 function toggleFsCheck(i){const e=document.getElementById('fsck'+i);if(e)e.style.display=e.style.display=='none'?'block':'none'}
 
@@ -732,7 +743,7 @@ function render(){
  //      user is typing in the filter, so the live sync never steals focus from it. No refresh-rate
  //      knob: the page refreshes automatically (see the W5 polling block). ----
  {
-  const listTab=['overview','queue','cohorts','built','failures','fontspector','diff'].includes(tab);
+  const listTab=['overview','queue','cohorts','built','failures','fontspector','diff','deb-deps'].includes(tab);
   const notifyBtn=(window.Notification&&Notification.permission!='granted')?' <button class="tbtn" onclick="askNotify()" title="notify when the build completes">🔔 notify</button>':'';
   setHTML('ctl',
     '<button title="pause scheduling AND freeze (SIGSTOP) running builds to free CPU/RAM" onclick="ctl({paused:true})"'+(snap.paused?' disabled':'')+'>pause</button> '+
@@ -760,6 +771,7 @@ function render(){
  else if(tab=='archive')body+=archiveView();
  else if(tab=='fontspector')body+=fsView();
  else if(tab=='diff')body+=diffView();
+ else if(tab=='deb-deps')body+=debDepsView();
  else if(tab=='crater')body+=craterView();
  else if(tab=='packaging')body+=packagingView();
  else if(tab=='reset')body+=resetView();
